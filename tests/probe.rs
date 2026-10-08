@@ -19,7 +19,13 @@ fn verified_ranges_and_private_writes() {
             let got = p.read("data.bin", off, len).unwrap();
             let end = (off + len as u64).min(67108864);
             let expected: Vec<u8> = (off..end)
-                .map(|i| ((i * 31 + i / 4096) % 251) as u8)
+                .map(|i| {
+                    if i % 65536 < 8 {
+                        ((i / 65536) >> ((i % 65536) * 8)) as u8
+                    } else {
+                        ((i * 31 + i / 4096) % 251) as u8
+                    }
+                })
                 .collect();
             assert_eq!(got, expected);
         }
@@ -56,4 +62,40 @@ fn verified_ranges_and_private_writes() {
         assert!(Probe::connect("http://127.0.0.1:1", false).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn distinct_fixture_chunks_at_every_supported_size() {
+    for chunk in [65536, 262144, 1048576] {
+        let root = std::env::temp_dir().join(format!("fs0-unique-{}-{chunk}", std::process::id()));
+        let server =
+            Server::spawn(Fixture::create(&root, chunk, None).unwrap(), "127.0.0.1:0").unwrap();
+        let p = Probe::connect(&server.url(), false).unwrap();
+        let entry = p
+            .manifest()
+            .entries
+            .iter()
+            .find(|e| e.path == "data.bin")
+            .unwrap();
+        let unique: std::collections::HashSet<_> = entry.chunks.iter().collect();
+        let counts = (unique.len(), entry.chunks.len());
+        drop(server);
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(counts.0, counts.1, "chunk size {chunk}");
+    }
+}
+#[test]
+fn manifest_identity_and_empty_write_noop() {
+    let root = std::env::temp_dir().join(format!("fs0-identity-{}", std::process::id()));
+    let server =
+        Server::spawn(Fixture::create(&root, 262144, None).unwrap(), "127.0.0.1:0").unwrap();
+    let mut p = Probe::connect(&server.url(), true).unwrap();
+    let original = p.read("empty", 0, 10).unwrap();
+    assert_eq!(p.write("empty", 10, b"").unwrap(), 0);
+    let after = p.read("empty", 0, 20).unwrap();
+    let identity = p.manifest_identity().to_owned();
+    drop(server);
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(after, original, "empty writes must not extend file");
+    assert_eq!(identity.len(), 64, "manifest identity required");
 }

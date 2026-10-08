@@ -35,6 +35,9 @@ impl Probe {
             .build();
         let bytes = fetch(&agent, &format!("{url}/manifest"), 1048576)?;
         let manifest: Manifest = serde_json::from_slice(&bytes)?;
+        if manifest.digest != manifest.canonical_digest() {
+            return Err("manifest digest mismatch".into());
+        }
         if ![65536, 262144, 1048576].contains(&manifest.chunk_size) {
             return Err("invalid chunk size".into());
         }
@@ -67,6 +70,9 @@ impl Probe {
             writable,
             fetched: 0,
         })
+    }
+    pub fn manifest_identity(&self) -> &str {
+        &self.manifest.digest
     }
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
@@ -123,6 +129,12 @@ impl Probe {
             .ok_or("not found")?;
         if e.mode & 0o222 == 0 {
             return Err("permission denied".into());
+        }
+        if e.directory {
+            return Err("is directory".into());
+        }
+        if bytes.is_empty() {
+            return Ok(0);
         }
         let size = e.size;
         let end = offset

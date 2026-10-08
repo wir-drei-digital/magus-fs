@@ -33,6 +33,14 @@ impl Fixture {
         std::fs::create_dir(root)?;
         let result = (|| -> Result<Self> {
             std::fs::create_dir(root.join("nested"))?;
+            let mut data: Vec<u8> = (0..67108864u64)
+                .map(|i| ((i * 31 + i / 4096) % 251) as u8)
+                .collect();
+            // Every supported chunk begins with a distinct little-endian block
+            // number. This also preserves uniqueness independent of chunk size.
+            for (index, block) in data.chunks_mut(65536).enumerate() {
+                block[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            }
             let files = [
                 (
                     "instructions.md",
@@ -50,13 +58,7 @@ impl Fixture {
                     0o755,
                 ),
                 ("empty", vec![], 0o644),
-                (
-                    "data.bin",
-                    (0..67108864u64)
-                        .map(|i| ((i * 31 + i / 4096) % 251) as u8)
-                        .collect(),
-                    0o644,
-                ),
+                ("data.bin", data, 0o644),
             ];
             let mut entries = Vec::new();
             let mut chunks = HashMap::new();
@@ -96,13 +98,13 @@ impl Fixture {
                 directory: true,
                 chunks: vec![],
             });
-            Ok(Self {
-                manifest: Manifest {
-                    chunk_size,
-                    entries,
-                },
-                chunks,
-            })
+            let mut manifest = Manifest {
+                digest: String::new(),
+                chunk_size,
+                entries,
+            };
+            manifest.digest = manifest.canonical_digest();
+            Ok(Self { manifest, chunks })
         })();
         if result.is_err() {
             let _ = std::fs::remove_dir_all(root);
@@ -213,5 +215,50 @@ impl Drop for Server {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+    #[test]
+    fn connection_rejects_metadata_and_descriptor_tampering() {
+        let root = std::env::temp_dir().join(format!("fs0-digest-{}", std::process::id()));
+        let fixture = Fixture::create(&root, 262144, None).unwrap();
+        let original = fixture.manifest.clone();
+        for mutation in 0..11 {
+            let mut changed = original.clone();
+            match mutation {
+                0 => changed.entries[0].mode ^= 0o100,
+                1 => changed.entries[0].uid = changed.entries[0].uid.wrapping_add(1),
+                2 => changed.entries[0].gid = changed.entries[0].gid.wrapping_add(1),
+                3 => changed.entries[0].path = "renamed.md".into(),
+                4 => changed.entries[0].size -= 1,
+                5 => changed.entries.swap(0, 1),
+                6 => changed.entries[0].chunks[0] = "0".repeat(64),
+                7 => changed.digest = "0".repeat(64),
+                8 => changed.chunk_size = 65536,
+                9 => changed.entries[4].chunks.swap(0, 1),
+                _ => changed.entries[0].directory = true,
+            }
+            let server = Server::spawn(
+                Fixture {
+                    manifest: changed,
+                    chunks: HashMap::new(),
+                },
+                "127.0.0.1:0",
+            )
+            .unwrap();
+            let rejection = crate::Probe::connect(&server.url(), false)
+                .err()
+                .map(|error| error.to_string());
+            let rejected = rejection.as_deref() == Some("manifest digest mismatch");
+            drop(server);
+            if !rejected {
+                std::fs::remove_dir_all(&root).unwrap();
+                panic!("mutation {mutation} accepted")
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
