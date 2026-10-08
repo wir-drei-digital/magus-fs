@@ -6,7 +6,7 @@ The project targets macOS and Linux first. Its core scope includes full local re
 
 ## Current state
 
-This repository currently contains project-entry documentation only. No filesystem, daemon, mount, CLI, tests or package is implemented. The next milestone is a real macOS/Linux mount feasibility proof, including reads/writes, byte accounting and read-only permission checks. A service range API alone cannot satisfy that gate.
+The local FS0 development branch contains a verified synthetic fixture/range source, probe CLI, owned test harness and experimental macOS NFS adapter. Raw protocol tests pass, but native macOS ordinary I/O currently stalls and Linux qualification is pending. No filesystem release or complete FS0 gate is claimed. See the [macOS qualification runbook](docs/fs0-macos.md) for actual behavior, limits and build/test commands.
 
 ## Shared specifications and progress
 
@@ -16,4 +16,4 @@ Set `MAGUS_ICM_ROOT` to the active ICM checkout when using a nonstandard layout.
 
 ## Development and distribution
 
-Repository: [wir-drei-digital/magus-fs](https://github.com/wir-drei-digital/magus-fs). Initial documentation is published on `main`; development continues on `codex/fs-foundation`. No runtime release exists. License and redistributable dependencies will be selected before external distribution; no license is granted by this planning README. No installation/build/test command is advertised until it actually exists.
+Repository: [wir-drei-digital/magus-fs](https://github.com/wir-drei-digital/magus-fs). Initial documentation is published on `main`; FS0 development continues locally on `codex/fs-poc`. No runtime release exists. License and redistributable dependencies will be selected before external distribution; no license is granted by this planning README. Build/test commands are documented in the qualification runbook; no packaged installation exists.

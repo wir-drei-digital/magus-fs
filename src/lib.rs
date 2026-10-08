@@ -1,3 +1,4 @@
+pub mod adapters;
 pub mod model;
 pub mod probe;
 pub mod source;
