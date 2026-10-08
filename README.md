@@ -10,10 +10,10 @@ This repository currently contains project-entry documentation only. No filesyst
 
 ## Shared specifications and progress
 
-Read the [Magus ICM delivery record](../magus-icm/DELIVERY.md). It locates the active ICM checkout/worktree. The standalone project record within that checkout is `work/2026-10-09-magus-fs/CONTEXT.md`; it links the specification, delivery sequence and handoff. The project card is `projects/magus-fs.md`.
+Maintainers with the shared Magus ICM checkout should read its `DELIVERY.md` (normally `../magus-icm/DELIVERY.md`). It locates the active ICM checkout/worktree; that local planning workspace is not part of this public repository. The standalone project record within that checkout is `work/2026-10-09-magus-fs/CONTEXT.md`; it links the specification, delivery sequence and handoff. The project card is `projects/magus-fs.md`.
 
 Set `MAGUS_ICM_ROOT` to the active ICM checkout when using a nonstandard layout. Keep shared requirements and coordination there, and keep implemented interfaces, contributor instructions and executable tests here. Do not duplicate the authoritative project spec into a second drifting copy.
 
 ## Development and distribution
 
-Initial branch: `codex/fs-foundation`. No public remote or release has been created. License and redistributable dependencies will be selected before external distribution; no license is granted by this planning README. No installation/build/test command is advertised until it actually exists.
+Repository: [wir-drei-digital/magus-fs](https://github.com/wir-drei-digital/magus-fs). Initial documentation is published on `main`; development continues on `codex/fs-foundation`. No runtime release exists. License and redistributable dependencies will be selected before external distribution; no license is granted by this planning README. No installation/build/test command is advertised until it actually exists.
