@@ -1,6 +1,6 @@
 # FS1 canonical revisions and immutable chunks
 
-`magus-fs-core` is the v1 local model and chunk store for macOS and Linux. It does not implement a journal, capture, mount, permissions evaluation, or shared service. The existing FS0 probe remains a separate package and its manifests are rejected with `unsupported_format`; there is no implicit migration. Task1 selected initial native capture layout `fixed262144` (262144 bytes), with SHA-256. Future extent edits may retain slices of existing chunks up to 1048576 bytes.
+`magus-fs-core` is the v1 local model and chunk store for macOS and Linux. The [local engine](fs1-durability.md) adds a journal and permission evaluation; capture, mounts and shared services remain separate tasks. The existing FS0 probe remains a separate package and its manifests are rejected with `unsupported_format`; there is no implicit migration. Task1 selected initial native capture layout `fixed262144` (262144 bytes), with SHA-256. Future extent edits may retain slices of existing chunks up to 1048576 bytes.
 
 ## Public interfaces
 
@@ -8,6 +8,8 @@ All fallible operations return typed errors, including decoding and validation:
 
 ```rust
 ObjectStore::open(path: impl AsRef<Path>, limits: ObjectLimits) -> Result<ObjectStore, FsError>
+ObjectStore::open_existing(path: impl AsRef<Path>, limits: ObjectLimits) -> Result<ObjectStore, FsError>
+ObjectStore::inventory(&self) -> Result<Vec<(ObjectId, u64)>, FsError>
 ObjectStore::install(&self, bytes: &[u8]) -> Result<ObjectId, FsError>
 ObjectStore::read_verified(&self, id: &ObjectId) -> Result<Vec<u8>, FsError>
 encode_revision(revision: &Revision) -> Result<Vec<u8>, FsError>
@@ -15,6 +17,8 @@ decode_revision(bytes: &[u8]) -> Result<Revision, FsError>
 revision_id(revision: &Revision) -> Result<RevisionId, FsError>
 validate_tree(tree: &Tree) -> Result<(), FsError>
 ```
+
+`open_existing` refuses a missing source and never creates it. `inventory` enumerates published IDs/sizes through the open directory with private-file checks; it does not itself hash every body. The engine verifies that inventory before reporting resident bytes. Owned staging files are omitted from published inventory and counted separately for engine quota enforcement.
 
 `ObjectLimits { max_chunk_size: u64, content_roots: Vec<PathBuf> }` defaults to 1048576 and an empty list. Callers opening a store for selected workspaces must supply **all selected content roots**, including intended destinations that do not exist yet. Equal roots or containment in either direction fail with `storage_overlap`. This uses native device/inode identity and directory ancestry from no-follow traversal, rather than path spelling or a Unicode lowercase approximation. A missing destination is checked through its nearest existing ancestor. The check runs before creation and again against the actual opened store after creation, so newly resolvable case/normalization aliases cannot bypass it. On refusal, a newly created empty store is removed only after its native identity is rechecked, and the parent is synced; cleanup errors are reported. Existing directories are never removed by this check. Truly distinct directories on case-sensitive filesystems remain valid. An empty list means the caller has no selected content roots; this API cannot discover unrelated workspaces. The future configuration layer owns that inventory.
 

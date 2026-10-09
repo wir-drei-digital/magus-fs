@@ -43,7 +43,7 @@ fn syscall_error() -> FsError {
         FsError::Io(e)
     }
 }
-fn open_at(parent: RawFd, n: &CString, flags: i32) -> Result<File, FsError> {
+fn open_at(parent: RawFd, n: &std::ffi::CStr, flags: i32) -> Result<File, FsError> {
     // SAFETY: name is NUL terminated, parent is live (or AT_FDCWD), mode is supplied for O_CREAT.
     let fd = unsafe {
         libc::openat(
@@ -311,6 +311,7 @@ impl ObjectStore {
         };
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         file.write_all(bytes)?;
+        crate::faults::hit("object-sync")?;
         file.sync_all()?;
         // Verify the staged bytes through the same open file before publication.
         use std::io::{Seek, SeekFrom};
@@ -343,5 +344,160 @@ impl ObjectStore {
         stage.remove()?;
         self.dir.sync_all()?;
         Ok(id)
+    }
+}
+
+impl ObjectStore {
+    pub(crate) fn directory(&self) -> &File {
+        &self.dir
+    }
+    pub(crate) fn assert_path(&self, path: &Path) -> Result<(), FsError> {
+        let native = inspect_no_symlink(&absolute(path)?)?;
+        if !native.complete
+            || identity(native.directories.last().ok_or(FsError::UnsafeStorage)?)?
+                != identity(&self.dir)?
+        {
+            return Err(FsError::UnsafeStorage);
+        }
+        Ok(())
+    }
+    pub(crate) fn control_file(&self, leaf: &str, create: bool) -> Result<File, FsError> {
+        let file = open_at(
+            self.dir.as_raw_fd(),
+            &name(OsStr::new(leaf))?,
+            libc::O_RDWR | libc::O_NONBLOCK | if create { libc::O_CREAT } else { 0 },
+        )?;
+        private(&file, false)?;
+        if file.metadata()?.nlink() != 1 {
+            return Err(FsError::UnsafeStorage);
+        }
+        file.sync_all()?;
+        self.dir.sync_all()?;
+        Ok(file)
+    }
+    /// Enumerate published chunks through the opened directory; stages and control files are excluded.
+    pub fn inventory(&self) -> Result<Vec<(ObjectId, u64)>, FsError> {
+        Ok(self.inventory_detail()?.0)
+    }
+    pub(crate) fn occupied_bytes(&self) -> Result<u64, FsError> {
+        let (objects, staged) = self.inventory_detail()?;
+        objects.iter().try_fold(staged, |total, (_, size)| {
+            total.checked_add(*size).ok_or(FsError::Backpressure)
+        })
+    }
+    fn inventory_detail(&self) -> Result<(Vec<(ObjectId, u64)>, u64), FsError> {
+        let directory = open_at(
+            self.dir.as_raw_fd(),
+            &name(OsStr::new("."))?,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )?;
+        use std::os::fd::IntoRawFd;
+        let raw = directory.into_raw_fd();
+        // SAFETY: fdopendir takes ownership of a fresh directory descriptor on success.
+        let stream = unsafe { libc::fdopendir(raw) };
+        if stream.is_null() {
+            unsafe { libc::close(raw) };
+            return Err(syscall_error());
+        }
+        struct Dir(*mut libc::DIR);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                unsafe { libc::closedir(self.0) };
+            }
+        }
+        let stream = Dir(stream);
+        let mut result = Vec::new();
+        let mut staged = 0u64;
+        loop {
+            // SAFETY: stream is live and used only by this call. Clear errno to distinguish EOF.
+            #[cfg(target_os = "macos")]
+            unsafe {
+                *libc::__error() = 0;
+            }
+            #[cfg(target_os = "linux")]
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            let entry = unsafe { libc::readdir(stream.0) };
+            if entry.is_null() {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(0) {
+                    return Err(e.into());
+                }
+                break;
+            }
+            let leaf = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if let Ok(id) = ObjectId::parse(leaf.to_string_lossy().into_owned()) {
+                let f = open_at(
+                    self.dir.as_raw_fd(),
+                    leaf,
+                    libc::O_RDONLY | libc::O_NONBLOCK,
+                )?;
+                private(&f, false)?;
+                let size = f.metadata()?.len();
+                if size > self.limits.max_chunk_size {
+                    return Err(FsError::LimitExceeded);
+                }
+                result.push((id, size));
+            } else if leaf.to_bytes().starts_with(b".stage-") {
+                let f = open_at(
+                    self.dir.as_raw_fd(),
+                    leaf,
+                    libc::O_RDONLY | libc::O_NONBLOCK,
+                )?;
+                private(&f, false)?;
+                staged = staged
+                    .checked_add(f.metadata()?.len())
+                    .ok_or(FsError::Backpressure)?;
+            }
+        }
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok((result, staged))
+    }
+    pub(crate) fn evict(&self, id: &ObjectId) -> Result<(), FsError> {
+        let (_, file) = self.read_file(id)?;
+        let _ = file;
+        // SAFETY: validated object name and live directory; never traverses a pathname.
+        if unsafe {
+            libc::unlinkat(
+                self.dir.as_raw_fd(),
+                name(OsStr::new(id.as_str()))?.as_ptr(),
+                0,
+            )
+        } != 0
+        {
+            return Err(syscall_error());
+        }
+        self.dir.sync_all()?;
+        Ok(())
+    }
+    pub(crate) fn sync_object(&self, id: &ObjectId) -> Result<(), FsError> {
+        let (_, file) = self.read_file(id)?;
+        crate::faults::hit("object-sync")?;
+        file.sync_all()?;
+        self.dir.sync_all()?;
+        Ok(())
+    }
+}
+impl ObjectStore {
+    /// Open an existing source without creating a missing directory.
+    pub fn open_existing(path: impl AsRef<Path>, limits: ObjectLimits) -> Result<Self, FsError> {
+        if limits.max_chunk_size == 0 || limits.max_chunk_size > MAX_CHUNK {
+            return Err(FsError::LimitExceeded);
+        }
+        let path = absolute(path.as_ref())?;
+        let mut native = inspect_no_symlink(&path)?;
+        if !native.complete {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+        }
+        let roots = limits
+            .content_roots
+            .iter()
+            .map(|p| absolute(p))
+            .collect::<Result<Vec<_>, _>>()?;
+        check_content_roots(&native, &roots)?;
+        let dir = native.directories.pop().ok_or(FsError::UnsafeStorage)?;
+        private(&dir, true)?;
+        Ok(Self { dir, limits })
     }
 }

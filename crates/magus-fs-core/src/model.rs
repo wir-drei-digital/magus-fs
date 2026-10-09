@@ -23,6 +23,29 @@ pub enum FsError {
     UnsafeStorage,
     StorageOverlap,
     Io(io::Error),
+    Database(rusqlite::Error),
+    UnsupportedSchema,
+    ReplicaBusy,
+    ConfigMismatch,
+    BaseMismatch,
+    BaseUnavailable {
+        object: ObjectId,
+        cause: SourceFailure,
+    },
+    InvalidSource,
+    Backpressure,
+    PermissionDenied,
+    UnknownPrincipal,
+    ReadOnly,
+    UnsupportedMode,
+    NotFound,
+    AlreadyExists,
+    NotDirectory,
+    IsDirectory,
+    NotEmpty,
+    StaleHandle,
+    GenerationMismatch,
+    OperationMismatch,
 }
 impl fmt::Display for FsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -42,6 +65,26 @@ impl FsError {
             Self::UnsafeStorage => "unsafe_storage",
             Self::StorageOverlap => "storage_overlap",
             Self::Io(_) => "io_error",
+            Self::Database(_) => "database_error",
+            Self::UnsupportedSchema => "unsupported_schema",
+            Self::ReplicaBusy => "replica_busy",
+            Self::ConfigMismatch => "config_mismatch",
+            Self::BaseMismatch => "base_mismatch",
+            Self::BaseUnavailable { .. } => "base_unavailable",
+            Self::InvalidSource => "invalid_source",
+            Self::Backpressure => "backpressure",
+            Self::PermissionDenied => "permission_denied",
+            Self::UnknownPrincipal => "unknown_principal",
+            Self::ReadOnly => "read_only",
+            Self::UnsupportedMode => "unsupported_mode",
+            Self::NotFound => "not_found",
+            Self::AlreadyExists => "already_exists",
+            Self::NotDirectory => "not_directory",
+            Self::IsDirectory => "is_directory",
+            Self::NotEmpty => "not_empty",
+            Self::StaleHandle => "stale_handle",
+            Self::GenerationMismatch => "generation_mismatch",
+            Self::OperationMismatch => "operation_mismatch",
         }
     }
 }
@@ -49,6 +92,8 @@ impl std::error::Error for FsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            Self::Database(e) => Some(e),
+            Self::BaseUnavailable { cause, .. } => Some(cause),
             _ => None,
         }
     }
@@ -253,6 +298,41 @@ impl<'de> Deserialize<'de> for EntryContent {
             ("directory", None) => Ok(Self::Directory),
             ("file", Some(version)) => Ok(Self::File { version }),
             _ => Err(serde::de::Error::custom("invalid entry kind/version")),
+        }
+    }
+}
+
+impl From<rusqlite::Error> for FsError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Database(e)
+    }
+}
+
+/// Bounded, body-free source failure context. Transport error text/URLs are not retained.
+#[derive(Debug)]
+pub enum SourceFailure {
+    Missing,
+    Deadline,
+    Io(io::Error),
+    Http(u16),
+    Transport { kind: String },
+}
+impl fmt::Display for SourceFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => f.write_str("source_missing"),
+            Self::Deadline => f.write_str("source_deadline"),
+            Self::Io(_) => f.write_str("source_io"),
+            Self::Http(status) => write!(f, "source_http_{status}"),
+            Self::Transport { kind } => write!(f, "source_transport_{kind}"),
+        }
+    }
+}
+impl std::error::Error for SourceFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
         }
     }
 }

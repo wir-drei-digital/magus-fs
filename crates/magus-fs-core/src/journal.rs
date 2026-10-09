@@ -1,0 +1,171 @@
+#[derive(Clone, Debug)]
+pub struct Pragmas {
+    pub sqlite_version: String,
+    pub journal_mode: String,
+    pub synchronous: u32,
+    pub foreign_keys: u32,
+    pub busy_timeout: u32,
+    pub fullfsync: u32,
+}
+use crate::*;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use std::{
+    fs::File,
+    os::fd::AsRawFd,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+pub(crate) struct Journal {
+    pub db: Connection,
+    control: ObjectStore,
+    _lock: File,
+    path: PathBuf,
+}
+impl Journal {
+    pub fn open(path: &Path, config: &ReplicaConfig) -> Result<Self, FsError> {
+        let control = ObjectStore::open(
+            path,
+            ObjectLimits {
+                content_roots: config.content_roots.clone(),
+                ..ObjectLimits::default()
+            },
+        )?;
+        let lock = control.control_file("owner.lock", true)?;
+        // SAFETY: lock is a live owned ordinary file. Nonblocking exclusive lock lasts until drop.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let e = std::io::Error::last_os_error();
+            return if e.kind() == std::io::ErrorKind::WouldBlock {
+                Err(FsError::ReplicaBusy)
+            } else {
+                Err(e.into())
+            };
+        }
+        let dbfile = control.control_file("journal.sqlite", true)?;
+        for leaf in [
+            "journal.sqlite-wal",
+            "journal.sqlite-shm",
+            "journal.sqlite-journal",
+        ] {
+            match control.control_file(leaf, false) {
+                Ok(_) => {}
+                Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        control.assert_path(path)?;
+        let db = Connection::open_with_flags(
+            path.join("journal.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        control.assert_path(path)?;
+        use std::os::unix::fs::MetadataExt;
+        let actual = control.control_file("journal.sqlite", false)?;
+        if actual.metadata()?.ino() != dbfile.metadata()?.ino()
+            || actual.metadata()?.dev() != dbfile.metadata()?.dev()
+        {
+            return Err(FsError::UnsafeStorage);
+        }
+        db.busy_timeout(Duration::from_millis(5000))?;
+        let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version > 1 {
+            return Err(FsError::UnsupportedSchema);
+        }
+        db.pragma_update(None, "journal_mode", "WAL")?;
+        db.pragma_update(None, "synchronous", "FULL")?;
+        db.pragma_update(None, "foreign_keys", "ON")?;
+        #[cfg(target_os = "macos")]
+        db.pragma_update(None, "fullfsync", "ON")?;
+        let mut result = Self {
+            db,
+            control,
+            _lock: lock,
+            path: path.to_path_buf(),
+        };
+        let p = result.pragmas()?;
+        if p.journal_mode != "wal"
+            || p.synchronous != 2
+            || p.foreign_keys != 1
+            || p.busy_timeout != 5000
+            || cfg!(target_os = "macos") && p.fullfsync != 1
+        {
+            return Err(FsError::UnsafeStorage);
+        }
+        let tx = result
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS configuration (singleton INTEGER PRIMARY KEY CHECK(singleton=1), value BLOB NOT NULL);
+  CREATE TABLE IF NOT EXISTS revisions (id TEXT PRIMARY KEY, descriptor BLOB NOT NULL);
+  CREATE TABLE IF NOT EXISTS working (singleton INTEGER PRIMARY KEY CHECK(singleton=1), value BLOB NOT NULL);
+  CREATE TABLE IF NOT EXISTS sources (object TEXT PRIMARY KEY, size INTEGER NOT NULL, source BLOB NOT NULL);
+  CREATE TABLE IF NOT EXISTS cache (object TEXT PRIMARY KEY, size INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS pins (revision TEXT PRIMARY KEY REFERENCES revisions(id));
+  CREATE TABLE IF NOT EXISTS operations (operation TEXT PRIMARY KEY,digest TEXT NOT NULL,state TEXT NOT NULL,result TEXT REFERENCES revisions(id),error TEXT,candidate BLOB NOT NULL);
+  PRAGMA user_version=1;")?;
+        let encoded = serde_json::to_vec(config).map_err(|_| FsError::InvalidDescriptor)?;
+        if let Some(existing) = tx
+            .query_row(
+                "SELECT value FROM configuration WHERE singleton=1",
+                [],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        {
+            if existing != encoded {
+                return Err(FsError::ConfigMismatch);
+            }
+        } else {
+            tx.execute("INSERT INTO configuration VALUES(1,?)", [encoded])?;
+        }
+        tx.commit()?;
+        result.guard()?;
+        result.control.directory().sync_all()?;
+        Ok(result)
+    }
+    pub fn guard(&self) -> Result<(), FsError> {
+        self.control.assert_path(&self.path)?;
+        for leaf in [
+            "journal.sqlite",
+            "journal.sqlite-wal",
+            "journal.sqlite-shm",
+            "journal.sqlite-journal",
+        ] {
+            match self.control.control_file(leaf, false) {
+                Ok(_) => {}
+                Err(FsError::Io(e))
+                    if e.kind() == std::io::ErrorKind::NotFound && leaf != "journal.sqlite" => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+    pub fn pragmas(&self) -> Result<Pragmas, FsError> {
+        Ok(Pragmas {
+            sqlite_version: self
+                .db
+                .query_row("SELECT sqlite_version()", [], |r| r.get(0))?,
+            journal_mode: self
+                .db
+                .pragma_query_value(None, "journal_mode", |r| r.get(0))?,
+            synchronous: self
+                .db
+                .pragma_query_value(None, "synchronous", |r| r.get(0))?,
+            foreign_keys: self
+                .db
+                .pragma_query_value(None, "foreign_keys", |r| r.get(0))?,
+            busy_timeout: self
+                .db
+                .pragma_query_value(None, "busy_timeout", |r| r.get(0))?,
+            fullfsync: self
+                .db
+                .pragma_query_value(None, "fullfsync", |r| r.get(0))?,
+        })
+    }
+    pub fn sync(&self) -> Result<(), FsError> {
+        self.guard()?;
+        self.db.execute_batch("PRAGMA wal_checkpoint(FULL)")?;
+        self.control.directory().sync_all()?;
+        Ok(())
+    }
+}
