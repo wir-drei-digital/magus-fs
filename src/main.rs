@@ -77,8 +77,28 @@ fn mount(args: &[String]) -> magus_fs_probe::Result<()> {
         }
         i += 2;
     }
+    if backend == Some("fuse") {
+        if backing.is_some() || resume {
+            return Err(
+                "FUSE FS0 uses an ephemeral private overlay; backing is unsupported".into(),
+            );
+        }
+        if !matches!(mode, Some("ro" | "private")) {
+            return Err("--mode must be ro or private".into());
+        }
+        #[cfg(target_os = "linux")]
+        return magus_fs_probe::adapters::linux::mount(
+            source.ok_or("--source required")?,
+            &mountpoint.ok_or("--mountpoint required")?,
+            mode == Some("private"),
+            expected,
+            prepare,
+        );
+        #[cfg(not(target_os = "linux"))]
+        return Err("FUSE backend requires Linux".into());
+    }
     if backend != Some("nfs") {
-        return Err("supported backend: nfs".into());
+        return Err("supported backends: nfs; fuse on Linux".into());
     }
     if !matches!(mode, Some("ro" | "private")) {
         return Err("--mode must be ro or private".into());
