@@ -6,7 +6,7 @@ The project targets macOS and Linux first. Its core scope includes full local re
 
 ## Current state
 
-The local FS0 branch contains the synthetic fixture/range source and experimentally qualified Linux FUSE adapter for pinned read-only and ephemeral private-byte views. Native macOS NFS now passes the controlled fixed-principal qualification after Network Volumes permission and a narrow dependency permission fix. The combined twelve-profile native matrix passes; task and whole-branch reviews remain pending. The [combined qualification runbook](docs/fs0-qualification.md) describes six fresh profiles per platform, strict reports and exact limits; platform details are in the [Linux](docs/fs0-linux.md) and [macOS](docs/fs0-macos.md) runbooks. No filesystem release, completed FS0 or integrated PoC is claimed.
+The local FS0 branch contains the synthetic fixture/range source and experimentally qualified Linux FUSE adapter for pinned read-only and ephemeral private-byte views. Native macOS NFS now passes the controlled fixed-principal qualification after Network Volumes permission and a narrow dependency permission fix. The combined twelve-profile native matrix passes; task reviews and whole-branch review corrections are complete. FS0 is qualified as an unmerged experimental checkpoint, with the final signal-stream reporting limitation recorded in the runbook. The [combined qualification runbook](docs/fs0-qualification.md) describes six fresh profiles per platform, strict reports and exact limits; platform details are in the [Linux](docs/fs0-linux.md) and [macOS](docs/fs0-macos.md) runbooks. No filesystem release or integrated PoC is claimed.
 
 ## Shared specifications and progress
 

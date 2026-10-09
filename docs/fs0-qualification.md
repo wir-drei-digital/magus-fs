@@ -1,6 +1,6 @@
 # FS0 qualification runner
 
-The final combined native matrix passed all twelve profiles: two fresh journeys at65536/262144/1048576-byte chunks on Linux FUSE and macOS NFS. Each profile passed all11 normalized required cases and cleanup. Task and whole-branch review remain pending; this is a bounded synthetic adapter qualification, not a filesystem release or integrated PoC.
+The final combined native matrix passed all twelve profiles: two fresh journeys at65536/262144/1048576-byte chunks on Linux FUSE and macOS NFS. Each profile passed all11 normalized required cases and cleanup. Task and whole-branch review corrections are complete at code `c55167f`; this is a bounded synthetic adapter qualification, not a filesystem release or integrated PoC.
 
 The measured invocation was:
 
@@ -43,4 +43,12 @@ Native cleanup unmounts owned views before reaping servers and retains failed-ru
 
 Read-only inventory selected Visual Studio Code1.135.0 and codex-cli0.158.0-alpha.13 for later real compatibility journeys; Claude Code2.1.295 is also installed. Installed versions are not compatibility proof. No editor session, paid model call, personal configuration edit or install occurred. Real editor and external-harness journeys remain an integrated PoC gate.
 
-The pinned Linux `fuser`0.18.0 and patched macOS `nfsserve`0.11.0 qualify only for this FS0 scope; see [Linux](fs0-linux.md) and [Mac](fs0-macos.md). Synthetic HTTP has no authentication/TLS; digest pinning provides identity/integrity, not principal authentication. Durable replicas/history, authenticated update authority, general multiuser/supplemental-group policy, generation publication/invalidation and complete namespace operations remain future implementation gates. The controller owns final review, ICM reconciliation and subsequent FS1 planning.
+The pinned Linux `fuser`0.18.0 and patched macOS `nfsserve`0.11.0 qualify only for this FS0 scope; see [Linux](fs0-linux.md) and [Mac](fs0-macos.md). Synthetic HTTP has no authentication/TLS; digest pinning provides identity/integrity, not principal authentication. Durable replicas/history, authenticated update authority, general multiuser/supplemental-group policy, generation publication/invalidation and complete namespace operations remain future implementation gates. FS1 planning follows this qualified checkpoint; the shared ICM tracks current execution.
+
+## Reviewed correction checkpoint
+
+Code `c55167f` closes the final FSINFO ancestor-metadata bypass: denied optional attributes are omitted through authorized getattr, while the successful filesystem-info encoding remains intact. Nine real NFS wire tests pass, including denied and authorized handles. Late finite SIGINT/SIGTERM during final cleanup/serialization now yields a failed report and exit1, tested on Python3.9.6 and3.14.7. Host Rust4 and Linux Rust7 plus fmt/clippy/build pass. The original twelve-profile matrix and later supervised Mac profile retain their original binaries and provenance; they were not relabeled or repeated for this narrow correction.
+
+For a fresh run of the corrected build, explicitly select `--image fs0-final-runtime`. Its image ID is `sha256:474b2bcb09d7ad22e9a73b1588bfdec0e21719e2bc30445277101bf771e96ac0`; host binary SHA256 is `66a1d977d980e6726afa52dbf9e424ee8a0a8077e9966d5d1be200e7e6679507`, Linux binary is `ae30dd8e34d49480dacbaba5613f56acf67ea5e9082804d71a7ba89eaa2e8de8`. Earlier image references above describe the measured matrix. The runner default remains that historical image, so use the explicit flag.
+
+One reviewed Minor remains: a continuous SIGINT/SIGTERM stream during every final report write can prevent the publication retry loop from returning until signals stop. This occurs after owned cleanup, preserves failed status for observed interruption and does not invalidate native results. FS1's first harness task must replace it with bounded publication and a sticky failed result. No production cancellation-liveness guarantee is claimed from this checkpoint.
