@@ -159,24 +159,30 @@ pub async fn provision(db: &crate::db::Database, records: Vec<Provision>) -> Res
         record.validate()?;
     }
     let mut connection = db.acquire().await?;
-    let tx = connection.transaction().await?;
-    for r in records {
-        let ns = r.namespace.as_str();
-        tx.execute(
-            "INSERT INTO namespaces(id) VALUES($1) ON CONFLICT DO NOTHING",
-            &[&ns],
-        )
-        .await?;
-        lock_namespace(&tx, ns).await?;
-        tx.execute(
-            "INSERT INTO principals(namespace,id) VALUES($1,$2) ON CONFLICT DO NOTHING",
-            &[&ns, &r.principal.as_str()],
-        )
-        .await?;
-        insert_credential(&tx, &r, None).await?;
-    }
-    tx.commit().await?;
-    Ok(())
+    connection
+        .run(|connection| {
+            Box::pin(async move {
+                let tx = connection.transaction().await?;
+                for r in records {
+                    let ns = r.namespace.as_str();
+                    tx.execute(
+                        "INSERT INTO namespaces(id) VALUES($1) ON CONFLICT DO NOTHING",
+                        &[&ns],
+                    )
+                    .await?;
+                    lock_namespace(&tx, ns).await?;
+                    tx.execute(
+                        "INSERT INTO principals(namespace,id) VALUES($1,$2) ON CONFLICT DO NOTHING",
+                        &[&ns, &r.principal.as_str()],
+                    )
+                    .await?;
+                    insert_credential(&tx, &r, None).await?;
+                }
+                tx.commit().await?;
+                Ok(())
+            })
+        })
+        .await
 }
 pub async fn insert_credential(
     tx: &tokio_postgres::Transaction<'_>,

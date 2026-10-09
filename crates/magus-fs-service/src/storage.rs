@@ -77,6 +77,8 @@ impl VerifiedObjects {
         }
         let (key, generation) = {
             let mut db = self.db.acquire().await?;
+            let bytes = &bytes;
+            db.run(|db| Box::pin(async move {
             let tx = db.transaction().await?;
             lock_namespace(&tx, &context.namespace).await?;
             let current = authenticate(&tx, &context.token_hash, &context.namespace).await?;
@@ -111,7 +113,8 @@ impl VerifiedObjects {
             }
             tx.execute("UPDATE objects SET lease_until=GREATEST(lease_until,(SELECT expires FROM upload_sessions WHERE id=$3)) WHERE namespace=$1 AND object_id=$2",&[&context.namespace,&id.as_str(),&session.as_str()]).await?;
             tx.commit().await?;
-            (key, generation)
+            Ok((key, generation))
+            })).await?
         };
         let path = Path::from(key);
         // Conditional create never overwrites an installed generation. An uncertain
@@ -138,10 +141,13 @@ impl VerifiedObjects {
             || readback.as_ref().is_ok_and(|stored| stored != &bytes);
         if corrupt {
             let mut db = self.db.acquire().await?;
+            db.run(|db| Box::pin(async move {
             let tx = db.transaction().await?;
             lock_namespace(&tx, &context.namespace).await?;
             tx.execute("UPDATE objects SET state='corrupt' WHERE namespace=$1 AND object_id=$2 AND generation=$3 AND state IN ('uploading','ready')", &[&context.namespace, &id.as_str(), &generation]).await?;
             tx.commit().await?;
+            Ok(())
+            })).await?;
             return Err(Error::invalid("corrupt_object"));
         }
         readback?;
@@ -151,6 +157,7 @@ impl VerifiedObjects {
             std::future::pending::<()>().await;
         }
         let mut db = self.db.acquire().await?;
+        db.run(|db| Box::pin(async move {
         let tx = db.transaction().await?;
         lock_namespace(&tx, &context.namespace).await?;
         let current = authenticate(&tx, &context.token_hash, &context.namespace).await?;
@@ -163,6 +170,7 @@ impl VerifiedObjects {
         tx.execute("UPDATE session_objects SET completed=true WHERE upload=$1 AND object_id=$2 AND generation=$3",&[&session.as_str(),&id.as_str(),&generation]).await?;
         tx.commit().await?;
         Ok(())
+        })).await
     }
     async fn read_verified(&self, path: &Path, id: &ObjectId, size: usize) -> Result<Bytes> {
         let result = self.store.get(path).await.map_err(|_| Error::backend())?;

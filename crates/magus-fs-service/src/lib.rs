@@ -114,10 +114,15 @@ impl ServiceState {
         {
             return Err(Error::unauthorized());
         }
-        let db = self.db.acquire().await?;
-        let context = authenticate(&*db, &digest(bearer.as_bytes()), namespace).await?;
-        context.action(action)?;
-        Ok(context)
+        let mut db = self.db.acquire().await?;
+        db.run(|db| {
+            Box::pin(async move {
+                let context = authenticate(db, &digest(bearer.as_bytes()), namespace).await?;
+                context.action(action)?;
+                Ok(context)
+            })
+        })
+        .await
     }
 }
 async fn bounded(State(state): State<ServiceState>, req: Request, next: Next) -> Response {
@@ -208,6 +213,7 @@ async fn create_upload(
     let _: Empty = json_body(body, &headers).await?;
     let upload = UploadId::random().map_err(|_| Error::backend())?;
     let mut db = state.db.acquire().await?;
+    db.run(|db| Box::pin(async move {
     let tx = db.transaction().await?;
     db::lock_namespace(&tx, &namespace).await?;
     let current = authenticate(&tx, &context.token_hash, &namespace).await?;
@@ -215,6 +221,7 @@ async fn create_upload(
     tx.execute("INSERT INTO upload_sessions(id,namespace,credential,generation,principal,replica,expires) SELECT $1,$2,id,generation,principal,replica,LEAST(expires,clock_timestamp()+make_interval(secs=>$4::double precision)) FROM credentials WHERE id=$3",&[&upload.as_str(),&namespace,&current.credential,&(UPLOAD_LEASE_SECONDS as f64)]).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(json!({"upload":upload}))))
+    })).await
 }
 async fn list_upload(
     State(state): State<ServiceState>,
@@ -224,6 +231,7 @@ async fn list_upload(
     let context = state.auth(&headers, &namespace, "write").await?;
     let upload = UploadId::parse(upload).map_err(|_| Error::not_found())?;
     let mut db = state.db.acquire().await?;
+    db.run(|db| Box::pin(async move {
     let tx = db.transaction().await?;
     db::lock_namespace(&tx, &namespace).await?;
     let current = authenticate(&tx, &context.token_hash, &namespace).await?;
@@ -236,6 +244,7 @@ async fn list_upload(
         .collect();
     tx.commit().await?;
     Ok(Json(json!({"upload":upload,"objects":objects})))
+    })).await
 }
 async fn install(
     State(state): State<ServiceState>,
@@ -278,6 +287,7 @@ async fn grants(
     let context = state.auth(&headers, &namespace, "admin").await?;
     let request: GrantRequest = json_body(body, &headers).await?;
     let mut db = state.db.acquire().await?;
+    db.run(|db| Box::pin(async move {
     let tx = db.transaction().await?;
     db::lock_namespace(&tx, &namespace).await?;
     let current = authenticate(&tx, &context.token_hash, &namespace).await?;
@@ -341,6 +351,7 @@ async fn grants(
     .await?;
     tx.commit().await?;
     Ok(Json(response))
+    })).await
 }
 fn narrower(c: &AuthContext, actions: &[String], branches: &[String], prefixes: &[String]) -> bool {
     actions.iter().all(|a| c.actions.contains(a))
