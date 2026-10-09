@@ -65,3 +65,43 @@ impl From<BranchName> for String {
         b.0
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewBinding {
+    pub view: ViewId,
+    pub head: HeadToken,
+    pub revision: crate::RevisionId,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateReceipt {
+    pub receipt: ReceiptId,
+    pub operation: crate::OperationId,
+    pub replica: crate::ReplicaId,
+    pub submitted_revision: crate::RevisionId,
+    pub original_view: ViewId,
+    pub original_head: HeadToken,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedReceipt {
+    pub receipt: ReceiptId,
+    pub operation: crate::OperationId,
+    pub replica: crate::ReplicaId,
+    pub submitted_revision: crate::RevisionId,
+    pub branch: BranchName,
+    pub head: HeadToken,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeEvent {
+    pub sequence: i64,
+    pub head: HeadToken,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangePage {
+    pub events: Vec<ChangeEvent>,
+    pub cursor: i64,
+}

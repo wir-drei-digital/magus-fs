@@ -1,8 +1,14 @@
 //! Standalone authenticated upload authority. Upload readiness is not publication.
 pub mod auth;
+mod changes;
 pub mod config;
 pub mod db;
+pub mod policy;
+mod publication;
+mod revisions;
 pub mod storage;
+mod submission;
+pub mod views;
 use auth::{authenticate, digest, AuthContext};
 use axum::{
     body::{Body, Bytes},
@@ -31,6 +37,12 @@ impl Error {
         Self {
             status: StatusCode::BAD_REQUEST,
             code,
+        }
+    }
+    pub fn pressure() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "backpressure",
         }
     }
     pub fn backend() -> Self {
@@ -85,6 +97,7 @@ pub struct ServiceState {
     pub db: Arc<db::Database>,
     pub objects: Arc<storage::VerifiedObjects>,
     requests: Arc<tokio::sync::Semaphore>,
+    revision_work: Arc<tokio::sync::Semaphore>,
 }
 impl ServiceState {
     pub async fn open(config: config::Config) -> Result<Self> {
@@ -94,7 +107,14 @@ impl ServiceState {
             db,
             objects,
             requests: Arc::new(tokio::sync::Semaphore::new(32)),
+            revision_work: Arc::new(tokio::sync::Semaphore::new(2)),
         })
+    }
+    pub(crate) fn revision_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.revision_work
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::pressure())
     }
     async fn auth(
         &self,
@@ -129,7 +149,32 @@ async fn bounded(State(state): State<ServiceState>, req: Request, next: Next) ->
     let Ok(_permit) = state.requests.try_acquire() else {
         return Error::backend().into_response();
     };
-    match tokio::time::timeout(Duration::from_secs(10), next.run(req)).await {
+    // Admission precedes body allocation and descriptor work. No detached work
+    // escapes this scope; WSS acquires separately for each bounded paging tick.
+    let path = req.uri().path();
+    let expensive = path.contains("/revisions/")
+        || path.contains("/views/")
+        || path.contains("/operations/")
+        || ["/seed", "/views", "/candidates", "/integrations"]
+            .iter()
+            .any(|suffix| path.ends_with(suffix));
+    let _revision_permit = if expensive {
+        match state.revision_permit() {
+            Ok(p) => Some(p),
+            Err(e) => return e.into_response(),
+        }
+    } else {
+        None
+    };
+    let seconds = if req.uri().path().ends_with("/candidates")
+        || req.uri().path().ends_with("/integrations")
+        || req.uri().path().ends_with("/seed")
+    {
+        60
+    } else {
+        10
+    };
+    match tokio::time::timeout(Duration::from_secs(seconds), next.run(req)).await {
         Ok(r) => r,
         Err(_) => Error::backend().into_response(),
     }
@@ -147,6 +192,34 @@ pub fn router(state: ServiceState) -> Router {
             put(install),
         )
         .route("/v1/n/{namespace}/grants", post(grants))
+        .route(
+            "/v1/n/{namespace}/uploads/{upload}/revisions/{revision}",
+            put(submission::stage),
+        )
+        .route("/v1/n/{namespace}/seed", post(publication::seed))
+        .route("/v1/n/{namespace}/views", post(views::create))
+        .route(
+            "/v1/n/{namespace}/views/{view}/descriptor",
+            get(views::descriptor),
+        )
+        .route(
+            "/v1/n/{namespace}/views/{view}/objects/{object}",
+            get(views::object),
+        )
+        .route("/v1/n/{namespace}/candidates", post(submission::candidate))
+        .route(
+            "/v1/n/{namespace}/integrations",
+            post(publication::integrate),
+        )
+        .route(
+            "/v1/n/{namespace}/operations/{replica}/{operation}",
+            get(submission::get_operation),
+        )
+        .route("/v1/n/{namespace}/changes", get(changes::changes))
+        .route(
+            "/v1/n/{namespace}/notifications",
+            get(changes::notifications),
+        )
         .fallback(|| async { Error::not_found() })
         .layer(middleware::from_fn_with_state(state.clone(), bounded))
         .with_state(state)
@@ -324,6 +397,7 @@ async fn grants(
             getrandom::fill(&mut bytes).map_err(|_| Error::backend())?;
             let token = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
             let r = auth::Provision {
+                authority: None, root_policy: None,
                 namespace: NamespaceId::parse(namespace.clone()).map_err(|_| Error::not_found())?,
                 principal: magus_fs_core::PrincipalId::parse(current.principal.clone())
                     .map_err(|_| Error::not_found())?,

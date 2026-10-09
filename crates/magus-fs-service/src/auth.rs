@@ -21,6 +21,7 @@ pub struct AuthContext {
     pub(crate) actions: Vec<String>,
     pub(crate) branches: Vec<String>,
     pub(crate) prefixes: Vec<String>,
+    pub(crate) depth: usize,
 }
 impl AuthContext {
     pub fn namespace(&self) -> &str {
@@ -72,11 +73,13 @@ pub async fn authenticate<C: GenericClient + Sync>(
     let row=db.query_opt("SELECT c.*, g.actions,g.branches,g.prefixes FROM credentials c JOIN grants g ON g.credential=c.id WHERE token_hash=$1 AND NOT revoked AND expires>clock_timestamp()",&[&hash]).await?.ok_or(Error::unauthorized())?;
     let mut parent: Option<String> = row.get("parent");
     let mut generation: Option<i64> = row.get("parent_generation");
+    let mut ancestors = 0;
     for depth in 0..=8 {
         let Some(id) = parent else { break };
         if depth == 8 {
             return Err(Error::unauthorized());
         }
+        ancestors += 1;
         let p=db.query_opt("SELECT generation,parent,parent_generation FROM credentials WHERE id=$1 AND NOT revoked AND expires>clock_timestamp()",&[&id]).await?.ok_or(Error::unauthorized())?;
         if generation != Some(p.get("generation")) {
             return Err(Error::unauthorized());
@@ -94,6 +97,7 @@ pub async fn authenticate<C: GenericClient + Sync>(
         actions: row.get("actions"),
         branches: row.get("branches"),
         prefixes: row.get("prefixes"),
+        depth: ancestors,
     };
     if context.namespace != namespace {
         return Err(Error::not_found());
@@ -104,6 +108,8 @@ pub async fn authenticate<C: GenericClient + Sync>(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provision {
+    pub authority: Option<crate::policy::AuthorityConfig>,
+    pub root_policy: Option<crate::policy::RootPolicy>,
     pub namespace: NamespaceId,
     pub principal: PrincipalId,
     pub replica: ReplicaId,
@@ -115,6 +121,7 @@ pub struct Provision {
 }
 impl Provision {
     pub fn validate(&self) -> Result<()> {
+        crate::policy::validate(self)?;
         if self.token.len() != 64
             || !self
                 .token
@@ -176,6 +183,7 @@ pub async fn provision(db: &crate::db::Database, records: Vec<Provision>) -> Res
                         &[&ns, &r.principal.as_str()],
                     )
                     .await?;
+                    crate::policy::install(&tx, &r).await?;
                     insert_credential(&tx, &r, None).await?;
                 }
                 tx.commit().await?;
@@ -189,6 +197,9 @@ pub async fn insert_credential(
     r: &Provision,
     parent: Option<&AuthContext>,
 ) -> Result<String> {
+    if let Some(parent) = parent {
+        check_child_depth(parent.depth)?;
+    }
     let id = NamespaceId::random()
         .map_err(|_| Error::backend())?
         .as_str()
@@ -220,4 +231,12 @@ pub async fn insert_credential(
     )
     .await?;
     Ok(id)
+}
+
+pub fn check_child_depth(parent_depth: usize) -> Result<()> {
+    if parent_depth >= 8 {
+        Err(Error::invalid("delegation_depth"))
+    } else {
+        Ok(())
+    }
 }

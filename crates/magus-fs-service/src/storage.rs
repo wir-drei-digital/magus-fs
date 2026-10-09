@@ -172,6 +172,26 @@ impl VerifiedObjects {
         Ok(())
         })).await
     }
+    pub async fn read_authorized(
+        &self,
+        context: &AuthContext,
+        view: &magus_fs_core::protocol::ViewId,
+        id: &ObjectId,
+    ) -> Result<Bytes> {
+        let (snapshot, key, generation, size) =
+            crate::views::object_record(&self.db, context, view, id).await?;
+        let bytes = self.read_verified(&Path::from(key), id, size).await;
+        if bytes.as_ref().is_err_and(|e| e.code == "corrupt_object") {
+            self.db.acquire().await?.run(|db|Box::pin(async move {
+                let tx=db.transaction().await?;lock_namespace(&tx,&context.namespace).await?;
+                tx.execute("UPDATE objects SET state='corrupt' WHERE namespace=$1 AND object_id=$2 AND generation=$3",&[&context.namespace,&id.as_str(),&generation]).await?;
+                tx.commit().await?;Ok(())
+            })).await?;
+        }
+        let bytes = bytes?;
+        crate::revisions::final_read(&self.db, &snapshot).await?;
+        Ok(bytes)
+    }
     async fn read_verified(&self, path: &Path, id: &ObjectId, size: usize) -> Result<Bytes> {
         let result = self.store.get(path).await.map_err(|_| Error::backend())?;
         if result.meta.size != size as u64 {

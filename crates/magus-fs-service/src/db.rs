@@ -79,7 +79,13 @@ impl Database {
             .run(|client| {
                 Box::pin(async move {
                     client
-                        .batch_execute(include_str!("../migrations/001_authority.sql"))
+                        .batch_execute(
+                            &[
+                                include_str!("../migrations/001_authority.sql"),
+                                include_str!("../migrations/002_revisions.sql"),
+                            ]
+                            .concat(),
+                        )
                         .await?;
                     Ok(())
                 })

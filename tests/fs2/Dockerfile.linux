@@ -8,6 +8,7 @@ COPY benches ./benches
 COPY crates ./crates
 COPY tests ./tests
 ARG VERIFY=1
+RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target if [ "$VERIFY" = service ]; then rustc --version --verbose && cargo fmt --all --check && cargo clippy --locked --workspace --all-targets --all-features -- -D warnings && cargo test --locked -p magus-fs-service --all-features; fi
 RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target if [ "$VERIFY" = 1 ]; then rustc --version --verbose && cargo fmt --all --check && cargo clippy --locked --workspace --all-targets --all-features -- -D warnings && cargo test --locked --workspace --all-features; fi
 RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target cargo build --locked -p magus-fs-service --features test-faults && mkdir /out && cp target/debug/magus-fs-service /out/magus-fs-service-faults && cargo build --locked -p magus-fs-service && cp target/debug/magus-fs-service /out/magus-fs-service
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
