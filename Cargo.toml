@@ -30,3 +30,8 @@ fastcdc = "=5.0.0"
 [[example]]
 name = "chunk_layout"
 path = "benches/chunk_layout.rs"
+
+[workspace]
+members = ["crates/magus-fs-core"]
+default-members = [".", "crates/magus-fs-core"]
+resolver = "2"
