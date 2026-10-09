@@ -4,6 +4,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY vendor ./vendor
 COPY src ./src
+COPY benches ./benches
 COPY tests/*.rs ./tests/
 COPY tests/fs0/permission_source.py ./tests/fs0/
 RUN --mount=type=cache,id=fs0-task3-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs0-task3-target,target=/src/target rustc --version --verbose && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo build --locked && mkdir -p /out && cp target/debug/magus-fs-probe /out/

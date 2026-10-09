@@ -5,6 +5,9 @@ from pathlib import Path
 import subprocess
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "support"))
+from publication import publish_result
+
 from inventory import collect
 from macos_report import summarize_macos
 from macos_supervisor import Interrupts
@@ -253,19 +256,7 @@ def matrix_main(argv,interrupts):
     if result['cleanup_errors']:
         result.update(state='failed',passed=False,exit_code=1)
     print(path,flush=True)
-    # Handlers only record a scalar. Reconcile outside serialization, then retry
-    # publication if a signal arrived while encoding or writing the result.
-    while True:
-        observed_interrupts = interrupts.count
-        if observed_interrupts:
-            result.update(state='failed',passed=False,exit_code=1,parent_interrupts=observed_interrupts)
-            failure = 'parent interrupted; inspect retained owned profile resources'
-            failures = result.setdefault('failures',[])
-            if failure not in failures:
-                failures.append(failure)
-        save()
-        if interrupts.count == observed_interrupts:
-            return result['exit_code']
+    return publish_result(result, path, interrupts)
 
 
 if __name__ == '__main__':

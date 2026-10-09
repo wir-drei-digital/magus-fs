@@ -1,5 +1,7 @@
 """Synthetic exception-boundary reports; no native mount/daemon claims or calls."""
 import json
+import os
+import signal
 from pathlib import Path
 import subprocess
 import tempfile
@@ -79,3 +81,69 @@ class OrchestrationFailures(unittest.TestCase):
         profile = report['platforms']['linux']['profiles'][0]
         self.assertEqual(profile['orchestration_error']['type'],'FileNotFoundError')
         self.assertIn('native_report_error',profile)
+
+
+class BoundedPublication(unittest.TestCase):
+    """Catches unlimited retries; actual handlers, JSON, files and cleanup run."""
+    def test_real_signals_bound_final_publication(self):
+        original_dumps = json.dumps
+        original_write = Path.write_text
+        original_cleanup = run.OwnedOutput.cleanup
+        for stage in ('initial_serialization', 'cleanup', 'every_publication'):
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(stage=stage, signal=signum), tempfile.TemporaryDirectory() as folder:
+                    output = Path(folder).resolve() / 'report'
+                    publications = []
+                    delivered = []
+                    previous = signal.getsignal(signum)
+                    def send():
+                        delivered.append(signum)
+                        os.kill(os.getpid(), signum)
+                    def dumps(value, *args, **kwargs):
+                        if isinstance(value, dict) and 'exit_code' in value:
+                            if stage == 'initial_serialization' and not delivered:
+                                send()
+                        return original_dumps(value, *args, **kwargs)
+                    def write(path, data, *args, **kwargs):
+                        answer = original_write(path, data, *args, **kwargs)
+                        if path == output / 'result.json' and 'exit_code' in json.loads(data):
+                            publications.append(json.loads(data))
+                            if stage == 'every_publication':
+                                send()
+                                if len(publications) == 3:
+                                    raise RuntimeError('test-only unlimited-publication cap')
+                        return answer
+                    def cleanup(owned, *args, **kwargs):
+                        answer = original_cleanup(owned, *args, **kwargs)
+                        if stage == 'cleanup':
+                            send()
+                        return answer
+                    def command(args, **kwargs):
+                        return subprocess.CompletedProcess(args, 0, 'synthetic revision', '')
+                    def aggregate(*args):
+                        return dict(state='passed', passed=True, exit_code=0, failures=[])
+                    with patch.object(run, 'collect', return_value={}), \
+                         patch.object(run, 'check', return_value={}), \
+                         patch.object(run.subprocess, 'run', side_effect=command), \
+                         patch.object(run, 'aggregate', side_effect=aggregate), \
+                         patch.object(run.json, 'dumps', side_effect=dumps), \
+                         patch.object(Path, 'write_text', write), \
+                         patch.object(run.OwnedOutput, 'cleanup', cleanup):
+                        try:
+                            code = run.main(['--preflight', '--output', str(output)])
+                        except RuntimeError as error:
+                            if str(error) != 'test-only unlimited-publication cap':
+                                raise
+                            code = 'unbounded'
+                    self.assertEqual(signal.getsignal(signum), previous)
+                    self.assertEqual(code, 1)
+                    self.assertLessEqual(len(publications), 2)
+                    result = json.loads((output / 'result.json').read_text())
+                    self.assertEqual(result['exit_code'], 1)
+                    self.assertFalse(result['passed'])
+                    self.assertEqual(result['state'], 'failed')
+                    self.assertGreaterEqual(result['parent_interrupts'], 1)
+                    self.assertLessEqual(result['parent_interrupts'], len(delivered))
+                    self.assertEqual(len(result['failures']), 1)
+                    print('signal-evidence', stage, int(signum), 'publications', len(publications),
+                          'delivered', len(delivered), 'sampled', result['parent_interrupts'])
