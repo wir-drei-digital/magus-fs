@@ -90,8 +90,8 @@ class NfsWireTests(unittest.TestCase):
         source = self.start("source", "--root", str(self.root / "source"))
         self.url = ready(source)
 
-    def start(self, *args):
-        process = subprocess.Popen([str(BIN), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    def start(self, *args, **kwargs):
+        process = subprocess.Popen([str(BIN), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kwargs)
         self.processes.append(process)
         return process
 
@@ -217,6 +217,68 @@ class NfsWireTests(unittest.TestCase):
         forged = root[:-8] + struct.pack(">Q", index)
         self.assertEqual(newer.call(100003, 6, opaque(forged) + struct.pack(">QI", 0, 20))[:4], words(13))
         self.assertEqual(newer.call(100003, 6, opaque(handle) + struct.pack(">QI", 0, 20))[:4], words(70))
+        _, private = self.private_endpoint("restricted-private", url=url, umask=0o077)
+        parent = private.lookup(private.mount(), b"nested")
+        self.assertEqual(private.call(100003, 1, opaque(parent))[8:12], words(0))
+        self.assertEqual(private.call(100003, 3, opaque(parent) + opaque(b"table.csv"))[:4], words(13))
+
+    def private_endpoint(self, name, url=None, resume=False, **kwargs):
+        args = ["mount", "--backend", "nfs", "--source", url or self.url,
+                "--mountpoint", str(self.root / name), "--mode", "private",
+                "--backing", str(self.root / "backing"), "--prepare-only"]
+        if resume:
+            args.append("--resume-backing")
+        process = self.start(*args, **kwargs)
+        return process, Rpc(json.loads(ready(process))["port"])
+
+    def test_private_directory_modes_ignore_umask(self):
+        # A shell umask must not change the advertised/authorized manifest modes.
+        process, rpc = self.private_endpoint("umask", umask=0o077)
+        root = rpc.mount()
+        nested = rpc.lookup(root, b"nested")
+        for handle in (root, nested):
+            attrs = rpc.call(100003, 1, opaque(handle))
+            self.assertEqual(attrs[8:12], words(0o755))
+
+    def test_private_chmod_modes_survive_resume(self):
+        # Acknowledged metadata must survive restart even when O_RDWR is denied.
+        process, rpc = self.private_endpoint("chmod0")
+        handle = rpc.lookup(rpc.mount(), b"instructions.md")
+        backing = self.root / "backing"
+        backing.chmod(0o500)
+        try:
+            request = opaque(handle) + words(1, 0o444, 0, 0, 0, 0, 0, 0)
+            self.assertEqual(rpc.call(100003, 2, request)[:4], words(5))
+            self.assertEqual(rpc.call(100003, 1, opaque(handle))[8:12], words(0o644))
+        finally:
+            backing.chmod(0o700)
+        for index, mode in enumerate((0o444, 0o200, 0o000)):
+            handle = rpc.lookup(rpc.mount(), b"instructions.md")
+            chmod = opaque(handle) + words(1, mode, 0, 0, 0, 0, 0, 0)
+            self.assertEqual(rpc.call(100003, 2, chmod)[:4], words(0))
+            process.kill()
+            process.communicate(timeout=5)
+            process, rpc = self.private_endpoint("chmod" + str(index + 1), resume=True)
+            handle = rpc.lookup(rpc.mount(), b"instructions.md")
+            attrs = rpc.call(100003, 1, opaque(handle))
+            self.assertEqual(attrs[8:12], words(mode))
+            read = rpc.call(100003, 6, opaque(handle) + struct.pack(">QI", 0, 7))
+            self.assertEqual(read[:4], words(0 if mode & 0o400 else 13))
+            write = rpc.call(100003, 7, opaque(handle) + struct.pack(">QII", 0, 7, 2) + opaque(b"durable"))
+            self.assertEqual(write[:4], words(0 if mode & 0o200 else 13))
+        # Restore exported access and observe content acknowledged in the write-only round.
+        self.assertEqual(rpc.call(100003, 2, opaque(handle) + words(1, 0o644, 0, 0, 0, 0, 0, 0))[:4], words(0))
+        self.assertIn(b"durable", rpc.call(100003, 6, opaque(handle) + struct.pack(">QI", 0, 7)))
+        process.kill()
+        process.communicate(timeout=5)
+        (backing / "permissions.json").rename(backing / "saved-permissions.json")
+        legacy = self.start("mount", "--backend", "nfs", "--source", self.url,
+                            "--mountpoint", str(self.root / "legacy"), "--mode", "private",
+                            "--backing", str(backing), "--resume-backing", "--prepare-only")
+        _, error = legacy.communicate(timeout=10)
+        self.assertEqual(legacy.returncode, 2)
+        self.assertIn("legacy FS0 backing is unsupported", error)
+        self.assertTrue((backing / "tree/instructions.md").read_bytes().startswith(b"durable"))
 
     def test_fixed_principal_read_denial(self):
         # Raw RPC cannot bypass the fixed actor's mode check, including root credentials.

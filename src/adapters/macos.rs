@@ -7,13 +7,47 @@ use std::io::Write;
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 struct Backing {
     files: Vec<File>,
     root: File,
     serial: Mutex<()>,
+    permissions: Mutex<ExportedPermissions>,
+    permissions_path: PathBuf,
+}
+// Small FS0 metadata snapshot, not a revision journal. Host access stays private
+// and owner-readable; only this exported metadata governs NFS mode decisions.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ExportedPermissions {
+    manifest_digest: String,
+    modes: Vec<u32>,
+}
+fn save_permissions(path: &Path, state: &ExportedPermissions) -> Result<()> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let staging = path.with_extension(format!("tmp.{}.{nonce}", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staging)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(&serde_json::to_vec(state)?)?;
+        durable(&file)?;
+        std::fs::rename(&staging, path)?;
+        File::open(path.parent().ok_or("permissions parent missing")?)?.sync_all()?;
+        // Flush the rename's directory metadata before publishing mode/ACK.
+        durable(&file)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    result
 }
 fn durable(file: &File) -> std::io::Result<()> {
     file.sync_all()?;
@@ -76,6 +110,8 @@ impl NfsAdapter {
         }
         let marker = root.join("manifest.json");
         let tree = root.join("tree");
+        let permissions_path = root.join("permissions.json");
+        let permissions;
         if resume {
             let stored: crate::Manifest = serde_json::from_reader(
                 OpenOptions::new()
@@ -86,10 +122,35 @@ impl NfsAdapter {
             if stored.digest != self.digest || stored.canonical_digest() != self.digest {
                 return Err("backing digest mismatch".into());
             }
+            permissions = serde_json::from_reader::<_, ExportedPermissions>(
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&permissions_path)
+                    .map_err(|e| {
+                        format!(
+                            "permissions snapshot required; legacy FS0 backing is unsupported: {e}"
+                        )
+                    })?,
+            )?;
+            if permissions.manifest_digest != self.digest
+                || permissions.modes.len() != self.entries.len()
+                || permissions.modes.iter().any(|mode| mode & !0o7777 != 0)
+                || self
+                    .entries
+                    .iter()
+                    .zip(&permissions.modes)
+                    .any(|(entry, mode)| entry.directory && entry.mode != *mode)
+            {
+                return Err("invalid backing permissions snapshot".into());
+            }
         } else {
             std::fs::create_dir(&tree)?;
+            std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o700))?;
             for entry in self.entries.iter().skip(1).filter(|e| e.directory) {
-                std::fs::create_dir(tree.join(&entry.path))?;
+                let path = tree.join(&entry.path);
+                std::fs::create_dir(&path)?;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
             }
             let mut probe = self.probe.lock().map_err(|_| "probe poisoned")?;
             for entry in self.entries.iter().skip(1).filter(|e| !e.directory) {
@@ -110,13 +171,18 @@ impl NfsAdapter {
                     file.write_all(&data)?;
                     offset += data.len() as u64;
                 }
-                file.set_permissions(std::fs::Permissions::from_mode(entry.mode))?;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
                 durable(&file)?;
             }
             self.hydrated_bytes = probe.fetched_bytes();
             for entry in self.entries.iter().filter(|e| e.directory) {
                 File::open(tree.join(&entry.path))?.sync_all()?;
             }
+            permissions = ExportedPermissions {
+                manifest_digest: self.digest.clone(),
+                modes: self.entries.iter().map(|e| e.mode).collect(),
+            };
+            save_permissions(&permissions_path, &permissions)?;
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -125,6 +191,7 @@ impl NfsAdapter {
             file.write_all(&serde_json::to_vec(probe.manifest())?)?;
             durable(&file)?;
             File::open(root)?.sync_all()?;
+            durable(&file)?;
         }
         let mut files = Vec::new();
         for entry in &self.entries {
@@ -143,6 +210,8 @@ impl NfsAdapter {
             files,
             root: File::open(root)?,
             serial: Mutex::new(()),
+            permissions: Mutex::new(permissions),
+            permissions_path,
         });
         Ok(())
     }
@@ -155,7 +224,11 @@ impl NfsAdapter {
             let metadata = backing.files[id as usize - 1]
                 .metadata()
                 .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-            entry.mode = metadata.mode() & 0o7777;
+            entry.mode = backing
+                .permissions
+                .lock()
+                .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                .modes[id as usize - 1];
             entry.size = metadata.len();
         }
         Ok(entry)
@@ -409,12 +482,18 @@ impl NFSFileSystem for NfsAdapter {
             }
             file.set_len(size).map_err(|_| nfsstat3::NFS3ERR_IO)?;
         }
-        if let set_mode3::mode(mode) = attr.mode {
-            file.set_permissions(std::fs::Permissions::from_mode(mode & 0o777))
-                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-        }
         durable(file).map_err(|_| nfsstat3::NFS3ERR_IO)?;
         backing.root.sync_all().map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        if let set_mode3::mode(mode) = attr.mode {
+            let mut current = backing
+                .permissions
+                .lock()
+                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            let mut next = current.clone();
+            next.modes[id as usize - 1] = mode;
+            save_permissions(&backing.permissions_path, &next).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            *current = next;
+        }
         self.attr(id)
     }
     async fn write(
