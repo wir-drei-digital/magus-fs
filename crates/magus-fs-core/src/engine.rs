@@ -841,6 +841,17 @@ impl Workspace {
         Ok(result)
     }
     pub fn write(&self, handle: &Handle, offset: u64, bytes: &[u8]) -> Result<usize, FsError> {
+        self.write_with_append(handle, offset, bytes, handle.inner.mode == OpenMode::Append)
+    }
+    /// Native status flags may change after open. Resolve EOF and commit under the
+    /// same lock while retaining the handle identity and current write authority.
+    pub fn write_with_append(
+        &self,
+        handle: &Handle,
+        offset: u64,
+        bytes: &[u8],
+        append: bool,
+    ) -> Result<usize, FsError> {
         perm::mutation(self.read_only)?;
         if bytes.len() as u64 > MAX_CHUNK {
             return Err(FsError::LimitExceeded);
@@ -854,11 +865,7 @@ impl Workspace {
         let EntryContent::File { version } = &e.content else {
             return Err(FsError::IsDirectory);
         };
-        let offset = if handle.inner.mode == OpenMode::Append {
-            version.size
-        } else {
-            offset
-        };
+        let offset = if append { version.size } else { offset };
         let end = offset
             .checked_add(bytes.len() as u64)
             .ok_or(FsError::LimitExceeded)?;
@@ -1070,6 +1077,36 @@ impl Workspace {
         e.owner = owner;
         e.group = group;
         replace_entry(&mut next, e)?;
+        core.save(next)
+    }
+    /// Metadata through an existing capability does not re-resolve its former path.
+    pub fn chmod_handle(&self, handle: &Handle, mode: u16) -> Result<(), FsError> {
+        perm::mutation(self.read_only)?;
+        perm::mode(mode)?;
+        let mut core = lock(&self.core)?;
+        let mut entry = self.handle_entry(&core, handle)?;
+        if entry.owner != *self.actor.principal() {
+            return Err(FsError::PermissionDenied);
+        }
+        entry.mode = mode;
+        let mut next = core.working()?.clone();
+        replace_entry(&mut next, entry)?;
+        core.save(next)
+    }
+    pub fn chown_handle(
+        &self,
+        handle: &Handle,
+        owner: PrincipalId,
+        group: GroupId,
+    ) -> Result<(), FsError> {
+        perm::mutation(self.read_only)?;
+        let mut core = lock(&self.core)?;
+        let mut entry = self.handle_entry(&core, handle)?;
+        perm::ownership_change(&core.config, self.actor(&core)?, &owner, &group)?;
+        entry.owner = owner;
+        entry.group = group;
+        let mut next = core.working()?.clone();
+        replace_entry(&mut next, entry)?;
         core.save(next)
     }
     pub fn fsync(&self) -> Result<(), FsError> {

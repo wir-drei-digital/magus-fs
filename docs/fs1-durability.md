@@ -80,3 +80,10 @@ Errors extend the existing typed `FsError` with `database_error` (original SQLit
 ## Verification scope
 
 The four integration targets are `journal`, `working`, `permissions` and `recovery`. `recovery` with `test-faults` kills only its own unmounted worker subprocesses, reopens the actual SQLite database and checks acknowledged bytes, prior/new head, recorded operation state, replay and integrity. HTTP tests use owned loopback listeners and join their threads. Test trees are isolated TempDirs, removed after workers have exited. Host/Linux source and image provenance, exact commands, RED/GREEN evidence and cleanup are in `.superpowers/sdd/fs1-plan/task-3-report.md` and its `task-3/` artifacts. Native mount acceptance and benchmarks are not repeated or claimed by this core task.
+
+
+## Native handle mutation additions
+
+`Workspace::write_with_append(&Handle, offset: u64, bytes: &[u8], append: bool) -> Result<usize, FsError>` accepts the native descriptor's current append status. Both offset selection and durable save occur under the existing engine lock. It retains the handle identity, readonly/mode checks and current write authority; no pathname is reopened. Existing `write` behavior is unchanged and derives append from the opening OpenMode.
+
+`Workspace::chmod_handle(&Handle, mode: u16) -> Result<(), FsError>` and `chown_handle(&Handle, owner: PrincipalId, group: GroupId) -> Result<(), FsError>` update the retained live/orphan EntryId through the same durable working transaction. Chmod requires the current logical owner; chown uses the existing configured ownership-transfer/group policy. Foreign workspace handles are stale, readonly views refuse mutations, and no removed pathname is recreated. Like native descriptor access and existing data handles, these capability methods do not re-traverse a former pathname. Path-based metadata methods retain their traversal checks.

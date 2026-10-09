@@ -1,7 +1,7 @@
 """Ordinary native file APIs: durability adapter regressions, independent expected bytes."""
 import errno, fcntl, hashlib, json, os, stat, subprocess, sys, time
 from pathlib import Path
-ROOT=Path('/view')
+ROOT=Path(os.environ.get('MAGUS_VIEW','/view'))
 def expected(offset, length):
     # Fixture producer uses sha256(counter); independently reconstruct only needed blocks.
     first=offset//32; end=(offset+length+31)//32
@@ -14,6 +14,63 @@ def denied(fn, codes):
     raise AssertionError('operation unexpectedly succeeded')
 def run(case):
     r={}
+    if case=='review-create':
+        for mode in [0o444,0o000]:
+            p=ROOT/('restrictive-'+oct(mode))
+            fd=os.open(p,os.O_CREAT|os.O_EXCL|os.O_RDWR,mode)
+            try:
+                assert p.exists() and stat.S_IMODE(os.fstat(fd).st_mode)==mode
+                denied(lambda:os.write(fd,b'not authorized by current mode'),[errno.EACCES])
+                os.fchmod(fd,0o600);assert os.write(fd,b'authorized')==10;os.fsync(fd)
+            finally:os.close(fd)
+            assert p.read_bytes()==b'authorized';p.unlink()
+        for access in [os.O_RDONLY,os.O_WRONLY]:
+            p=ROOT/('access-'+str(access));fd=os.open(p,os.O_CREAT|os.O_EXCL|access,0o600)
+            try:
+                if access==os.O_RDONLY:denied(lambda:os.write(fd,b'x'),[errno.EBADF])
+                else:denied(lambda:os.read(fd,1),[errno.EBADF])
+            finally:os.close(fd)
+            p.unlink()
+        return {'restrictive_create_returns_handle':True,'current_mode_still_enforced':True,'requested_access_preserved':True}
+    if case=='review-append':
+        p=ROOT/'append-flags';p.write_bytes(b'abc')
+        fd=os.open(p,os.O_RDWR|os.O_APPEND)
+        try:
+            fcntl.fcntl(fd,fcntl.F_SETFL,fcntl.fcntl(fd,fcntl.F_GETFL)&~os.O_APPEND)
+            os.lseek(fd,0,os.SEEK_SET);assert os.write(fd,b'Z')==1
+            assert p.read_bytes()==b'Zbc'
+            fcntl.fcntl(fd,fcntl.F_SETFL,fcntl.fcntl(fd,fcntl.F_GETFL)|os.O_APPEND)
+            os.lseek(fd,0,os.SEEK_SET);assert os.write(fd,b'Q')==1
+            assert p.read_bytes()==b'ZbcQ'
+            p.unlink();p.write_bytes(b'other identity')
+            assert os.write(fd,b'R')==1;assert os.pread(fd,99,0)==b'ZbcQR'
+            fcntl.fcntl(fd,fcntl.F_SETFL,fcntl.fcntl(fd,fcntl.F_GETFL)&~os.O_APPEND)
+            os.lseek(fd,0,os.SEEK_SET);assert os.write(fd,b'A')==1
+            assert os.pread(fd,99,0)==b'AbcQR';assert p.read_bytes()==b'other identity'
+        finally:os.close(fd)
+        p.unlink();return {'set_clear_append_on_live_and_unlinked_identity':True}
+    if case=='review-metadata':
+        for replacement in [False,True]:
+            p=ROOT/('metadata-'+str(replacement));fd=os.open(p,os.O_CREAT|os.O_EXCL|os.O_RDWR,0o600)
+            try:
+                os.write(fd,b'held')
+                if replacement:
+                    new=ROOT/'replacement';new.write_bytes(b'replacement');os.replace(new,p)
+                    new_inode=p.stat().st_ino
+                else:p.unlink()
+                os.fchmod(fd,0o640);os.fchown(fd,1001,1001)
+                st=os.fstat(fd);assert stat.S_IMODE(st.st_mode)==0o640 and (st.st_uid,st.st_gid)==(1001,1001)
+                denied(lambda:os.fchown(fd,1003,1003),[errno.EACCES,errno.EPERM])
+                st=os.fstat(fd);assert (st.st_uid,st.st_gid)==(1001,1001)
+                os.ftruncate(fd,6);assert os.pread(fd,99,0)==b'held\0\0'
+                os.fchmod(fd,0o400);denied(lambda:os.write(fd,b'no'),[errno.EACCES])
+                os.fchmod(fd,0o600);assert os.pwrite(fd,b'H',0)==1;os.fsync(fd)
+                if replacement:
+                    assert p.stat().st_ino==new_inode and stat.S_IMODE(p.stat().st_mode)==0o644 and p.read_bytes()==b'replacement'
+                else:assert not p.exists()
+            finally:os.close(fd)
+            if replacement:p.unlink()
+        return {'unlinked_replaced_chmod_chown_truncate':True,'no_namespace_resurrection':True,'current_authority_enforced':True}
     if case=='metadata':
         assert 'large' in os.listdir(ROOT)
         for p in [ROOT,ROOT/'large',ROOT/'empty']:

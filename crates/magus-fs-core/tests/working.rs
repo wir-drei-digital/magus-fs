@@ -510,3 +510,85 @@ fn adapter_identity_lookup_and_handle_attributes_do_not_resurrect_or_leak_unsear
     err(w.lookup_identity(&names[0].1), "permission_denied");
     err(w.lookup("directory/child"), "permission_denied");
 }
+#[test]
+fn mutable_append_flags_write_atomically_through_unlinked_identity() {
+    let (_d, _rep, w, _base) = setup();
+    let h = w.create("flags", 0o600).unwrap();
+    w.write(&h, 0, b"abc").unwrap();
+    w.write_with_append(&h, 0, b"Q", true).unwrap();
+    w.write_with_append(&h, 0, b"Z", false).unwrap();
+    assert_eq!(w.read(&h, 0, 99).unwrap(), b"ZbcQ");
+    w.unlink("flags").unwrap();
+    let other = w.create("flags", 0o600).unwrap();
+    w.write(&other, 0, b"other").unwrap();
+    w.write_with_append(&h, 0, b"R", true).unwrap();
+    w.write_with_append(&h, 0, b"A", false).unwrap();
+    assert_eq!(w.read(&h, 0, 99).unwrap(), b"AbcQR");
+    assert_eq!(w.read(&other, 0, 99).unwrap(), b"other");
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let workspace = w.clone();
+            let handle = h.clone();
+            std::thread::spawn(move || {
+                for _ in 0..5 {
+                    workspace.write_with_append(&handle, 0, b"x", true).unwrap();
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(
+        w.read(&h, 0, 99).unwrap(),
+        [b"AbcQR".as_slice(), &[b'x'; 20]].concat()
+    );
+    let reader = w.open("flags", OpenMode::Read).unwrap();
+    err(
+        w.write_with_append(&reader, 0, b"no", true),
+        "permission_denied",
+    );
+}
+#[test]
+fn retained_handle_metadata_mutates_only_its_identity_with_current_authority() {
+    let (_d, rep, w, base) = setup();
+    let h = w.create("held-metadata", 0o600).unwrap();
+    w.write(&h, 0, b"held").unwrap();
+    w.unlink("held-metadata").unwrap();
+    let replacement = w.create("held-metadata", 0o644).unwrap();
+    w.chmod_handle(&h, 0o400).unwrap();
+    err(w.write(&h, 0, b"no"), "permission_denied");
+    w.chmod_handle(&h, 0o640).unwrap();
+    w.chown_handle(&h, principal(1), group(1)).unwrap();
+    err(
+        w.chown_handle(&h, principal(3), group(3)),
+        "permission_denied",
+    );
+    assert_eq!(w.handle_attributes(&h).unwrap().mode, 0o640);
+    assert_eq!(w.handle_attributes(&replacement).unwrap().mode, 0o644);
+    assert_eq!(
+        w.lookup("held-metadata").unwrap().id,
+        *replacement.entry_id()
+    );
+    w.chown_handle(&h, principal(2), group(1)).unwrap();
+    err(w.chmod_handle(&h, 0o777), "permission_denied");
+    err(w.write_with_append(&h, 0, b"no", true), "permission_denied");
+    assert_eq!(
+        w.handle_attributes(&replacement).unwrap().owner,
+        principal(1)
+    );
+    let foreign = rep.begin(&base, Actor::new(principal(2)), false).unwrap();
+    let f = foreign.open("held-metadata", OpenMode::Read).unwrap();
+    err(foreign.chmod_handle(&f, 0o777), "permission_denied");
+    err(
+        foreign.chown_handle(&f, principal(2), group(1)),
+        "permission_denied",
+    );
+    err(foreign.chmod_handle(&h, 0o777), "stale_handle");
+    let readonly = rep.begin(&base, actor(), true).unwrap();
+    err(readonly.chmod_handle(&h, 0o777), "read_only");
+    err(
+        readonly.chown_handle(&h, principal(1), group(1)),
+        "read_only",
+    );
+}

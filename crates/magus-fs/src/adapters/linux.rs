@@ -30,11 +30,12 @@ fn errno(error: FsError) -> Errno {
 fn unsupported<T>() -> Result<T> {
     Err(FsError::UnsupportedMode)
 }
+#[derive(Clone)]
 struct OpenFile {
     uid: u32,
     workspace: Workspace,
     handle: Handle,
-    append: Option<Handle>,
+    access: i32,
 }
 struct State {
     config: ReplicaConfig,
@@ -126,6 +127,60 @@ impl State {
         }
         Ok(file)
     }
+    fn metadata_target(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: Option<FileHandle>,
+    ) -> Result<(Entry, Option<OpenFile>)> {
+        let file = if let Some(fh) = fh {
+            self.held(req, fh)?
+        } else {
+            match self.entry(req, ino) {
+                Ok(entry) => return Ok((entry, None)),
+                Err(FsError::NotFound) => {
+                    // Linux may omit fh for fstat/fchmod/fchown after unlink or replacement.
+                    // Only a same-UID capability for this exact inode may supply the identity.
+                    let id = self.identity(ino)?;
+                    self.handles
+                        .values()
+                        .find(|file| file.uid == req.uid() && file.handle.entry_id() == id)
+                        .ok_or(FsError::NotFound)?
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        Ok((
+            file.workspace.handle_attributes(&file.handle)?,
+            Some(file.clone()),
+        ))
+    }
+    fn reserve_handle(&mut self) -> Result<FileHandle> {
+        let fh = self.next_handle;
+        self.next_handle = self
+            .next_handle
+            .checked_add(1)
+            .ok_or(FsError::LimitExceeded)?;
+        Ok(FileHandle(fh))
+    }
+    fn register(
+        &mut self,
+        fh: FileHandle,
+        req: &Request,
+        workspace: Workspace,
+        handle: Handle,
+        flags: i32,
+    ) {
+        self.handles.insert(
+            fh.0,
+            OpenFile {
+                uid: req.uid(),
+                workspace,
+                handle,
+                access: flags & libc::O_ACCMODE,
+            },
+        );
+    }
     fn open(&mut self, req: &Request, path: &str, flags: i32) -> Result<FileHandle> {
         let workspace = self.ws(req)?;
         let mode = match flags & libc::O_ACCMODE {
@@ -134,30 +189,13 @@ impl State {
             libc::O_RDWR => OpenMode::ReadWrite,
             _ => return Err(FsError::InvalidPath),
         };
+        let fh = self.reserve_handle()?;
         let handle = workspace.open(path, mode)?;
         if flags & libc::O_TRUNC != 0 {
             workspace.truncate(&handle, 0)?;
         }
-        let append = if flags & libc::O_APPEND != 0 && mode != OpenMode::Read {
-            Some(workspace.open(path, OpenMode::Append)?)
-        } else {
-            None
-        };
-        let fh = self.next_handle;
-        self.next_handle = self
-            .next_handle
-            .checked_add(1)
-            .ok_or(FsError::LimitExceeded)?;
-        self.handles.insert(
-            fh,
-            OpenFile {
-                uid: req.uid(),
-                workspace,
-                handle,
-                append,
-            },
-        );
-        Ok(FileHandle(fh))
+        self.register(fh, req, workspace, handle, flags);
+        Ok(fh)
     }
 }
 struct Adapter {
@@ -210,26 +248,7 @@ impl Filesystem for Adapter {
     }
     fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         match self.with(|s| {
-            let e = if let Some(fh) = fh {
-                let f = s.held(req, fh)?;
-                f.workspace.handle_attributes(&f.handle)?
-            } else {
-                match s.entry(req, ino) {
-                    Ok(e) => e,
-                    Err(FsError::NotFound) => {
-                        // Linux fstat may omit FATTR_FH after unlink. The inode still has
-                        // an open kernel reference; recover only its same-UID capability.
-                        let id = s.identity(ino)?;
-                        let file = s
-                            .handles
-                            .values()
-                            .find(|file| file.uid == req.uid() && file.handle.entry_id() == id)
-                            .ok_or(FsError::NotFound)?;
-                        file.workspace.handle_attributes(&file.handle)?
-                    }
-                    Err(error) => return Err(error),
-                }
-            };
+            let (e, _) = s.metadata_target(req, ino, fh)?;
             s.attr(&e)
         }) {
             Ok(a) => reply.attr(&Duration::ZERO, &a),
@@ -258,6 +277,9 @@ impl Filesystem for Adapter {
     ) {
         match self.with(|s| {
             let f = s.held(req, fh)?;
+            if f.access == libc::O_WRONLY {
+                return Err(FsError::PermissionDenied);
+            }
             f.workspace.read(&f.handle, offset, size as usize)
         }) {
             Ok(b) => reply.data(&b),
@@ -272,14 +294,17 @@ impl Filesystem for Adapter {
         offset: u64,
         data: &[u8],
         _: WriteFlags,
-        _: OpenFlags,
+        flags: OpenFlags,
         _: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
         match self.mutate(|s| {
             let f = s.held(req, fh)?;
+            if f.access == libc::O_RDONLY {
+                return Err(FsError::PermissionDenied);
+            }
             f.workspace
-                .write(f.append.as_ref().unwrap_or(&f.handle), offset, data)
+                .write_with_append(&f.handle, offset, data, flags.0 & libc::O_APPEND != 0)
         }) {
             Ok(n) => reply.written(n as u32),
             Err(e) => reply.error(e),
@@ -376,10 +401,19 @@ impl Filesystem for Adapter {
         match self.mutate(|s| {
             let p = s.child(req, parent, name)?;
             let w = s.ws(req)?;
+            if !matches!(
+                flags & libc::O_ACCMODE,
+                libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR
+            ) {
+                return Err(FsError::InvalidPath);
+            }
+            let fh = s.reserve_handle()?;
             let h = w.create(&p, (mode & 0o7777) as u16)?;
             let e = w.handle_attributes(&h)?;
             let a = s.attr(&e)?;
-            let fh = s.open(req, &p, flags & !libc::O_TRUNC)?;
+            // Creation already established this capability under the engine lock.
+            // Reopening its pathname would fail for restrictive initial modes.
+            s.register(fh, req, w, h, flags);
             Ok((a, fh))
         }) {
             Ok((a, h)) => reply.created(
@@ -491,49 +525,59 @@ impl Filesystem for Adapter {
                 return unsupported();
             }
             let w = s.ws(req)?;
+            let (entry, file) = s.metadata_target(req, ino, fh)?;
             if let Some(size) = size {
-                if let Some(fh) = fh {
-                    let f = s.held(req, fh)?;
-                    f.workspace.truncate(&f.handle, size)?;
-                    let e = f.workspace.handle_attributes(&f.handle)?;
-                    return s.attr(&e);
+                if let Some(file) = &file {
+                    if file.access == libc::O_RDONLY {
+                        return Err(FsError::PermissionDenied);
+                    }
+                    file.workspace.truncate(&file.handle, size)?;
+                } else {
+                    let h = w.open(&entry.path, OpenMode::Write)?;
+                    w.truncate(&h, size)?;
                 }
-                let e = s.entry(req, ino)?;
-                let h = w.open(&e.path, OpenMode::Write)?;
-                w.truncate(&h, size)?;
-            } else {
-                let e = s.entry(req, ino)?;
-                if let Some(mode) = mode {
-                    w.chmod(&e.path, (mode & 0o7777) as u16)?
+            } else if let Some(mode) = mode {
+                if let Some(file) = &file {
+                    file.workspace
+                        .chmod_handle(&file.handle, (mode & 0o7777) as u16)?;
+                } else {
+                    w.chmod(&entry.path, (mode & 0o7777) as u16)?;
                 }
-                if uid.is_some() || gid.is_some() {
-                    let owner = if let Some(uid) = uid {
-                        s.config
-                            .authorities
-                            .iter()
-                            .find(|a| a.uid == uid)
-                            .ok_or(FsError::MappingBlocked)?
-                            .principal
-                            .clone()
-                    } else {
-                        e.owner
-                    };
-                    let group = if let Some(gid) = gid {
-                        s.config
-                            .authorities
-                            .iter()
-                            .find(|a| a.gid == gid)
-                            .ok_or(FsError::MappingBlocked)?
-                            .primary_group
-                            .clone()
-                    } else {
-                        e.group
-                    };
-                    w.chown(&e.path, owner, group)?;
+            } else if uid.is_some() || gid.is_some() {
+                let owner = if let Some(uid) = uid {
+                    s.config
+                        .authorities
+                        .iter()
+                        .find(|a| a.uid == uid)
+                        .ok_or(FsError::MappingBlocked)?
+                        .principal
+                        .clone()
+                } else {
+                    entry.owner
+                };
+                let group = if let Some(gid) = gid {
+                    s.config
+                        .authorities
+                        .iter()
+                        .find(|a| a.gid == gid)
+                        .ok_or(FsError::MappingBlocked)?
+                        .primary_group
+                        .clone()
+                } else {
+                    entry.group
+                };
+                if let Some(file) = &file {
+                    file.workspace.chown_handle(&file.handle, owner, group)?;
+                } else {
+                    w.chown(&entry.path, owner, group)?;
                 }
             }
-            let e = s.entry(req, ino)?;
-            s.attr(&e)
+            let changed = if let Some(file) = file {
+                file.workspace.handle_attributes(&file.handle)?
+            } else {
+                s.entry(req, ino)?
+            };
+            s.attr(&changed)
         });
         match result {
             Ok(a) => reply.attr(&Duration::ZERO, &a),
