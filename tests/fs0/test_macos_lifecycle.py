@@ -17,6 +17,69 @@ from resources import OwnedOutput
 
 
 class MacosLifecycleTests(unittest.TestCase):
+    def test_sigint_during_exact_save_cannot_escape_or_publish_success(self):
+        module = ast.parse(Path(macos_run.__file__).read_text())
+        run = next(n for n in module.body if isinstance(n, ast.FunctionDef) and n.name == 'run')
+        body = next(n for n in run.body if isinstance(n, ast.Try)).finalbody
+        save_node = next(n for n in run.body if isinstance(n, ast.FunctionDef) and n.name == 'save')
+        # Large JSON-native data exercises the system 3.9 encoder's dictionary
+        # iterator without replacing json.dumps or the runner's save function.
+        for initially_mounted in (True, False):
+            with self.subTest(initially_mounted=initially_mounted), tempfile.TemporaryDirectory(prefix='fs0-json-interrupt-') as directory:
+                owned = OwnedOutput(str(Path(directory) / 'owned'))
+                mounted = [initially_mounted]
+                guard = macos_run.MountGuard(owned, lambda path: mounted[0])
+                point = owned.path / 'synthetic-mount'
+                guard.candidate(point)
+                report = {'passed':True, 'cleanup_errors':[],
+                          'cases':{str(i):{'observed':[i,i,i,i]} for i in range(80000)}}
+                report_path = owned.path / 'result.json'
+                def unmount(item):
+                    raise RuntimeError('synthetic unmount unresolved')
+                def wait(seconds):
+                    persisted = json.loads(report_path.read_text())
+                    self.assertEqual(persisted['state'], 'cleanup_pending')
+                    self.assertIn(str(point), persisted['remaining_owned_resources'])
+                    mounted[0] = False
+                env = dict(vars(macos_run), guard=guard, endpoints=[{'path':point}],
+                           mount_state=lambda path: mounted[0], unmount=unmount, report=report,
+                           report_path=report_path, processes=[], gateway=None,
+                           time=SimpleNamespace(sleep=wait))
+                exec(compile(ast.Module(body=[save_node], type_ignores=[]), macos_run.__file__, 'exec'), env)
+                exact_save = env['save']
+                sent = []
+                def interrupted_save():
+                    if sent:
+                        exact_save()
+                        return
+                    def interrupt():
+                        time.sleep(0.02)
+                        os.kill(os.getpid(), signal.SIGINT)
+                    sender = threading.Thread(target=interrupt)
+                    sent.append(sender)
+                    sender.start()
+                    try:
+                        exact_save()
+                    finally:
+                        sender.join(timeout=5)
+                env['save'] = interrupted_save
+                previous = signal.getsignal(signal.SIGINT)
+                try:
+                    try:
+                        exec(compile(ast.Module(body=body, type_ignores=[]), macos_run.__file__, 'exec'), env)
+                    except (RuntimeError, KeyboardInterrupt) as error:
+                        self.fail('serialization interrupt escaped finalization: '+repr(error))
+                    persisted = json.loads(report_path.read_text())
+                    self.assertFalse(mounted[0])
+                    self.assertFalse(persisted['passed'])
+                    self.assertEqual(persisted['state'], 'failed')
+                    self.assertEqual(persisted['cleanup_interrupts'], 1)
+                    self.assertEqual(signal.getsignal(signal.SIGINT), previous)
+                finally:
+                    for sender in sent:
+                        sender.join(timeout=5)
+                    signal.signal(signal.SIGINT, previous)
+
     def test_runner_finalization_retains_endpoints_after_unmount_interrupt(self):
         self.exercise_finalization(injected=True)
 

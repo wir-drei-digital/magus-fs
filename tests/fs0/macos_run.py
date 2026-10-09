@@ -117,14 +117,21 @@ def command(args, output, timeout=20, *, owned=None, guard=None, mountpoint=None
 @contextmanager
 def defer_cleanup_interrupts(report):
     """Ctrl-C records failure; it cannot abandon an in-process source gateway."""
+    interrupts = 0
     def interrupted(signum, frame):
-        report['cleanup_interrupts'] = report.get('cleanup_interrupts', 0) + 1
-        report['passed'] = False
+        # Never touch objects that save() may currently be serializing.
+        nonlocal interrupts
+        interrupts += 1
+    def reconcile():
+        if interrupts:
+            report['cleanup_interrupts'] = interrupts
+            report['passed'] = False
     previous = signal.signal(signal.SIGINT, interrupted)
     try:
-        yield
+        yield reconcile
     finally:
         signal.signal(signal.SIGINT, previous)
+        reconcile()
 
 
 def effective_options(text, path, readonly):
@@ -371,7 +378,7 @@ def run(output, prepare_only=False, chunk_size=262144, uid=501, gid=20):
         report['error']=repr(error)
         report['passed']=False
     finally:
-        with defer_cleanup_interrupts(report):
+        with defer_cleanup_interrupts(report) as reconcile_interrupts:
             # Reap interrupted syscall helpers before touching mounts; serving daemons remain live.
             for process in guard.attempts:
                 if process.poll() is None: settle(process)
@@ -381,6 +388,7 @@ def run(output, prepare_only=False, chunk_size=262144, uid=501, gid=20):
                     except (Exception, KeyboardInterrupt) as error:
                         report['cleanup_errors'].append(repr(error))
             def pending():
+                reconcile_interrupts()
                 report['remaining_owned_resources']=[str(path) for path in guard.paths if mount_state(path) is not False]
                 report['remaining_owned_command_pids']=[p.pid for p in guard.attempts if p.poll() is None]
             pending()
@@ -409,8 +417,10 @@ def run(output, prepare_only=False, chunk_size=262144, uid=501, gid=20):
             pending()
             if report['cleanup_errors'] or report['remaining_owned_resources'] or any(p.poll() is None for p in processes):
                 report['passed']=False
-            report['state']='passed' if report['passed'] else 'failed'
-            save()
+        # All owned mounts/commands are resolved before restoring SIGINT. Publish
+        # after the final reconciliation so even a late deferred interrupt fails.
+        report['state']='passed' if report['passed'] else 'failed'
+        save()
     print(report_path,flush=True)
     return 0 if report['passed'] else 1
 
