@@ -554,7 +554,13 @@ fn authorize_capture(
             )?;
             let replacement = new.entries.iter().find(|e| e.id == entry.id);
             if replacement != Some(entry) {
-                perm::parent_write(old, &entry.path, a)?;
+                // Parent write controls namespace changes, not bytes or owner metadata.
+                if replacement.is_none_or(|next| next.path != entry.path) {
+                    perm::parent_write(old, &entry.path, a)?;
+                    if let Some(next) = replacement {
+                        perm::parent_write(old, &next.path, a)?;
+                    }
+                }
                 if let Some(replacement) = replacement {
                     if entry.content != replacement.content
                         && entry.content != EntryContent::Directory

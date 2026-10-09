@@ -97,7 +97,6 @@ fn recovery_pin_protects_ancestry_closure() {
     let first = import(&rep, &old, local(d.path(), b"old"));
     let w = rep.begin(&first, actor(), false).unwrap();
     let h = w.open("a", OpenMode::ReadWrite).unwrap();
-    w.read(&h, 0, 3).unwrap();
     w.write(&h, 0, b"new").unwrap();
     drop(h);
     let second = w
@@ -107,8 +106,78 @@ fn recovery_pin_protects_ancestry_closure() {
             attr(),
         )
         .unwrap();
+    assert_eq!(rep.status().unwrap().resident_bytes, 3);
     rep.pin(&second, true).unwrap();
+    assert_eq!(rep.status().unwrap().resident_bytes, 6);
+    std::fs::rename(d.path().join("source"), d.path().join("offline-source")).unwrap();
+    let archive = d.path().join("archive");
+    rep.export(&second, &archive, actor()).unwrap();
+    assert_eq!(verify_archive(&archive).unwrap().revisions, 2);
     let report = rep.prune(true).unwrap();
     assert_eq!(report.pinned_bytes, 6);
     assert!(report.evictable.is_empty());
+}
+
+#[test]
+fn incomplete_ancestry_pin_fails_without_changing_prior_pins_or_working_state() {
+    for failure in ["quota", "missing", "corrupt"] {
+        let d = scratch();
+        let mut cfg = config();
+        if failure == "quota" {
+            cfg.cache_bytes = 3;
+        }
+        let rep = Replica::open(d.path().join("state"), cfg).unwrap();
+        let empty = import(&rep, &revision(), ChunkSource::Unavailable);
+        rep.pin(&empty, true).unwrap();
+        let mut old = revision();
+        add_file(&mut old, "a", b"old");
+        let first = import(&rep, &old, local(d.path(), b"old"));
+        let w = rep.begin(&first, actor(), false).unwrap();
+        let h = w.open("a", OpenMode::ReadWrite).unwrap();
+        w.write(&h, 0, b"new").unwrap();
+        drop(h);
+        let second = w
+            .checkpoint(
+                &OperationId::random().unwrap(),
+                w.generation().unwrap(),
+                attr(),
+            )
+            .unwrap();
+        let source = d
+            .path()
+            .join("source")
+            .join(ObjectId::for_bytes(b"old").unwrap().as_str());
+        match failure {
+            "missing" => std::fs::remove_file(source).unwrap(),
+            "corrupt" => std::fs::write(source, b"bad").unwrap(),
+            _ => (),
+        }
+        let before = rep.status().unwrap();
+        err(
+            rep.pin(&second, true),
+            match failure {
+                "quota" => "backpressure",
+                "missing" => "base_unavailable",
+                _ => "corrupt_object",
+            },
+        );
+        let after = rep.status().unwrap();
+        assert_eq!(after.pinned, vec![empty]);
+        assert_eq!(before.head, after.head);
+        assert_eq!(before.generation, after.generation);
+        assert_eq!(
+            w.read(&w.open("a", OpenMode::Read).unwrap(), 0, 3).unwrap(),
+            b"new"
+        );
+        drop(w);
+        drop(rep);
+        assert_eq!(
+            Replica::reopen(d.path().join("state"))
+                .unwrap()
+                .status()
+                .unwrap()
+                .pinned,
+            before.pinned
+        );
+    }
 }

@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 const ARCHIVE_FORMAT: &str = "magus-fs-archive/v1";
-const MAX_ARCHIVE_DESCRIPTORS: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_ARCHIVE_DESCRIPTORS: u64 = 64 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetainedHistoryGrant {

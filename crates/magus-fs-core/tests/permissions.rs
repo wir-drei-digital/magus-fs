@@ -213,3 +213,43 @@ fn nfs_queries_follow_current_parent_and_historical_authority() {
     err(old.check_remove_identity(&id), "read_only");
     err(w.read(&retained, 0, 3), "stale_handle");
 }
+
+#[test]
+fn native_history_attributes_project_only_current_permissions_and_recheck_handles() {
+    let (_d, rep, w, _) = setup();
+    w.mkdir("past", 0o700).unwrap();
+    w.mkdir("now", 0o700).unwrap();
+    let h = w.create("past/file", 0o600).unwrap();
+    w.write(&h, 0, b"old").unwrap();
+    w.chmod("past/file", 0).unwrap();
+    let id = w
+        .checkpoint(
+            &OperationId::random().unwrap(),
+            w.generation().unwrap(),
+            attr(),
+        )
+        .unwrap();
+    let old = rep.begin(&id, actor(), true).unwrap();
+    let old_entry = old.lookup("past/file").unwrap();
+    w.chmod("past/file", 0o640).unwrap();
+    w.rename("past/file", "now/file").unwrap();
+    w.write(&h, 0, b"longer new bytes").unwrap();
+    w.chown("now/file", principal(2), group(1)).unwrap();
+    let projected = old.native_attributes(&old_entry).unwrap();
+    assert_eq!(projected.id, old_entry.id);
+    assert_eq!(projected.path, "past/file");
+    assert_eq!(projected.content, old_entry.content);
+    assert_eq!(projected.mode, 0o640);
+    assert_eq!(projected.owner, principal(2));
+    assert_eq!(projected.group, group(1));
+    let held = old.open("past/file", OpenMode::Read).unwrap();
+    assert_eq!(old.read(&held, 0, 99).unwrap(), b"old");
+    w.chmod("now", 0).unwrap();
+    err(old.native_attributes(&old_entry), "permission_denied");
+    err(old.handle_attributes(&held), "permission_denied");
+    w.chmod("now", 0o700).unwrap();
+    w.unlink("now/file").unwrap();
+    err(old.native_attributes(&old_entry), "permission_denied");
+    err(old.handle_attributes(&held), "permission_denied");
+    err(old.read(&held, 0, 99), "permission_denied");
+}

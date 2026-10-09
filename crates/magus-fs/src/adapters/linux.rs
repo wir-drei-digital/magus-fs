@@ -83,7 +83,8 @@ impl State {
             format!("{}/{name}", entry.path)
         })
     }
-    fn attr(&mut self, e: &Entry) -> Result<FileAttr> {
+    fn attr(&mut self, req: &Request, e: &Entry) -> Result<FileAttr> {
+        let e = self.ws(req)?.native_attributes(e)?;
         let uid = self
             .config
             .authorities
@@ -240,7 +241,7 @@ impl Filesystem for Adapter {
         match self.with(|s| {
             let path = s.child(req, parent, name)?;
             let e = s.ws(req)?.lookup(&path)?;
-            s.attr(&e)
+            s.attr(req, &e)
         }) {
             Ok(a) => reply.entry(&Duration::ZERO, &a, Generation(1)),
             Err(e) => reply.error(e),
@@ -249,7 +250,7 @@ impl Filesystem for Adapter {
     fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         match self.with(|s| {
             let (e, _) = s.metadata_target(req, ino, fh)?;
-            s.attr(&e)
+            s.attr(req, &e)
         }) {
             Ok(a) => reply.attr(&Duration::ZERO, &a),
             Err(e) => reply.error(e),
@@ -410,7 +411,7 @@ impl Filesystem for Adapter {
             let fh = s.reserve_handle()?;
             let h = w.create(&p, (mode & 0o7777) as u16)?;
             let e = w.handle_attributes(&h)?;
-            let a = s.attr(&e)?;
+            let a = s.attr(req, &e)?;
             // Creation already established this capability under the engine lock.
             // Reopening its pathname would fail for restrictive initial modes.
             s.register(fh, req, w, h, flags);
@@ -439,7 +440,7 @@ impl Filesystem for Adapter {
             let p = s.child(req, parent, name)?;
             let w = s.ws(req)?;
             w.mkdir(&p, (mode & 0o7777) as u16)?;
-            s.attr(&w.lookup(&p)?)
+            s.attr(req, &w.lookup(&p)?)
         }) {
             Ok(a) => reply.entry(&Duration::ZERO, &a, Generation(1)),
             Err(e) => reply.error(e),
@@ -577,7 +578,7 @@ impl Filesystem for Adapter {
             } else {
                 s.entry(req, ino)?
             };
-            s.attr(&changed)
+            s.attr(req, &changed)
         });
         match result {
             Ok(a) => reply.attr(&Duration::ZERO, &a),

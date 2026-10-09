@@ -255,6 +255,34 @@ impl Core {
         }
         Ok(referenced)
     }
+    fn recovery_closure(&self, selected: &RevisionId) -> Result<BTreeMap<ObjectId, u64>, FsError> {
+        let mut pending = vec![selected.clone()];
+        let mut seen = BTreeSet::new();
+        let mut objects = BTreeMap::new();
+        let mut descriptor_bytes = 0u64;
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let revision = self.revision(&id)?;
+            descriptor_bytes += encode_revision(&revision)?.len() as u64;
+            if seen.len() + objects.len() > MAX_ENTRIES
+                || descriptor_bytes > crate::archive::MAX_ARCHIVE_DESCRIPTORS
+            {
+                return Err(FsError::LimitExceeded);
+            }
+            for (object, size) in cache::closure(&revision.tree) {
+                if objects.insert(object, size).is_some_and(|old| old != size) {
+                    return Err(FsError::CorruptObject);
+                }
+            }
+            if seen.len() + objects.len() > MAX_ENTRIES {
+                return Err(FsError::LimitExceeded);
+            }
+            pending.extend(revision.parents);
+        }
+        Ok(objects)
+    }
     fn pinned_closure(&self, pins: &[String]) -> Result<BTreeSet<ObjectId>, FsError> {
         let mut pending = pins
             .iter()
@@ -707,9 +735,9 @@ impl Replica {
     pub fn pin(&self, id: &RevisionId, pin: bool) -> Result<(), FsError> {
         let deadline = Instant::now() + Duration::from_millis(4500);
         let mut core = lock(&self.core)?;
-        let rev = core.revision(id)?;
+        core.revision(id)?;
         if pin {
-            let closure = cache::closure(&rev.tree);
+            let closure = core.recovery_closure(id)?;
             core.reserve(&closure)?;
             for (object, size) in closure {
                 core.fetch(&object, size, deadline)?;
@@ -835,6 +863,37 @@ impl Workspace {
     }
     pub fn generation(&self) -> Result<u64, FsError> {
         Ok(lock(&self.core)?.working()?.generation)
+    }
+    /// Project a guarded native entry's permission fields without changing historical
+    /// identity, pathname or content. Recheck current identity and traversal even for
+    /// retained historical handles; deletion must never fall back to obsolete rights.
+    /// Live entries (including already-guarded orphan handles) need no projection.
+    pub fn native_attributes(&self, entry: &Entry) -> Result<Entry, FsError> {
+        let core = lock(&self.core)?;
+        let mut projected = entry.clone();
+        if let (Some(view), Some(working)) = (&self.view, &core.working) {
+            let historical = perm::entry(&view.tree, &entry.path)?;
+            if historical.id != entry.id {
+                return Err(FsError::StaleHandle);
+            }
+            self.access(&core, &historical, 0)?;
+            let current = if entry.id == working.tree.root.id {
+                perm::root_entry(&working.tree)
+            } else {
+                working
+                    .tree
+                    .entries
+                    .iter()
+                    .find(|e| e.id == entry.id)
+                    .cloned()
+                    .ok_or(FsError::PermissionDenied)?
+            };
+            projected = historical;
+            projected.owner = current.owner;
+            projected.group = current.group;
+            projected.mode = current.mode;
+        }
+        Ok(projected)
     }
     pub fn lookup(&self, path: &str) -> Result<Entry, FsError> {
         let core = lock(&self.core)?;

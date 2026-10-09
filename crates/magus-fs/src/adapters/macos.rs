@@ -121,6 +121,7 @@ impl State {
         })
     }
     fn attr(&self, id: u64, e: &Entry) -> Result<fattr3> {
+        let e = self.ws.native_attributes(e)?;
         let uid = self
             .config
             .authorities

@@ -327,3 +327,83 @@ fn captured_metadata_transfer_obeys_current_root_and_file_authority() {
         assert_eq!(rep.status().unwrap().head, Some(head));
     }
 }
+
+#[test]
+fn same_path_capture_under_nonwritable_parent_checks_file_and_metadata_rights() {
+    for metadata_only in [false, true] {
+        let d = scratch();
+        let root = d.path().join("tree");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a"), b"old").unwrap();
+        fs::set_permissions(root.join("a"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+        let (c, n) = native_config(&root);
+        let rep = Replica::open(d.path().join("state"), c).unwrap();
+        rep.configure_native(n.clone()).unwrap();
+        let first = rep
+            .capture(
+                &root,
+                n.policy.clone(),
+                OperationId::random().unwrap(),
+                actor(),
+            )
+            .unwrap();
+        let original = rep.revision(&first).unwrap().tree.entries[0].clone();
+        if metadata_only {
+            fs::set_permissions(root.join("a"), fs::Permissions::from_mode(0o600)).unwrap();
+        } else {
+            fs::write(root.join("a"), b"new").unwrap();
+        }
+        let result = rep.capture(&root, n.policy, OperationId::random().unwrap(), actor());
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let second = result.unwrap();
+        let changed = rep.revision(&second).unwrap().tree.entries[0].clone();
+        assert_eq!(changed.id, original.id);
+        if metadata_only {
+            assert_eq!(changed.mode, 0o600);
+        } else {
+            assert_ne!(changed.content, original.content);
+        }
+    }
+}
+
+#[test]
+fn namespace_capture_still_requires_old_parent_write() {
+    for change in ["insert", "remove", "replace", "move"] {
+        let d = scratch();
+        let root = d.path().join("tree");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a"), b"old").unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+        let (c, n) = native_config(&root);
+        let rep = Replica::open(d.path().join("state"), c).unwrap();
+        rep.configure_native(n.clone()).unwrap();
+        let first = rep
+            .capture(
+                &root,
+                n.policy.clone(),
+                OperationId::random().unwrap(),
+                actor(),
+            )
+            .unwrap();
+        let held = fs::File::open(root.join("a")).unwrap();
+        // Native owner temporarily changes the host directory; current model remains 0555.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        match change {
+            "insert" => fs::write(root.join("b"), b"new").unwrap(),
+            "remove" => fs::remove_file(root.join("a")).unwrap(),
+            "replace" => {
+                fs::remove_file(root.join("a")).unwrap();
+                fs::write(root.join("a"), b"new").unwrap();
+            }
+            "move" => fs::rename(root.join("a"), root.join("b")).unwrap(),
+            _ => unreachable!(),
+        }
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = rep.capture(&root, n.policy, OperationId::random().unwrap(), actor());
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        err(result, "permission_denied");
+        assert_eq!(rep.status().unwrap().head, Some(first));
+        drop(held);
+    }
+}
