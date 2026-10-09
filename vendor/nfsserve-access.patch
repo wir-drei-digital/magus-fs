@@ -1,0 +1,61 @@
+--- a/src/vfs.rs
++++ b/src/vfs.rs
+@@ -109,6 +109,12 @@
+     /// Returns the attributes of an id.
+     /// This method should be fast as it is used very frequently.
+     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3>;
++
++    /// Return only access bits allowed by this filesystem's actor and policy.
++    /// The default denies access; protocol request bits are not authorization.
++    async fn access(&self, _id: fileid3, _requested: u32) -> Result<u32, nfsstat3> {
++        Err(nfsstat3::NFS3ERR_ACCES)
++    }
+ 
+     /// Sets the attributes of an id
+     /// this should return Err(nfsstat3::NFS3ERR_ROFS) if readonly
+--- a/src/nfs_handlers.rs
++++ b/src/nfs_handlers.rs
+@@ -516,9 +516,18 @@
+         Ok(v) => nfs::post_op_attr::attributes(v),
+         Err(_) => nfs::post_op_attr::Void,
+     };
+-    // TODO better checks here
++    access = match context.vfs.access(id, access).await {
++        Ok(allowed) => access & allowed,
++        Err(stat) => {
++            make_success_reply(xid).serialize(output)?;
++            stat.serialize(output)?;
++            obj_attr.serialize(output)?;
++            return Ok(());
++        },
++    };
++    // Read-only still permits execution; mutation rights remain protocol-masked.
+     if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
+-        access &= ACCESS3_READ | ACCESS3_LOOKUP;
++        access &= ACCESS3_READ | ACCESS3_LOOKUP | ACCESS3_EXECUTE;
+     }
+     debug!(" {:?} ---> {:?}", xid, access);
+     make_success_reply(xid).serialize(output)?;
+@@ -887,14 +896,19 @@
+             dir_attr.serialize(&mut counting_output)?;
+             dirversion.serialize(&mut counting_output)?;
+             for entry in result.entries {
+-                let obj_attr = entry.attr;
+-                let handle = nfs::post_op_fh3::handle(context.vfs.id_to_fh(entry.fileid));
++                // Names may be readable without permission to search this directory.
++                // RFC 1813 allows omitted child attributes and handles in READDIRPLUS.
++                let (obj_attr, handle) = match context.vfs.getattr(entry.fileid).await {
++                    Ok(attr) => (nfs::post_op_attr::attributes(attr),
++                                 nfs::post_op_fh3::handle(context.vfs.id_to_fh(entry.fileid))),
++                    Err(_) => (nfs::post_op_attr::Void, nfs::post_op_fh3::Void),
++                };
+ 
+                 let entry = entryplus3 {
+                     fileid: entry.fileid,
+                     name: entry.name,
+                     cookie: entry.fileid,
+-                    name_attributes: nfs::post_op_attr::attributes(obj_attr),
++                    name_attributes: obj_attr,
+                     name_handle: handle,
+                 };
+                 // write the entry into a buffer first

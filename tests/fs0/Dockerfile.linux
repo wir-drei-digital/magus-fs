@@ -2,6 +2,7 @@ FROM rust:1.92.0-bookworm@sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866
 RUN rustup component add --toolchain 1.92.0 rustfmt clippy
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY vendor ./vendor
 COPY src ./src
 COPY tests/*.rs ./tests/
 COPY tests/fs0/permission_source.py ./tests/fs0/

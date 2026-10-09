@@ -1,0 +1,37 @@
+{
+  "crate": "nfsserve",
+  "version": "0.11.0",
+  "registry_source": "registry+https://github.com/rust-lang/crates.io-index",
+  "crate_sha256": "ef1424b6d88c60a091931392970999ea3ceab132d968e6a5545c770fad5b97d7",
+  "upstream_vcs": {
+    "git": {
+      "sha1": "af4f1176dd709847f3dda4f1a7cd093edaadde63"
+    },
+    "path_in_vcs": ""
+  },
+  "files": {
+    "Cargo.toml": "52cd142aef786e22d864f63f0eea9c7bdb0595f1c2918be19fc8a1609415c45a",
+    "LICENSE": "f8254b0c6339281c9b458fae067d68b3a36048f279f022acaa45f918d836c1ea",
+    "Cargo.lock": "5f7f88042dd1e2271bcb9eba1f489ab4248572a0ed5f933d4422c97bc519dab9",
+    "README.md": "3c08cc29176d85d0b6a7812a6999831b30bc1879057a6851b531bb90b801972d",
+    ".cargo_vcs_info.json": "691c96e9aab239c78073ad71bac3b91b0473c9c422b6f9372709fd655b10dc0d",
+    "Cargo.toml.orig": "e1418c62de37a6c89e0dc5c4a6c14b2bae9d6c29870f1f639985a2388f3c99c2",
+    "src/xdr.rs": "29b9cbaf586c8af29651b7d11affb0b31d087bf3bfe75c6080768c8810f749ab",
+    "src/mount_handlers.rs": "790507bfdfb280303f55bebceb0fd73b5a2c0f29ad2750596f767c2b81be3c79",
+    "src/config.rs": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+    "src/lib.rs": "0e8e7a0a91aa56541f7171fd2580a50206cab9d28fa9383936dd89f00b577acb",
+    "src/fs_util.rs": "16530d2eadaa92b7e7bd9591b5605c5637eebe49111e7ec5230b2195901477af",
+    "src/write_counter.rs": "a530d38d13ad29f07544eaafe92116736ca69daafacdfbe5c44f128051d1f5e5",
+    "src/portmap.rs": "9b18b95bed75f37c2836e9b40ffff2368afac23acf410c3370bf7b96a5e62828",
+    "src/mount.rs": "5061de2cb2aedebe2bb23589871bef3e5ad452e4f2ca9de44ac94126bab22bce",
+    "src/nfs.rs": "eeb9fddfaa71ed136482391af2abd706b8ee99c8f94d09ef14639b94906f308f",
+    "src/nfs_handlers.rs": "826c832c029d29a946ed73d07a5358e4fb3e9bf73fd81fdee3d31e67624eb510",
+    "src/tcp.rs": "1206c94a35e11d701a29f4f47d997af3ee5587174fefdbe786589ab7a5f95856",
+    "src/portmap_handlers.rs": "bb2297342eba6595d77954d0b296eec3bad31068c26e3646d432cc8b33316c4d",
+    "src/rpcwire.rs": "d8b4df58950c602b832ee3c07f3c4de478407ae0c6ddbda7fdc67358010ff012",
+    "src/vfs.rs": "07a5796ec2cfa6a3badf20e0cf6cdd8688f620f46d4a9c816e85a200455292a8",
+    "src/context.rs": "9a86a898733344bb7832fd6154e9764700edef9097c00c2f45d927f729ce1f3e",
+    "src/transaction_tracker.rs": "91ed917eeb351a38471414dfa69cc611d45c8b41643e2db13396e9944f0f1a21",
+    "src/rpc.rs": "7dc67c913a44402ba374bf834a42234f8cf88f6eebd18cf1eae52d4b173dedd6"
+  }
+}

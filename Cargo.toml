@@ -19,3 +19,6 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "=0.18.0", default-features = false }
+
+[patch.crates-io]
+nfsserve = { path = "vendor/nfsserve-0.11.0" }

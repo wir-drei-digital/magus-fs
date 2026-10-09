@@ -280,6 +280,69 @@ class NfsWireTests(unittest.TestCase):
         self.assertIn("legacy FS0 backing is unsupported", error)
         self.assertTrue((backing / "tree/instructions.md").read_bytes().startswith(b"durable"))
 
+    def test_access_matches_fixed_actor_modes_and_readonly_capability(self):
+        # Catches both readonly executable denial and RW overgranting execute/search.
+        rpc, _ = self.endpoint()
+        root = rpc.mount()
+        executable = rpc.lookup(root, b'run.sh')
+        ordinary = rpc.lookup(root, b'instructions.md')
+        for actor in (os.getuid(), 0, 12345):
+            self.assertEqual(rpc.call(100003, 4, opaque(executable) + words(63), actor)[-4:], words(33))
+            self.assertEqual(rpc.call(100003, 4, opaque(ordinary) + words(63), actor)[-4:], words(1))
+            self.assertEqual(rpc.call(100003, 4, opaque(root) + words(63), actor)[-4:], words(3))
+        _, private = self.private_endpoint('access-private')
+        self.assertEqual(private.call(100003, 4, opaque(private.mount()) + words(63))[-4:], words(31))
+        ordinary = private.lookup(private.mount(), b'instructions.md')
+        self.assertEqual(private.call(100003, 4, opaque(ordinary) + words(63))[-4:], words(13))
+        chmod = opaque(ordinary) + words(1, 0, 0, 0, 0, 0, 0, 0)
+        self.assertEqual(private.call(100003, 2, chmod)[:4], words(0))
+        self.assertEqual(private.call(100003, 4, opaque(ordinary) + words(63))[-4:], words(0))
+
+    def test_directory_read_and_search_permissions_are_separate(self):
+        # READDIR requires directory read; LOOKUP requires search, not both.
+        from permission_source import project_manifest
+        with urllib.request.urlopen(self.url + '/manifest', timeout=5) as response:
+            base = json.load(response)
+        current = [base]
+        class Gateway(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                data = json.dumps(current[0], separators=(',', ':')).encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            def log_message(self, *args):
+                pass
+        gateway = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Gateway)
+        threading.Thread(target=gateway.serve_forever, daemon=True).start()
+        self.addCleanup(gateway.server_close)
+        self.addCleanup(gateway.shutdown)
+        for mode, listing, lookup in [(0o400, 0, 13), (0o100, 13, 0)]:
+            current[0] = project_manifest(base, directory_mode=mode, uid=os.geteuid(), gid=os.getegid())
+            process = self.start('mount', '--backend', 'nfs', '--source', 'http://127.0.0.1:' + str(gateway.server_port),
+                                 '--mountpoint', str(self.root / ('directory-' + str(mode))), '--mode', 'ro', '--prepare-only')
+            rpc = Rpc(json.loads(ready(process))['port'])
+            nested = rpc.lookup(rpc.mount(), b'nested')
+            args = opaque(nested) + struct.pack('>Q', 0) + b'\0' * 8
+            self.assertEqual(rpc.call(100003, 16, args + words(4096))[:4], words(listing))
+            plus = rpc.call(100003, 17, args + words(4096, 4096))
+            self.assertEqual(plus[:4], words(listing))
+            if mode == 0o400:
+                # Name listing must not reveal child attrs/handles without search.
+                offset = 4
+                has_attrs = struct.unpack('>I', plus[offset:offset + 4])[0]
+                offset += 4 + (84 if has_attrs else 0) + 8
+                self.assertEqual(plus[offset:offset + 4], words(1))
+                offset += 4 + 8
+                length = struct.unpack('>I', plus[offset:offset + 4])[0]
+                offset += 4 + length + (-length % 4) + 8
+                self.assertEqual(plus[offset:offset + 8], words(0, 0))
+                index = next(i for i, entry in enumerate(base['entries']) if entry['path'] == 'nested/table.csv') + 2
+                forged = nested[:-8] + struct.pack('>Q', index)
+                self.assertEqual(rpc.call(100003, 1, opaque(forged))[:4], words(13))
+            self.assertEqual(rpc.call(100003, 4, opaque(nested) + words(63))[-4:], words(1 if mode == 0o400 else 2))
+            self.assertEqual(rpc.call(100003, 3, opaque(nested) + opaque(b'table.csv'))[:4], words(lookup))
+
     def test_fixed_principal_read_denial(self):
         # Raw RPC cannot bypass the fixed actor's mode check, including root credentials.
         source = self.start("source", "--root", str(self.root / "denied"), "--mode", "000")

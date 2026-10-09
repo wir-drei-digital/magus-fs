@@ -373,7 +373,27 @@ impl NFSFileSystem for NfsAdapter {
             .ok_or(nfsstat3::NFS3ERR_NOENT)
     }
     async fn getattr(&self, id: fileid3) -> std::result::Result<fattr3, nfsstat3> {
+        self.traversal(&self.current_entry(id)?)?;
         self.attr(id)
+    }
+    async fn access(&self, id: fileid3, requested: u32) -> std::result::Result<u32, nfsstat3> {
+        let entry = self.current_entry(id)?;
+        self.traversal(&entry)?;
+        let mut allowed = 0;
+        if self.allowed(&entry, 4) {
+            allowed |= 1; // READ: bytes or directory names
+        }
+        if self.allowed(&entry, 1) {
+            allowed |= if entry.directory { 2 } else { 32 }; // LOOKUP or EXECUTE
+        }
+        if self.backing.is_some() && self.allowed(&entry, if entry.directory { 3 } else { 2 }) {
+            allowed |= 4 | 8; // MODIFY and EXTEND permissions
+            if entry.directory {
+                allowed |= 16; // DELETE permission requires directory write and search
+            }
+        }
+        // ACCESS describes permissions; unsupported namespace procedures still reject.
+        Ok(requested & allowed)
     }
     async fn read(
         &self,
@@ -418,7 +438,8 @@ impl NFSFileSystem for NfsAdapter {
             return Err(nfsstat3::NFS3ERR_NOTDIR);
         }
         self.traversal(parent)?;
-        if !self.allowed(parent, 5) {
+        // Listing names needs read permission; child lookup separately requires search.
+        if !self.allowed(parent, 4) {
             return Err(nfsstat3::NFS3ERR_ACCES);
         }
         let children: Vec<_> = self
