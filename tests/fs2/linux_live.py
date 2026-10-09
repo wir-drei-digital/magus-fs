@@ -84,7 +84,43 @@ open('/tmp/held-result','w').write(json.dumps(out));os.close(h)
         assert held['held_hash']==hashlib.sha256(old).hexdigest() and held['held_size']==len(old)
         assert held['new_hash']==hashlib.sha256(new).hexdigest() and held['new_size']==len(new)
         assert held['stale_errno']==116 and held['old_inode']!=held['new_inode']
-        self.more_cases(reports)
+        if getattr(self, "isolated_authority_only", False):self.isolated_authority_case()
+        else:self.more_cases(reports)
+    def isolated_authority_case(self):
+        self.start('isolated',publication='isolated',actor='worker')
+        cached=self.read('isolated/reports/live')
+        self.start('isolated-clean',publication='isolated',actor='worker')
+        assert self.read('isolated-clean/reports/live')==cached
+        clean_before=self.cli('sync','status','--state','/private/isolated-clean/state')['live']
+        self.execute("import json,os;f=open('/shared/isolated/reports/private','wb');f.write(b'never published private bytes');f.flush();os.fsync(f.fileno());f.close();print('{}')",user='1001:1001')
+        before=self.cli('sync','status','--state','/private/isolated/state')['live']
+        def denied():
+            return self.execute("import json,os\ndef write(path):\n fd=os.open(path,os.O_WRONLY)\n try:os.pwrite(fd,open(path,'rb').read(1),0)\n finally:os.close(fd)\nrows={}\nfor name,fn in [('cached_read',lambda:open('/shared/isolated/reports/live','rb').read()),('clean_read',lambda:open('/shared/isolated-clean/reports/live','rb').read()),('cached_write',lambda:write('/shared/isolated/reports/live')),('private_write',lambda:write('/shared/isolated/reports/private'))]:\n try:fn();rows[name]=0\n except OSError as e:rows[name]=e.errno\nprint(json.dumps(rows))",user='1001:1001')
+        self.expect('isolated-revoke','POST',self.root+'/grants',200,body={'revoke':self.credential})
+        try:self.until(lambda:set(denied().values())=={13},15)
+        finally:self.evidence['isolated_authority']={'before':before,'denied_errno':denied()};self.save()
+        code,renewed=self.request('POST',self.root+'/grants',body={'delegate':{'replica':WORKER,'expires':int(time.time())+1800,'actions':['read','write','history','integrate'],'branches':['main'],'prefixes':['reports']}});assert code==200
+        self.execute("import json,sys;token=json.load(sys.stdin)\nfor name in ['isolated','isolated-clean']:open('/private/'+name+'/token','w').write(token)\nprint('{}')",renewed['token'])
+        self.until(lambda:set(denied().values())=={0},15)
+        refreshed=self.cli('sync','status','--state','/private/isolated/state')['live']
+        assert refreshed['epoch']==before['epoch'] and refreshed['revision']==before['revision']
+        assert self.read('isolated/reports/live')==cached and self.read('isolated/reports/private')==b'never published private bytes'.hex()
+        def change_content(r):
+            entry=next(e for e in r['tree']['entries'] if e['path']=='reports/live');entry['content']=file_entry('unused',entry['parent'],b'changed shared bytes')['content']
+        shared=self.publish(change_content,[b'changed shared bytes']);self.accepted(shared)
+        self.until(lambda:self.cli('sync','status','--state','/private/isolated-clean/state')['live']['pending_revision'] is not None,15)
+        clean_after=self.cli('sync','status','--state','/private/isolated-clean/state')['live']
+        assert clean_after['epoch']==clean_before['epoch'] and clean_after['revision']==clean_before['revision'] and self.read('isolated-clean/reports/live')==cached
+        assert self.read('isolated/reports/live')==cached and self.read('live/reports/live')==b'changed shared bytes'.hex()
+        refreshed_errno=denied();assert set(refreshed_errno.values())=={0}
+        def revoke_mode(r):next(e for e in r['tree']['entries'] if e['path']=='reports/live')['mode']=0
+        shared=self.publish(revoke_mode);self.accepted(shared)
+        self.until(lambda:denied()['cached_read']==13 and denied()['cached_write']==13 and denied()['clean_read']==13,15)
+        assert denied()['private_write']==0
+        after=self.cli('sync','status','--state','/private/isolated/state')['live'];assert after['epoch']==before['epoch'] and after['revision']==before['revision']
+        assert self.read('isolated/reports/private')==b'never published private bytes'.hex()
+        self.evidence['isolated_authority'].update({'clean_before':clean_before,'clean_after':clean_after,'clean_bytes_retained':True,'refreshed':refreshed,'mode_revoked':after,'mode_errno':denied(),'refreshed_errno':refreshed_errno,'cached_hash':hashlib.sha256(bytes.fromhex(cached)).hexdigest(),'cached_size':len(bytes.fromhex(cached)),'private_hash':hashlib.sha256(b'never published private bytes').hexdigest(),'private_size':len(b'never published private bytes')});self.save()
+
     def accepted(self,shared,name='live'):
         def ready():
             status=self.cli('sync','status','--state','/private/'+name+'/state')
@@ -221,14 +257,14 @@ print(json.dumps({'mount':mount,'unmount':p.returncode,'still_mounted':False,'pi
         self.i.write_json('mount-cleanup.json',rows)
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--output',required=True);p.add_argument('--image',default='magus-fs2-task4-live');p.add_argument('--reuse-image',action='store_true');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--output',required=True);p.add_argument('--image',default='magus-fs2-task4-live');p.add_argument('--reuse-image',action='store_true');p.add_argument('--isolated-authority-only',action='store_true');a=p.parse_args()
     i=OwnedInfra(Path(a.output));j=None;status=1;clean=False
     try:
         i.preflight();source=capture(i)
         if not a.reuse_image:i.docker('build','-f','tests/fs2/Dockerfile.linux','--build-arg','VERIFY=client-fix','-t',a.image,'.',timeout=900)
         i.setup(a.image);verify_image(i,source)
         i.write_json('binary-identity.json',{'linux':i.docker('exec',i.service,'sha256sum','/usr/local/bin/magus-fs').stdout})
-        j=LiveJourney(i,a.image);started=time.monotonic();j.run();assert time.monotonic()-started<600;status=0
+        j=LiveJourney(i,a.image);j.isolated_authority_only=a.isolated_authority_only;started=time.monotonic();j.run();assert time.monotonic()-started<600;status=0
     except InfrastructureUnavailable as e:i.write_json('failure.json',{'classification':'blocked','reason':str(e)});status=2
     except Exception as e:i.write_json('failure.json',{'classification':'failed','reason':str(e),'trace':traceback.format_exc()})
     finally:

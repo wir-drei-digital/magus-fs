@@ -219,3 +219,78 @@ fn pending_authority_governs_handle_metadata_and_remote_removed_identities() {
     err(w.unlink("a"), "permission_denied");
     assert!(rep.status().unwrap().dirty);
 }
+
+fn observed_local_identity_removal(reopen: bool) {
+    let (d, rep, w, original) = pair();
+    let shared = w.create("shared-local", 0o600).unwrap();
+    w.write(&shared, 0, b"shared").unwrap();
+    let checkpoint = w
+        .checkpoint(
+            &OperationId::random().unwrap(),
+            w.generation().unwrap(),
+            attr(),
+        )
+        .unwrap();
+    let mut observed = rep.revision(&checkpoint).unwrap();
+    observed.parents.clear();
+    observed.operation = OperationId::random().unwrap();
+    let observed = import(&rep, &observed, ChunkSource::Unavailable);
+    let private = w.create("never-observed", 0o600).unwrap();
+    w.write(&private, 0, b"private").unwrap();
+    w.write(&shared, 0, b"dirty!").unwrap();
+    rep.observe_remote_authority(Some(&observed), 0).unwrap();
+    assert_eq!(w.read(&shared, 0, 99).unwrap(), b"dirty!");
+    let mut removed = rep.revision(&observed).unwrap();
+    removed.operation = OperationId::random().unwrap();
+    removed.tree.entries.retain(|e| e.id != *shared.entry_id());
+    let removed = import(&rep, &removed, ChunkSource::Unavailable);
+    rep.observe_remote_authority(Some(&removed), 1).unwrap();
+    let epoch = w.epoch().unwrap();
+    let generation = w.generation().unwrap();
+    assert!(!original
+        .tree
+        .entries
+        .iter()
+        .any(|e| e.id == *shared.entry_id()));
+    if !reopen {
+        err(w.read(&shared, 0, 99), "permission_denied");
+        err(w.write(&shared, 0, b"bad"), "permission_denied");
+        err(w.chmod_handle(&shared, 0o777), "permission_denied");
+    }
+    drop(shared);
+    drop(private);
+    drop(w);
+    let rep = if reopen {
+        drop(rep);
+        Replica::reopen(d.path().join("state")).unwrap()
+    } else {
+        rep
+    };
+    let w = rep
+        .begin_live(&revision_id(&original).unwrap(), actor(), false)
+        .unwrap();
+    err(
+        w.open("shared-local", OpenMode::ReadWrite),
+        "permission_denied",
+    );
+    err(w.rename("shared-local", "escaped"), "permission_denied");
+    err(w.unlink("shared-local"), "permission_denied");
+    let private = w.open("never-observed", OpenMode::ReadWrite).unwrap();
+    assert_eq!(w.read(&private, 0, 99).unwrap(), b"private");
+    assert_eq!(w.generation().unwrap(), generation);
+    assert_eq!(w.epoch().unwrap(), epoch);
+    assert!(rep.status().unwrap().dirty);
+    rep.observe_remote_authority(Some(&observed), 2).unwrap();
+    let shared = w.open("shared-local", OpenMode::ReadWrite).unwrap();
+    assert_eq!(w.read(&shared, 0, 99).unwrap(), b"dirty!");
+    w.write(&private, 0, b"PRIVATE").unwrap();
+}
+
+#[test]
+fn remotely_observed_local_identity_cannot_regain_private_access() {
+    observed_local_identity_removal(false);
+}
+#[test]
+fn removed_remote_provenance_survives_reopen_without_losing_private_bytes() {
+    observed_local_identity_removal(true);
+}

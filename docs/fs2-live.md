@@ -1,6 +1,6 @@
 # Linux live views and open epochs
 
-An attached `shared-live` Linux mount polls the authenticated durable change log and current authorized view. A separate explicitly trusted WSS connection receives cursor hints; hints are not content authority and do not hold the publication execution gate. Discovery and publication share the bounded `SyncExecution` gate, without holding Core's mutex across discovery requests. The Core journal owns incoming authority, working state, immutable sources and receipts.
+Every attached Linux mount, including `isolated`, polls the authenticated durable change log and current authorized view. A separate explicitly trusted WSS connection receives cursor hints; hints are not content authority and do not hold the publication execution gate. Discovery and publication share the bounded `SyncExecution` gate, without holding Core's mutex across discovery requests. The Core journal owns incoming authority, working state, immutable sources and receipts.
 
 ```sh
 magus-fs sync attach --state STATE --profile PROFILE --branch main --publication shared-live
@@ -8,7 +8,7 @@ magus-fs mount --state STATE --revision ATTACHED_PROJECTED_REVISION --mountpoint
 magus-fs sync status --state STATE
 ```
 
-Use `--mode read-only` for an absolute readonly live mount. The default isolated publication mode preserves private work and does not adopt shared updates automatically. Existing unbound FS1 snapshot mounts keep their historical behavior.
+Use `--mode read-only` for an absolute readonly live mount. The default isolated publication mode preserves private work and does not adopt shared updates automatically. Its discovery worker still enforces authenticated current authority and credential revocation, without changing bytes, adopted epoch or Applied acknowledgement. Existing unbound FS1 snapshot mounts keep their historical behavior.
 
 ## Descriptor semantics
 
@@ -16,7 +16,7 @@ Each accepted remote adoption advances a persistent epoch independently of the o
 
 Writes, truncates and handle metadata mutations from an old epoch return `ESTALE` before mutation. Readonly denial remains absolute. No implicit private branch or rebase is created. Epoch trees and their object roots remain protected while descriptors retain them. Native fsync is local durability and does not imply upload or shared acceptance.
 
-Core adopts only clean, generation-matching state. Unresolved submissions and unsubmitted local checkpoints block replacement. A newer authority projection can revoke access while incoming content remains pending; dirty bytes and queued original bases are retained. Legitimate local creates retain their own identity and permissions, subject to the current remote parent authority. The independently journaled authority generation rejects stale observations; its immutable history records authenticated descriptor identities or definitive denial. Authentication denial closes this replica’s mounted remote access; a transient transport outage retains last-known authority. It does not disable unrelated replicas or delete retained bytes. Explicit owner-controlled local recovery/archive APIs retain their existing scope; they must remain outside the workload boundary. These controls cannot erase previously downloaded files or copies and do not replace the existing explicit local recovery/archive rules.
+Core adopts only clean, generation-matching state. Unresolved submissions and unsubmitted local checkpoints block replacement. A newer authority projection can revoke access while incoming content remains pending; dirty bytes and queued original bases are retained. Legitimate never-observed local creates retain their own identity and permissions, subject to the current remote parent authority. An identity once present in authenticated remote authority remains remote-known even if it originated locally and adoption was blocked. Core rebuilds an ID membership set from its immutable authority history on open and updates it after committed observations; later remote removal cannot turn that identity back into a private create. The independently journaled authority generation rejects stale observations; its immutable history records authenticated descriptor identities or definitive denial. Authentication denial closes this replica’s mounted remote access; a transient transport outage retains last-known authority. It does not disable unrelated replicas or delete retained bytes. Explicit owner-controlled local recovery/archive APIs retain their existing scope; they must remain outside the workload boundary. These controls cannot erase previously downloaded files or copies and do not replace the existing explicit local recovery/archive rules.
 
 Every incoming source is an immutable opaque identity outside canonical content. The trusted resolver retains its original namespace, projected view and profile binding. A queued publication continues using its original binding and request digest after another view becomes active. Projected snapshots have their own canonical hashes and no parents; they are not the server's full revision DAG.
 

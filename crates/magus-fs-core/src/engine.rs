@@ -78,6 +78,8 @@ pub(crate) struct Core {
     pub(crate) working: Option<Working>,
     handles: Vec<Weak<HandleData>>,
     pub(crate) epochs: BTreeMap<u64, Working>,
+    /// Derived from committed authority history; rebuilt once on reopen.
+    pub(crate) remote_entries: BTreeSet<EntryId>,
     pub(crate) remote_fetcher: Option<Arc<dyn RemoteFetcher>>,
 }
 #[derive(Clone)]
@@ -632,8 +634,23 @@ impl Replica {
             working,
             handles: vec![],
             epochs: BTreeMap::new(),
+            remote_entries: BTreeSet::new(),
             remote_fetcher: None,
         };
+        let observations = core
+            .journal
+            .db
+            .prepare(
+                "SELECT DISTINCT revision FROM live_authority_history WHERE revision IS NOT NULL",
+            )?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for id in observations {
+            let tree = core.revision(&RevisionId::parse(id)?)?.tree;
+            core.remote_entries.insert(tree.root.id);
+            core.remote_entries
+                .extend(tree.entries.into_iter().map(|e| e.id));
+        }
         // Unlinked open handles die with their process; immutable bodies are retained until explicit pruning.
         if let Some(w) = &mut core.working {
             w.orphans.clear();
@@ -986,7 +1003,9 @@ impl Workspace {
                     perm::access(a, &current, bits)?;
                 } else {
                     let base = core.revision(&core.working()?.base)?;
-                    if base.tree.entries.iter().any(|v| v.id == e.id) {
+                    if core.remote_entries.contains(&e.id)
+                        || base.tree.entries.iter().any(|v| v.id == e.id)
+                    {
                         return Err(FsError::PermissionDenied);
                     }
                     // Locally created entries inherit current remote search authority

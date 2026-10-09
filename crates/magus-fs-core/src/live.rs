@@ -53,11 +53,14 @@ impl Replica {
             return Ok(());
         }
 
+        let mut observed_entries = Vec::new();
         if let Some(id) = revision {
             let r = core.revision(id)?;
             if r.tree.root.id != core.working()?.tree.root.id {
                 return Err(FsError::BaseMismatch);
             }
+            observed_entries.push(r.tree.root.id);
+            observed_entries.extend(r.tree.entries.into_iter().map(|e| e.id));
         }
         let next = generation.checked_add(1).ok_or(FsError::LimitExceeded)?;
         let tx = core.journal.db.transaction()?;
@@ -73,6 +76,7 @@ impl Replica {
             [revision.map(RevisionId::as_str)],
         )?;
         tx.commit()?;
+        core.remote_entries.extend(observed_entries);
         Ok(())
     }
 

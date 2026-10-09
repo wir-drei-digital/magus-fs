@@ -145,6 +145,12 @@ impl Incoming {
             self.rep
                 .observe_remote_authority(Some(&next.view.revision), authority_generation)?;
             self.credential = Some(credential);
+            // Private publication still observes authority, but never adopts shared bytes.
+            if binding.publication == PublicationMode::Isolated {
+                self.needs_refresh = false;
+                self.pending_source = None;
+                return Ok(None);
+            }
             let generation = self.rep.status()?.generation;
             install_sources(&self.rep, Some(next.clone()))?;
             match apply(next, generation) {

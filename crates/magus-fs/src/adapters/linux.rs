@@ -724,12 +724,11 @@ pub fn mount(
     let session = fuser::Session::new(adapter, mountpoint, &cfg)?;
     let notifier = session.notifier();
     let stop = Arc::new(AtomicBool::new(false));
-    let incoming = if rep
-        .sync_status()?
-        .binding
+    let binding = rep.sync_status()?.binding;
+    let shared_live = binding
         .as_ref()
-        .is_some_and(|b| b.publication == PublicationMode::SharedLive)
-    {
+        .is_some_and(|b| b.publication == PublicationMode::SharedLive);
+    let incoming = if binding.is_some() {
         let stop = stop.clone();
         let rep = rep.clone();
         let mountpoint = mountpoint.to_path_buf();
@@ -739,13 +738,17 @@ pub fn mount(
                 Ok(v) => v,
                 Err(_) => return,
             };
-            let mut pending = rep.live_status().ok().and_then(|status| {
-                rep.revision(&status.revision).ok().map(|r| Adoption {
-                    revision: status.revision,
-                    epoch: status.epoch,
-                    entries: r.tree.entries,
-                })
-            });
+            let mut pending = rep
+                .live_status()
+                .ok()
+                .filter(|_| shared_live)
+                .and_then(|status| {
+                    rep.revision(&status.revision).ok().map(|r| Adoption {
+                        revision: status.revision,
+                        epoch: status.epoch,
+                        entries: r.tree.entries,
+                    })
+                });
             while !stop.load(Ordering::Relaxed) {
                 let result = incoming.poll(|binding, generation| {
                     let mut state = live_state.lock().map_err(|_| FsError::ReplicaBusy)?;
