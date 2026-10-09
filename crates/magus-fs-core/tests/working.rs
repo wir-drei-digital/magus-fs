@@ -413,3 +413,78 @@ fn concurrent_unlink_cannot_invalidate_a_successfully_created_handle() {
     assert!(created > 0);
     assert_eq!(stale, 0);
 }
+
+#[test]
+fn explicit_prune_recovers_small_quota_after_repeated_uncheckpointed_overwrites() {
+    let d = scratch();
+    let mut c = config();
+    c.cache_bytes = 6;
+    let rep = Replica::open(d.path().join("state"), c).unwrap();
+    let base = import(&rep, &revision(), ChunkSource::Unavailable);
+    let w = rep.begin(&base, actor(), false).unwrap();
+    let h = w.create("a", 0o600).unwrap();
+    w.write(&h, 0, b"old").unwrap();
+    drop(h);
+    for n in 0..12u8 {
+        let h = w.open("a", OpenMode::ReadWrite).unwrap();
+        let bytes = [n, 42, 99];
+        w.write(&h, 0, &bytes).unwrap();
+        assert!(rep.prune(true).unwrap().evictable.is_empty());
+        err(w.write(&h, 0, b"xxx"), "backpressure");
+        drop(h);
+        let dry = rep.prune(true).unwrap();
+        assert_eq!(dry.reclaimable_bytes, 3);
+        assert_eq!(dry.evictable.len(), 1);
+        assert_eq!(rep.status().unwrap().resident_bytes, 6);
+        rep.prune(false).unwrap();
+        assert_eq!(rep.status().unwrap().resident_bytes, 3);
+        let h = w.open("a", OpenMode::Read).unwrap();
+        assert_eq!(w.read(&h, 0, 3).unwrap(), bytes);
+        drop(h);
+    }
+}
+
+#[test]
+fn unreachable_garbage_pruning_retains_committed_local_history() {
+    let (d, rep, w, base) = setup();
+    let h = w.create("a", 0o600).unwrap();
+    w.write(&h, 0, b"old").unwrap();
+    let old = w
+        .checkpoint(
+            &OperationId::random().unwrap(),
+            w.generation().unwrap(),
+            attr(),
+        )
+        .unwrap();
+    w.write(&h, 0, b"mid").unwrap();
+    w.write(&h, 0, b"new").unwrap();
+    drop(h);
+    let report = rep.prune(true).unwrap();
+    assert_eq!(report.evictable, vec![ObjectId::for_bytes(b"mid").unwrap()]);
+    rep.prune(false).unwrap();
+    assert_eq!(rep.status().unwrap().resident_bytes, 6);
+    drop(w);
+    drop(rep);
+    let rep = Replica::open(d.path().join("state"), config()).unwrap();
+    let historical = rep.begin(&old, actor(), true).unwrap();
+    let h = historical.open("a", OpenMode::Read).unwrap();
+    assert_eq!(historical.read(&h, 0, 3).unwrap(), b"old");
+    let w = rep.begin(&base, actor(), false).unwrap();
+    let h = w.open("a", OpenMode::Read).unwrap();
+    assert_eq!(w.read(&h, 0, 3).unwrap(), b"new");
+    assert!(rep.prune(true).unwrap().evictable.is_empty());
+    assert_eq!(rep.history().unwrap(), vec![base, old]);
+}
+
+#[test]
+fn unreachable_unlinked_local_bytes_wait_for_last_handle_close() {
+    let (_d, rep, w, _) = setup();
+    let h = w.create("a", 0o600).unwrap();
+    w.write(&h, 0, b"abc").unwrap();
+    w.unlink("a").unwrap();
+    assert!(rep.prune(true).unwrap().evictable.is_empty());
+    assert_eq!(w.read(&h, 0, 3).unwrap(), b"abc");
+    drop(h);
+    assert_eq!(rep.prune(false).unwrap().reclaimable_bytes, 3);
+    assert_eq!(rep.status().unwrap().resident_bytes, 0);
+}

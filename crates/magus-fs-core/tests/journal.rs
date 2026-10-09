@@ -174,3 +174,73 @@ fn replacing_the_control_path_refuses_further_workspace_operations() {
     err(w.lookup("a"), "unsafe_storage");
     err(rep.status(), "unsafe_storage");
 }
+
+#[test]
+fn reimport_upgrades_source_without_unavailable_downgrade_and_persists() {
+    let d = scratch();
+    let rep = Replica::open(d.path().join("state"), config()).unwrap();
+    let mut r = revision();
+    add_file(&mut r, "a", b"abc");
+    let base = import(&rep, &r, ChunkSource::Unavailable);
+    let source = local(d.path(), b"abc");
+    assert_eq!(import(&rep, &r, source), base);
+    import(&rep, &r, ChunkSource::Unavailable);
+    assert_eq!(rep.history().unwrap().len(), 1);
+    drop(rep);
+    let rep = Replica::open(d.path().join("state"), config()).unwrap();
+    let w = rep.begin(&base, actor(), false).unwrap();
+    let h = w.open("a", OpenMode::Read).unwrap();
+    assert_eq!(w.read(&h, 0, 3).unwrap(), b"abc");
+}
+
+#[test]
+fn cross_revision_source_replacement_repairs_stale_source_with_size_consistency() {
+    let d = scratch();
+    let rep = Replica::open(d.path().join("state"), config()).unwrap();
+    let mut r = revision();
+    add_file(&mut r, "a", b"abc");
+    let base = import(
+        &rep,
+        &r,
+        ChunkSource::Local {
+            path: d.path().join("expired"),
+        },
+    );
+    let w = rep.begin(&base, actor(), false).unwrap();
+    let h = w.open("a", OpenMode::Read).unwrap();
+    err(w.read(&h, 0, 3), "base_unavailable");
+    let mut bad = r.clone();
+    bad.operation = OperationId::random().unwrap();
+    if let EntryContent::File { version } = &mut bad.tree.entries[0].content {
+        version.size = 2;
+        if let Extent::Chunk {
+            object_size,
+            length,
+            ..
+        } = &mut version.extents[0]
+        {
+            *object_size = 2;
+            *length = 2
+        }
+    }
+    let source = local(d.path(), b"abc");
+    err(
+        rep.import_revision(
+            ImportDescriptor {
+                expected: revision_id(&bad).unwrap(),
+                bytes: encode_revision(&bad).unwrap(),
+            },
+            source.clone(),
+        ),
+        "corrupt_object",
+    );
+    assert_eq!(rep.history().unwrap(), vec![base.clone()]);
+    err(w.read(&h, 0, 3), "base_unavailable");
+    let mut newer = r.clone();
+    newer.operation = OperationId::random().unwrap();
+    newer.parents = vec![base];
+    newer.tree.entries[0].mode = 0o600;
+    import(&rep, &newer, source);
+    assert_eq!(rep.status().unwrap().resident_bytes, 0);
+    assert_eq!(w.read(&h, 0, 3).unwrap(), b"abc");
+}

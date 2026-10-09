@@ -88,3 +88,72 @@ fn write_only_handles_and_append_do_not_require_or_grant_read_access() {
     let read = w.open("a", OpenMode::Read).unwrap();
     assert_eq!(w.read(&read, 0, 2).unwrap(), b"ab");
 }
+
+#[test]
+fn historical_lookup_list_and_open_follow_current_grants_and_revocations() {
+    let (_d, rep, w, _) = setup();
+    w.mkdir("dir", 0o700).unwrap();
+    let h = w.create("dir/file", 0o600).unwrap();
+    w.write(&h, 0, b"history").unwrap();
+    drop(h);
+    w.chmod("dir/file", 0).unwrap();
+    w.chmod("dir", 0).unwrap();
+    w.chmod("", 0).unwrap();
+    let id = w
+        .checkpoint(
+            &OperationId::random().unwrap(),
+            w.generation().unwrap(),
+            attr(),
+        )
+        .unwrap();
+    let old = rep.begin(&id, actor(), true).unwrap();
+    err(old.lookup("dir/file"), "permission_denied");
+    err(old.list("dir"), "permission_denied");
+    err(old.open("dir/file", OpenMode::Read), "permission_denied");
+    w.chmod("", 0o700).unwrap();
+    w.chmod("dir", 0o700).unwrap();
+    w.chmod("dir/file", 0o600).unwrap();
+    assert_eq!(old.lookup("dir/file").unwrap().mode, 0);
+    assert_eq!(old.list("dir").unwrap(), vec!["file"]);
+    let old_handle = old.open("dir/file", OpenMode::Read).unwrap();
+    assert_eq!(old.read(&old_handle, 0, 7).unwrap(), b"history");
+    w.chmod("dir", 0).unwrap();
+    err(old.lookup("dir/file"), "permission_denied");
+    err(old.list("dir"), "permission_denied");
+    err(old.open("dir/file", OpenMode::Read), "permission_denied");
+    err(old.read(&old_handle, 0, 7), "permission_denied");
+    w.chmod("dir", 0o700).unwrap();
+    w.unlink("dir/file").unwrap();
+    err(old.lookup("dir/file"), "permission_denied");
+    err(old.open("dir/file", OpenMode::Read), "permission_denied");
+    w.unlink("dir").unwrap();
+    err(old.list("dir"), "permission_denied");
+}
+
+#[test]
+fn historical_traversal_authorizes_current_renamed_identity_path() {
+    let (_d, rep, w, _) = setup();
+    w.mkdir("past", 0o700).unwrap();
+    w.mkdir("current", 0o700).unwrap();
+    let h = w.create("past/file", 0o600).unwrap();
+    w.write(&h, 0, b"old").unwrap();
+    drop(h);
+    w.chmod("past", 0).unwrap();
+    let id = w
+        .checkpoint(
+            &OperationId::random().unwrap(),
+            w.generation().unwrap(),
+            attr(),
+        )
+        .unwrap();
+    w.chmod("past", 0o700).unwrap();
+    w.rename("past/file", "current/file").unwrap();
+    w.unlink("past").unwrap();
+    let old = rep.begin(&id, actor(), true).unwrap();
+    assert!(old.lookup("past/file").is_ok());
+    let h = old.open("past/file", OpenMode::Read).unwrap();
+    assert_eq!(old.read(&h, 0, 3).unwrap(), b"old");
+    w.chmod("current", 0).unwrap();
+    err(old.lookup("past/file"), "permission_denied");
+    err(old.open("past/file", OpenMode::Read), "permission_denied");
+}

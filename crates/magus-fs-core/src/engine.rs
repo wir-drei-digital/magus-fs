@@ -202,11 +202,6 @@ impl Core {
             if w.dirty {
                 protected.extend(cache::object_set(&w.tree));
             }
-            for e in &w.orphans {
-                let mut ids = BTreeMap::new();
-                cache::entry_objects(e, &mut ids);
-                protected.extend(ids.into_keys());
-            }
         }
         for h in self.handles.iter().filter_map(Weak::upgrade) {
             let mut ids = BTreeMap::new();
@@ -245,15 +240,36 @@ impl Core {
         // Pending and failed candidates remain independent roots even after further working edits.
         Ok(protected)
     }
+    fn referenced(&self, protected: &BTreeSet<ObjectId>) -> Result<BTreeSet<ObjectId>, FsError> {
+        let mut referenced = protected.clone();
+        if let Some(working) = &self.working {
+            referenced.extend(cache::object_set(&working.tree));
+        }
+        // All retained revisions are roots for local-only bytes, even when they are
+        // neither the head nor pinned. Source registration alone is not a root.
+        let mut statement = self.journal.db.prepare("SELECT id FROM revisions")?;
+        for id in statement.query_map([], |row| row.get::<_, String>(0))? {
+            referenced.extend(cache::object_set(
+                &self.revision(&RevisionId::parse(id?)?)?.tree,
+            ));
+        }
+        Ok(referenced)
+    }
     fn prune(&mut self, dry_run: bool) -> Result<PruneReport, FsError> {
         let protected = self.protected()?;
+        let referenced = self.referenced(&protected)?;
         let inventory = self.inventory()?;
         let mut report = PruneReport {
             evictable: vec![],
             reclaimable_bytes: 0,
         };
         for (id, size) in inventory {
-            if !protected.contains(&id) && self.source(&id)?.is_some_and(|(_, s)| s.refetchable()) {
+            let unreachable = !referenced.contains(&id);
+            let clean_refetchable = !protected.contains(&id)
+                && self
+                    .source(&id)?
+                    .is_some_and(|(_, source)| source.refetchable());
+            if unreachable || clean_refetchable {
                 report.reclaimable_bytes += size;
                 report.evictable.push(id);
             }
@@ -435,8 +451,15 @@ impl Replica {
             if old.is_some_and(|old| old as u64 != size) {
                 return Err(FsError::CorruptObject);
             }
+            // Explicit endpoint imports supersede stale endpoints. Unavailable only registers
+            // a missing source; it must not erase an already configured endpoint.
+            let statement = if source.refetchable() {
+                "INSERT INTO sources VALUES(?,?,?) ON CONFLICT(object) DO UPDATE SET source=excluded.source"
+            } else {
+                "INSERT OR IGNORE INTO sources VALUES(?,?,?)"
+            };
             tx.execute(
-                "INSERT OR IGNORE INTO sources VALUES(?,?,?)",
+                statement,
                 params![object.as_str(), size as u32, json(&source)?],
             )?;
         }
@@ -620,6 +643,19 @@ impl Workspace {
         }
         perm::access(a, e, bits)
     }
+    fn resolve_entry(&self, core: &Core, tree: &Tree, path: &str) -> Result<Entry, FsError> {
+        if !path.is_empty() {
+            crate::paths::validate_path(path)?;
+        }
+        // Historical names resolve identity; current ancestry and permissions authorize it.
+        // An imported readonly view with no working branch uses its own authority tree.
+        if self.view.is_none() || core.working.is_none() {
+            perm::traversal(tree, path, self.actor(core)?)?;
+        }
+        let entry = perm::entry(tree, path)?;
+        self.access(core, &entry, 0)?;
+        Ok(entry)
+    }
     fn handle_entry(&self, core: &Core, h: &Handle) -> Result<Entry, FsError> {
         if h.inner.workspace != self.token {
             return Err(FsError::StaleHandle);
@@ -653,16 +689,12 @@ impl Workspace {
     pub fn lookup(&self, path: &str) -> Result<Entry, FsError> {
         let core = lock(&self.core)?;
         let tree = self.tree(&core)?;
-        perm::traversal(&tree, path, self.actor(&core)?)?;
-        let e = perm::entry(&tree, path)?;
-        self.access(&core, &e, 0)?;
-        Ok(e)
+        self.resolve_entry(&core, &tree, path)
     }
     pub fn list(&self, path: &str) -> Result<Vec<String>, FsError> {
         let core = lock(&self.core)?;
         let tree = self.tree(&core)?;
-        perm::traversal(&tree, path, self.actor(&core)?)?;
-        let e = perm::entry(&tree, path)?;
+        let e = self.resolve_entry(&core, &tree, path)?;
         if e.content != EntryContent::Directory {
             return Err(FsError::NotDirectory);
         }
@@ -682,8 +714,7 @@ impl Workspace {
         }
         let mut core = lock(&self.core)?;
         let tree = self.tree(&core)?;
-        perm::traversal(&tree, path, self.actor(&core)?)?;
-        let e = perm::entry(&tree, path)?;
+        let e = self.resolve_entry(&core, &tree, path)?;
         if e.content == EntryContent::Directory {
             return Err(FsError::IsDirectory);
         }

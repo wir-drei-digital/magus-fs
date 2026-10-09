@@ -167,3 +167,58 @@ fn enospc_eio_at_object_sync_and_db_commit_keep_head_and_retryable_bytes() {
 fn pending_clean_checkpoint_protects_refetchable_objects_from_prune() {
     fault_case("before-transaction", "pause", true)
 }
+
+#[cfg(feature = "test-faults")]
+#[test]
+fn failed_save_orphan_worker() {
+    let Some(path) = std::env::var_os("MAGUS_ORPHAN_WORKER_STATE") else {
+        return;
+    };
+    let mut c = config();
+    c.cache_bytes = 6;
+    let rep = Replica::open(path, c).unwrap();
+    let base = rep.status().unwrap().selected_base.unwrap();
+    let w = rep.begin(&base, actor(), false).unwrap();
+    let h = w.open("a", OpenMode::ReadWrite).unwrap();
+    err(w.write(&h, 0, b"new"), "io_error");
+}
+
+#[cfg(feature = "test-faults")]
+#[test]
+fn failed_save_published_orphan_is_reclaimable_without_losing_acknowledged_bytes() {
+    let d = scratch();
+    let mut c = config();
+    c.cache_bytes = 6;
+    let rep = Replica::open(d.path().join("state"), c.clone()).unwrap();
+    let base = import(&rep, &revision(), ChunkSource::Unavailable);
+    let w = rep.begin(&base, actor(), false).unwrap();
+    let h = w.create("a", 0o600).unwrap();
+    w.write(&h, 0, b"old").unwrap();
+    let generation = w.generation().unwrap();
+    drop(h);
+    drop(w);
+    drop(rep);
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "failed_save_orphan_worker", "--nocapture"])
+        .env("MAGUS_ORPHAN_WORKER_STATE", d.path().join("state"))
+        .env("MAGUS_TEST_FAULT_POINT", "db-commit")
+        .env("MAGUS_TEST_FAULT_ACTION", "EIO")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    assert!(child.wait().unwrap().success());
+    let rep = Replica::open(d.path().join("state"), c).unwrap();
+    let w = rep.begin(&base, actor(), false).unwrap();
+    assert_eq!(w.generation().unwrap(), generation);
+    assert_eq!(rep.status().unwrap().resident_bytes, 6);
+    let dry = rep.prune(true).unwrap();
+    assert_eq!(dry.evictable, vec![ObjectId::for_bytes(b"new").unwrap()]);
+    rep.prune(false).unwrap();
+    let h = w.open("a", OpenMode::ReadWrite).unwrap();
+    assert_eq!(w.read(&h, 0, 3).unwrap(), b"old");
+    w.write(&h, 0, b"fix").unwrap();
+    assert_eq!(w.read(&h, 0, 3).unwrap(), b"fix");
+    assert_eq!(rep.status().unwrap().head, Some(base));
+    assert_eq!(rep.integrity_check().unwrap(), "ok");
+    println!("failed-save published orphan: owned_pid={pid} reaped=true restored_capacity=3 acknowledged_bytes_retained=true integrity=ok");
+}
