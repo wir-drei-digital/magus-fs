@@ -172,3 +172,121 @@ fn lowered_limits_and_open_directory_anchor_are_enforced() {
     );
     assert_eq!(fs::read_dir(root.join("replacement")).unwrap().count(), 0);
 }
+
+fn native_identity(path: &std::path::Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(path).unwrap();
+    (m.dev(), m.ino())
+}
+fn overlap(store: &std::path::Path, content: std::path::PathBuf) -> Result<ObjectStore, FsError> {
+    ObjectStore::open(
+        store,
+        ObjectLimits {
+            content_roots: vec![content],
+            ..ObjectLimits::default()
+        },
+    )
+}
+// Probe the owned fixture volume rather than assume its equivalence rules from the OS name.
+fn native_alias_fixture(
+    original: &str,
+    alias: &str,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    bool,
+) {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().canonicalize().unwrap();
+    let p = root.join(original);
+    let q = root.join(alias);
+    ObjectStore::open(&p, ObjectLimits::default()).unwrap();
+    let aliases = q.exists() && native_identity(&p) == native_identity(&q);
+    println!("native alias {original:?}/{alias:?} = {aliases}");
+    (t, p, q, aliases)
+}
+#[test]
+fn native_alias_equality_is_refused_without_conflating_distinct_directories() {
+    for (original, alias) in [("store", "STORE"), ("café", "cafe\u{301}")] {
+        let (_t, p, q, aliases) = native_alias_fixture(original, alias);
+        if aliases {
+            assert!(matches!(overlap(&p, q), Err(FsError::StorageOverlap)));
+        } else {
+            ObjectStore::open(&q, ObjectLimits::default()).unwrap();
+            assert_ne!(native_identity(&p), native_identity(&q));
+            let store = overlap(&p, q.clone()).unwrap();
+            let id = store.install(b"private").unwrap();
+            assert!(!q.join(id.as_str()).exists());
+        }
+    }
+}
+#[test]
+fn native_alias_existing_containment_in_both_directions_is_refused() {
+    for (original, alias) in [("store", "STORE"), ("café", "cafe\u{301}")] {
+        let (_t, p, q, aliases) = native_alias_fixture(original, alias);
+        ObjectStore::open(p.join("nested"), ObjectLimits::default()).unwrap();
+        if aliases {
+            assert!(matches!(
+                overlap(&p.join("nested"), q.clone()),
+                Err(FsError::StorageOverlap)
+            ));
+            assert!(matches!(
+                overlap(&p, q.join("nested")),
+                Err(FsError::StorageOverlap)
+            ));
+        } else {
+            ObjectStore::open(&q, ObjectLimits::default()).unwrap();
+            ObjectStore::open(q.join("nested"), ObjectLimits::default()).unwrap();
+            assert!(overlap(&p.join("nested"), q.clone()).is_ok());
+            assert!(overlap(&p, q.join("nested")).is_ok());
+        }
+    }
+}
+#[test]
+fn native_alias_missing_content_descendants_are_refused() {
+    for (original, alias) in [("store", "STORE"), ("café", "cafe\u{301}")] {
+        let (_t, p, q, aliases) = native_alias_fixture(original, alias);
+        let result = overlap(&p, q.join("not-created/deeper"));
+        if aliases {
+            assert!(matches!(result, Err(FsError::StorageOverlap)));
+        } else {
+            assert!(result.is_ok());
+        }
+        assert!(!q.join("not-created").exists());
+    }
+}
+#[test]
+fn native_alias_new_store_paths_are_refused_and_owned_empty_directory_is_removed() {
+    for (original, alias) in [("store", "STORE"), ("café", "cafe\u{301}")] {
+        let (t, p, q, aliases) = native_alias_fixture(original, alias);
+        fs::remove_dir(&p).unwrap();
+        for suffix in [None, Some("not-created/deeper")] {
+            let content = match suffix {
+                Some(s) => q.join(s),
+                None => q.clone(),
+            };
+            let result = overlap(&p, content);
+            if aliases {
+                assert!(matches!(result, Err(FsError::StorageOverlap)));
+                assert!(
+                    !p.exists(),
+                    "remove only the just-created empty store on refusal"
+                );
+            } else {
+                assert!(result.is_ok());
+                fs::remove_dir(&p).unwrap();
+            }
+        }
+        let root = t.path().canonicalize().unwrap();
+        ObjectStore::open(&p, ObjectLimits::default()).unwrap();
+        let result = overlap(&p.join("new-store"), q.clone());
+        if aliases {
+            assert!(matches!(result, Err(FsError::StorageOverlap)));
+            assert!(!p.join("new-store").exists());
+        } else {
+            assert!(result.is_ok());
+        }
+        assert!(root.is_dir());
+    }
+}

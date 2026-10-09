@@ -80,21 +80,80 @@ fn root_fd() -> Result<File, FsError> {
         libc::O_RDONLY | libc::O_DIRECTORY,
     )
 }
-fn inspect_no_symlink(path: &Path) -> Result<(), FsError> {
-    let mut dir = root_fd()?;
+// Retain open ancestors so native identity cannot be recycled during a comparison.
+struct NativePath {
+    directories: Vec<File>,
+    complete: bool,
+}
+fn identity(file: &File) -> Result<(u64, u64), FsError> {
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+fn inspect_no_symlink(path: &Path) -> Result<NativePath, FsError> {
+    let mut native = NativePath {
+        directories: vec![root_fd()?],
+        complete: true,
+    };
     for c in path.components() {
         if let Component::Normal(n) = c {
+            let dir = native.directories.last().ok_or(FsError::UnsafeStorage)?;
             match open_at(
                 dir.as_raw_fd(),
                 &name(n)?,
                 libc::O_RDONLY | libc::O_DIRECTORY,
             ) {
-                Ok(next) => dir = next,
-                Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Ok(next) => native.directories.push(next),
+                Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    native.complete = false;
+                    break;
+                }
                 Err(e) => return Err(e),
             }
         }
     }
+    Ok(native)
+}
+fn refuse_native_overlap(storage: &NativePath, content: &NativePath) -> Result<(), FsError> {
+    let storage_ids = storage
+        .directories
+        .iter()
+        .map(identity)
+        .collect::<Result<Vec<_>, _>>()?;
+    let content_ids = content
+        .directories
+        .iter()
+        .map(identity)
+        .collect::<Result<Vec<_>, _>>()?;
+    let storage_tip = storage_ids.last().ok_or(FsError::UnsafeStorage)?;
+    let content_tip = content_ids.last().ok_or(FsError::UnsafeStorage)?;
+    // An incomplete path's tip is only its nearest existing ancestor, not the intended root.
+    if (storage.complete && content_ids.contains(storage_tip))
+        || (content.complete && storage_ids.contains(content_tip))
+    {
+        return Err(FsError::StorageOverlap);
+    }
+    Ok(())
+}
+fn check_content_roots(storage: &NativePath, content_roots: &[PathBuf]) -> Result<(), FsError> {
+    for content in content_roots {
+        refuse_native_overlap(storage, &inspect_no_symlink(content)?)?;
+    }
+    Ok(())
+}
+fn remove_owned_empty_directory(
+    parent: &File,
+    leaf: &CString,
+    owned: &File,
+) -> Result<(), FsError> {
+    let current = open_at(parent.as_raw_fd(), leaf, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    if identity(&current)? != identity(owned)? {
+        return Err(FsError::UnsafeStorage);
+    }
+    // SAFETY: live parent/name; remove only the verified owned directory, and only if empty.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), leaf.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(syscall_error());
+    }
+    parent.sync_all()?;
     Ok(())
 }
 fn private(file: &File, dir: bool) -> Result<(), FsError> {
@@ -141,14 +200,17 @@ impl ObjectStore {
         if path == Path::new("/") {
             return Err(FsError::UnsafeStorage);
         }
-        for content in &limits.content_roots {
-            let content = absolute(content)?;
-            if path.starts_with(&content) || content.starts_with(&path) {
-                return Err(FsError::StorageOverlap);
-            }
-            inspect_no_symlink(&content)?;
-        }
-        let mut dir = root_fd()?;
+        let content_roots = limits
+            .content_roots
+            .iter()
+            .map(|p| absolute(p))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Check known ancestry before creating anything, including a missing store below content.
+        check_content_roots(&inspect_no_symlink(&path)?, &content_roots)?;
+        let mut storage = NativePath {
+            directories: vec![root_fd()?],
+            complete: true,
+        };
         let parts: Vec<_> = path
             .components()
             .filter_map(|c| {
@@ -160,6 +222,7 @@ impl ObjectStore {
             })
             .collect();
         for (i, n) in parts.iter().enumerate() {
+            let dir = storage.directories.last().ok_or(FsError::UnsafeStorage)?;
             let n = name(n)?;
             if i + 1 == parts.len() {
                 // SAFETY: directory and name remain live. mkdirat never follows an existing leaf.
@@ -174,11 +237,28 @@ impl ObjectStore {
                     child.set_permissions(std::fs::Permissions::from_mode(0o700))?;
                 }
                 private(&child, true)?;
+                // Resolve selected roots again: creating the leaf can make a formerly missing
+                // case/normalization alias resolvable. Check the actual opened store ancestry.
+                storage.directories.push(child);
+                if let Err(error) = check_content_roots(&storage, &content_roots) {
+                    if made {
+                        let owned = storage.directories.last().ok_or(FsError::UnsafeStorage)?;
+                        let parent = &storage.directories[storage.directories.len() - 2];
+                        remove_owned_empty_directory(parent, &n, owned)?;
+                    }
+                    return Err(error);
+                }
+                let child = storage.directories.pop().ok_or(FsError::UnsafeStorage)?;
                 child.sync_all()?;
-                dir.sync_all()?;
+                storage
+                    .directories
+                    .last()
+                    .ok_or(FsError::UnsafeStorage)?
+                    .sync_all()?;
                 return Ok(Self { dir: child, limits });
             }
-            dir = open_at(dir.as_raw_fd(), &n, libc::O_RDONLY | libc::O_DIRECTORY)?;
+            let child = open_at(dir.as_raw_fd(), &n, libc::O_RDONLY | libc::O_DIRECTORY)?;
+            storage.directories.push(child);
         }
         Err(FsError::UnsafeStorage)
     }
