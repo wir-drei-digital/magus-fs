@@ -22,7 +22,15 @@ magus-fs-probe mount --backend fuse --source http://ADDRESS:PORT \
   --mountpoint /ABSOLUTE/NEW/PATH --mode ro --expect-digest SHA256
 ```
 
-`--mode private` enables the same Probe's in-memory byte overlay. `--prepare-only` validates the manifest/options/path and exits without mounting. `--backing` and `--resume-backing` are rejected for FUSE. Mount options always include `default_permissions,nosuid,nodev,allow_other` and `ro` or `rw`. Kernel permission checks are supplemented by daemon caller/parent checks. The tested mapped source principal is UID/GID 0:0; nonowner and primary-group identities are tested only inside disposable containers. Supplemental-group authorization is conservatively unsupported in daemon checks and needs FS1 treatment.
+For the focused permission regressions added after review, run:
+
+```sh
+python3 tests/fs0/linux_run.py --focused-permissions --output /tmp/fs0-linux-permissions-NEW-UNIQUE-NAME
+```
+
+These fixtures vary only manifest metadata and continue forwarding all content chunks to the real Rust source. They qualify mode0400 directory name enumeration without child search, mode0100 search without enumeration, and root private write/readback on mode0444/mode000 with nonroot and read-only denial contrasts.
+
+`--mode private` enables the same Probe's in-memory byte overlay. `--prepare-only` validates the manifest/options/path and exits without mounting. `--backing` and `--resume-backing` are rejected for FUSE. Mount options always include `default_permissions,nosuid,nodev,allow_other` and `ro` or `rw`. Kernel permission checks are supplemented by daemon caller/parent checks. Directory enumeration requires directory read permission; child lookup/read still requires ancestor search permission. Private byte writes pass through a crate-private byte-store method only after the adapter authorizes the actual caller, so authorized root DAC override is honored while the independent read-only guard remains absolute. Standalone Probe writes retain their existing mode restriction. The tested mapped source principal is UID/GID 0:0; nonowner and primary-group identities are tested only inside disposable containers. Supplemental-group authorization is conservatively unsupported in daemon checks and needs FS1 treatment.
 
 Ordinary mounted tests cover exact ranges/EOF, metadata and traversal, root mode000 bypass with all read-only mutations denied, private write/readback, sparse extension/reopen, read mmap and visibility of private writes in an existing mmap, local lock contention and pinned manifests/open descriptors. Enumeration fetched zero content bodies; two 4 KiB head/tail reads fetched 524,288 bytes with the 256 KiB chunk size, and a warm repeat fetched zero additional bytes.
 

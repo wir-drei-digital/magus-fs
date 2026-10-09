@@ -9,7 +9,24 @@ import uuid
 IMAGE = 'fs0-task3-runtime-final'
 
 
-def run(output, image=IMAGE):
+def permission_cases(workload, control, report):
+    script = "import json,sys; from permission_io import run; d=json.load(sys.stdin); print(json.dumps(run(d['case'],d['source'])))"
+    for name, view, user, kind in [
+        ('directory-readable','directory400-ro','1001:1001','directory400'),
+        ('directory-searchable','directory100-ro','1001:1001','directory100'),
+        ('root-private444','file444-private','0:0','private-root'),
+        ('root-private000','file000-private','0:0','private-root'),
+        ('nonroot-private444','file444-private','1001:1001','private-denied'),
+        ('nonroot-private000','file000-private','1001:1001','private-denied'),
+        ('root-readonly444','file444-ro','0:0','readonly-root'),
+        ('root-readonly000','file000-ro','0:0','readonly-root'),
+    ]:
+        label = view.rsplit('-',1)[0]
+        workload(name, view, script, {'case':kind,'source':control['sources'][label]['url']},user=user,readonly=view.endswith('-ro'))
+    report['qualification'] = 'focused directory read/search and authorized root private byte-write correction'
+
+
+def run(output, image=IMAGE, focused=False):
     output = Path(output).absolute()
     output.mkdir(exist_ok=False)
     token = 'fs0-task3-' + uuid.uuid4().hex[:12]
@@ -50,7 +67,7 @@ def run(output, image=IMAGE):
         report['owned_containers'].append(daemon)
         started = True
         cmd(['docker','run','-d','--name',daemon,'--read-only','--cap-drop','ALL','--cap-add','SYS_ADMIN','--security-opt','no-new-privileges',
-             '--device','/dev/fuse','--tmpfs','/private:rw,nosuid,nodev,size=256m','--tmpfs','/tmp:rw,nosuid,nodev,size=4m','-v',vm_path + ':/shared:rshared',image,'python3','/opt/fs0/linux_daemon.py'],'daemon-start')
+             '--device','/dev/fuse','--tmpfs','/private:rw,nosuid,nodev,size=256m','--tmpfs','/tmp:rw,nosuid,nodev,size=4m','-v',vm_path + ':/shared:rshared',image,'python3','/opt/fs0/linux_daemon.py', *(['--focused-permissions'] if focused else [])],'daemon-start')
         deadline = time.monotonic() + 35
         while True:
             logs = cmd(['docker','logs',daemon],'daemon-log',check=False).stdout
@@ -65,51 +82,55 @@ def run(output, image=IMAGE):
         control = json.loads(cmd(['docker','exec',daemon,'cat','/private/control.json'],'control').stdout)
         report['daemon'] = control
         report['daemon_inspect'] = json.loads(cmd(['docker','inspect',daemon],'daemon-inspect').stdout)[0]
-        source = control['sources']['normal']['url']
-        manifest = control['sources']['normal']['manifest']
-        def source_stats():
-            return json.loads(cmd(['docker','exec',daemon,'python3','-c',"import json,urllib.request; print(urllib.request.urlopen('" + source + "/stats').read().decode())"], 'stats-' + str(len(report['commands']))).stdout)
-        # Do transfer measurements before any ordinary scenario hydrates bytes.
-        before = source_stats()
-        listing = workload('enumeration','normal-ro',"import json,os; print(json.dumps(sorted(os.listdir('/view'))))",{},readonly=True)
-        enumerated = source_stats()
-        assert before['content_body_bytes'] == enumerated['content_body_bytes'] == 0
-        script = "import json,os; from ordinary_io import expected; f=os.open('/view/data.bin',os.O_RDONLY); offsets=[0,67108864-4096]; [(_ for _ in ()).throw(AssertionError('range mismatch')) for off in offsets if os.pread(f,4096,off)!=expected(off,4096)]; os.close(f); print(json.dumps({'exact_head_tail':True}))"
-        workload('partial-cold','normal-ro',script,{},readonly=True)
-        cold = source_stats()
-        assert 0 < cold['content_body_bytes'] <= 8388608, cold
-        workload('partial-warm','normal-ro',script,{},readonly=True)
-        warm = source_stats()
-        assert warm['content_body_bytes'] == cold['content_body_bytes'], (cold,warm)
-        report['transfer'] = {'before':before,'enumeration':enumerated,'cold':cold,'warm':warm}
-        script = "import json,sys; from linux_io import run; from root_confinement import run as confined; d=json.load(sys.stdin); r=run('/view',d['mode'],d['manifest']); r['root_confinement']={'state':'passed','detail':confined(d['source'])}; print(json.dumps(r)); raise SystemExit(0 if all(x['state']=='passed' for x in r.values()) else 2)"
-        workload('root-readonly','normal-ro',script,{'mode':'ro','manifest':manifest,'source':source},readonly=True)
-        locked = control['sources']['locked']
-        workload('root-mode000-readonly','locked-ro',script,{'mode':'ro','manifest':locked['manifest'],'source':locked['url']},readonly=True)
-        script = "import errno,json; from pathlib import Path;\ntry:\n Path('/view/instructions.md').read_bytes()\nexcept OSError as e:\n assert e.errno==errno.EACCES\nelse:\n raise AssertionError('nonroot mode000 read allowed')\nprint(json.dumps({'nonroot_mode000_read_denied':True}))"
-        workload('nonroot-mode000','locked-ro',script,{},user='1001:1001',readonly=True)
-        script = "import json,sys; from linux_io import run; d=json.load(sys.stdin); r=run('/view',d['mode'],d['manifest']); print(json.dumps(r)); raise SystemExit(0 if all(x['state']=='passed' for x in r.values()) else 2)"
-        workload('private','normal-private',script,{'mode':'private','manifest':manifest})
-        script = "import errno,json,os; from pathlib import Path; f=Path('/view/instructions.md'); assert f.read_bytes().startswith(b'# Synthetic');\ntry:\n f.open('r+b')\nexcept OSError as e:\n assert e.errno==errno.EACCES\nelse:\n raise AssertionError('group write allowed')\ntry:\n Path('/view/nested/table.csv').read_bytes()\nexcept OSError as e:\n assert e.errno==errno.EACCES\nelse:\n raise AssertionError('parent traversal allowed')\nprint(json.dumps({'group_read':True,'group_write_denied':True,'parent_search_denied':True}))"
-        workload('group-permissions','permissions-private',script,{},user='1001:0')
-        script = "import errno,json; from pathlib import Path;\ntry:\n Path('/view/instructions.md').read_bytes()\nexcept OSError as e:\n assert e.errno==errno.EACCES\nelse:\n raise AssertionError('other read allowed')\nprint(json.dumps({'other_read_denied':True}))"
-        workload('other-permissions','permissions-private',script,{},user='1001:1001')
-        script = "import json,subprocess; r=subprocess.run(['/view/run.sh'],capture_output=True,text=True,timeout=5); assert r.returncode==0 and r.stdout=='synthetic\\n', (r.returncode,r.stdout,r.stderr); print(json.dumps({'other_execute_0755':True,'output':r.stdout}))"
-        workload('execute-other','normal-ro',script,{},user='1001:1001',readonly=True)
-        script = "import errno,json,subprocess;\ntry:\n subprocess.run(['/view/run.sh'],capture_output=True,timeout=5)\nexcept OSError as e:\n assert e.errno==errno.EACCES\nelse:\n raise AssertionError('0640 execution allowed')\nprint(json.dumps({'group_execute_0640_denied':True}))"
-        workload('execute-denied','permissions-private',script,{},user='1001:0')
-        # Source files are snapshot inputs: touching them must not change a pinned mount.
-        cmd(['docker','exec',daemon,'python3','-c',"from pathlib import Path; Path('/private/fixture-normal/instructions.md').write_bytes(b'incoming source-file edit')"], 'source-file-edit')
-        workload('pinned-source-edit','normal-ro',"import json; from pathlib import Path; assert Path('/view/instructions.md').read_bytes()==b'# Synthetic workspace\\nUse relative paths.\\n'; print(json.dumps({'source_file_edit_is_not_generation_publication':True,'pinned_mount_unchanged':True}))",{},readonly=True)
-        different = control['sources']['permissions']['manifest']['digest']
-        assert different != manifest['digest']
-        generation_container = token + '-generation'
-        report['owned_containers'].append(generation_container)
-        generation = cmd(['docker','run','--rm','--name',generation_container,'--network','none','--read-only','--cap-drop','ALL','--cap-add','DAC_OVERRIDE','--security-opt','no-new-privileges','-v',vm_path + '/normal-ro:/old:ro,rslave','-v',vm_path + '/permissions-private:/fresh:ro,rslave',image,'python3','-c',"import json,os,stat; f=os.open('/old/instructions.md',os.O_RDONLY); before=os.pread(f,200,0); fresh=open('/fresh/instructions.md','rb').read(); assert before==fresh; assert stat.S_IMODE(os.stat('/old/instructions.md').st_mode)==0o644; assert stat.S_IMODE(os.stat('/fresh/instructions.md').st_mode)==0o640; assert os.pread(f,200,0)==before; os.close(f); print(json.dumps({'old_open_handle_and_mount_remain_pinned':True,'fresh_manifest_mode_visible_in_new_mount':True,'in_place_invalidation':'unsupported: no generation publication API'}))"],'generation-pinning')
-        report['cases']['generation-pinning'] = json.loads(generation.stdout)
-        report['generation_digests'] = {'old':manifest['digest'],'fresh':different}
-        report['qualification'] = 'pinned FS0 byte views; namespace mutation/live generation publication unsupported'
-        report['passed'] = True
+        if focused:
+            permission_cases(workload, control, report)
+            report['passed'] = all(case['state'] == 'passed' for scenario in report['cases'].values() for case in scenario.values())
+        else:
+            source = control['sources']['normal']['url']
+            manifest = control['sources']['normal']['manifest']
+            def source_stats():
+                return json.loads(cmd(['docker','exec',daemon,'python3','-c',"import json,urllib.request; print(urllib.request.urlopen('" + source + "/stats').read().decode())"], 'stats-' + str(len(report['commands']))).stdout)
+            # Do transfer measurements before any ordinary scenario hydrates bytes.
+            before = source_stats()
+            listing = workload('enumeration','normal-ro',"import json,os; print(json.dumps(sorted(os.listdir('/view'))))",{},readonly=True)
+            enumerated = source_stats()
+            assert before['content_body_bytes'] == enumerated['content_body_bytes'] == 0
+            script = "import json,os; from ordinary_io import expected; f=os.open('/view/data.bin',os.O_RDONLY); offsets=[0,67108864-4096]; [(_ for _ in ()).throw(AssertionError('range mismatch')) for off in offsets if os.pread(f,4096,off)!=expected(off,4096)]; os.close(f); print(json.dumps({'exact_head_tail':True}))"
+            workload('partial-cold','normal-ro',script,{},readonly=True)
+            cold = source_stats()
+            assert 0 < cold['content_body_bytes'] <= 8388608, cold
+            workload('partial-warm','normal-ro',script,{},readonly=True)
+            warm = source_stats()
+            assert warm['content_body_bytes'] == cold['content_body_bytes'], (cold,warm)
+            report['transfer'] = {'before':before,'enumeration':enumerated,'cold':cold,'warm':warm}
+            script = "import json,sys; from linux_io import run; from root_confinement import run as confined; d=json.load(sys.stdin); r=run('/view',d['mode'],d['manifest']); r['root_confinement']={'state':'passed','detail':confined(d['source'])}; print(json.dumps(r)); raise SystemExit(0 if all(x['state']=='passed' for x in r.values()) else 2)"
+            workload('root-readonly','normal-ro',script,{'mode':'ro','manifest':manifest,'source':source},readonly=True)
+            locked = control['sources']['locked']
+            workload('root-mode000-readonly','locked-ro',script,{'mode':'ro','manifest':locked['manifest'],'source':locked['url']},readonly=True)
+            script = "import errno,json; from pathlib import Path;\ntry:\n Path('/view/instructions.md').read_bytes()\nexcept OSError as e:\n assert e.errno==errno.EACCES\nelse:\n raise AssertionError('nonroot mode000 read allowed')\nprint(json.dumps({'nonroot_mode000_read_denied':True}))"
+            workload('nonroot-mode000','locked-ro',script,{},user='1001:1001',readonly=True)
+            script = "import json,sys; from linux_io import run; d=json.load(sys.stdin); r=run('/view',d['mode'],d['manifest']); print(json.dumps(r)); raise SystemExit(0 if all(x['state']=='passed' for x in r.values()) else 2)"
+            workload('private','normal-private',script,{'mode':'private','manifest':manifest})
+            script = "import errno,json,os; from pathlib import Path; f=Path('/view/instructions.md'); assert f.read_bytes().startswith(b'# Synthetic');\ntry:\n f.open('r+b')\nexcept OSError as e:\n assert e.errno==errno.EACCES\nelse:\n raise AssertionError('group write allowed')\ntry:\n Path('/view/nested/table.csv').read_bytes()\nexcept OSError as e:\n assert e.errno==errno.EACCES\nelse:\n raise AssertionError('parent traversal allowed')\nprint(json.dumps({'group_read':True,'group_write_denied':True,'parent_search_denied':True}))"
+            workload('group-permissions','permissions-private',script,{},user='1001:0')
+            script = "import errno,json; from pathlib import Path;\ntry:\n Path('/view/instructions.md').read_bytes()\nexcept OSError as e:\n assert e.errno==errno.EACCES\nelse:\n raise AssertionError('other read allowed')\nprint(json.dumps({'other_read_denied':True}))"
+            workload('other-permissions','permissions-private',script,{},user='1001:1001')
+            script = "import json,subprocess; r=subprocess.run(['/view/run.sh'],capture_output=True,text=True,timeout=5); assert r.returncode==0 and r.stdout=='synthetic\\n', (r.returncode,r.stdout,r.stderr); print(json.dumps({'other_execute_0755':True,'output':r.stdout}))"
+            workload('execute-other','normal-ro',script,{},user='1001:1001',readonly=True)
+            script = "import errno,json,subprocess;\ntry:\n subprocess.run(['/view/run.sh'],capture_output=True,timeout=5)\nexcept OSError as e:\n assert e.errno==errno.EACCES\nelse:\n raise AssertionError('0640 execution allowed')\nprint(json.dumps({'group_execute_0640_denied':True}))"
+            workload('execute-denied','permissions-private',script,{},user='1001:0')
+            # Source files are snapshot inputs: touching them must not change a pinned mount.
+            cmd(['docker','exec',daemon,'python3','-c',"from pathlib import Path; Path('/private/fixture-normal/instructions.md').write_bytes(b'incoming source-file edit')"], 'source-file-edit')
+            workload('pinned-source-edit','normal-ro',"import json; from pathlib import Path; assert Path('/view/instructions.md').read_bytes()==b'# Synthetic workspace\\nUse relative paths.\\n'; print(json.dumps({'source_file_edit_is_not_generation_publication':True,'pinned_mount_unchanged':True}))",{},readonly=True)
+            different = control['sources']['permissions']['manifest']['digest']
+            assert different != manifest['digest']
+            generation_container = token + '-generation'
+            report['owned_containers'].append(generation_container)
+            generation = cmd(['docker','run','--rm','--name',generation_container,'--network','none','--read-only','--cap-drop','ALL','--cap-add','DAC_OVERRIDE','--security-opt','no-new-privileges','-v',vm_path + '/normal-ro:/old:ro,rslave','-v',vm_path + '/permissions-private:/fresh:ro,rslave',image,'python3','-c',"import json,os,stat; f=os.open('/old/instructions.md',os.O_RDONLY); before=os.pread(f,200,0); fresh=open('/fresh/instructions.md','rb').read(); assert before==fresh; assert stat.S_IMODE(os.stat('/old/instructions.md').st_mode)==0o644; assert stat.S_IMODE(os.stat('/fresh/instructions.md').st_mode)==0o640; assert os.pread(f,200,0)==before; os.close(f); print(json.dumps({'old_open_handle_and_mount_remain_pinned':True,'fresh_manifest_mode_visible_in_new_mount':True,'in_place_invalidation':'unsupported: no generation publication API'}))"],'generation-pinning')
+            report['cases']['generation-pinning'] = json.loads(generation.stdout)
+            report['generation_digests'] = {'old':manifest['digest'],'fresh':different}
+            report['qualification'] = 'pinned FS0 byte views; namespace mutation/live generation publication unsupported'
+            report['passed'] = True
     except Exception as error:
         report['error'] = repr(error)
     finally:
@@ -153,5 +174,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--output',required=True)
     parser.add_argument('--image',default=IMAGE)
+    parser.add_argument('--focused-permissions',action='store_true')
     args = parser.parse_args()
-    raise SystemExit(run(args.output,args.image))
+    raise SystemExit(run(args.output,args.image,args.focused_permissions))

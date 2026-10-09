@@ -4,10 +4,11 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src ./src
 COPY tests/*.rs ./tests/
+COPY tests/fs0/permission_source.py ./tests/fs0/
 RUN --mount=type=cache,id=fs0-task3-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs0-task3-target,target=/src/target rustc --version --verbose && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo build --locked && mkdir -p /out && cp target/debug/magus-fs-probe /out/
 
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 RUN apt-get update && apt-get install -y --no-install-recommends fuse3 python3 util-linux && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/magus-fs-probe /usr/local/bin/magus-fs-probe
-COPY tests/fs0/ordinary_io.py tests/fs0/linux_io.py tests/fs0/linux_daemon.py tests/fs0/root_confinement.py /opt/fs0/
+COPY tests/fs0/ordinary_io.py tests/fs0/linux_io.py tests/fs0/linux_daemon.py tests/fs0/root_confinement.py tests/fs0/permission_source.py tests/fs0/permission_io.py /opt/fs0/
 ENV PYTHONPATH=/opt/fs0

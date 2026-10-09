@@ -94,6 +94,15 @@ impl FuseAdapter {
             Err(libc::EACCES)
         }
     }
+    /// Check directory enumeration separately from search/child traversal.
+    pub fn directory_as(&self, ino: u64, uid: u32, gid: u32) -> IoResult<&Entry> {
+        let entry = self.entry(ino)?;
+        if !entry.directory {
+            return Err(libc::ENOTDIR);
+        }
+        self.authorize(entry, uid, gid, 4)?;
+        Ok(entry)
+    }
     pub fn read_as(
         &self,
         ino: u64,
@@ -130,9 +139,6 @@ impl FuseAdapter {
             return Err(libc::EISDIR);
         }
         self.authorize(e, uid, gid, 2)?;
-        if e.mode & 0o222 == 0 {
-            return Err(libc::EACCES);
-        }
         let end = offset.checked_add(data.len() as u64).ok_or(libc::EFBIG)?;
         if end > 67108864 {
             return Err(libc::EFBIG);
@@ -140,7 +146,7 @@ impl FuseAdapter {
         let mut state = self.state.lock().map_err(|_| libc::EIO)?;
         let size = state
             .probe
-            .write(&e.path, offset, data)
+            .write_authorized(&e.path, offset, data)
             .map_err(|_| libc::EIO)?;
         if size != 0 {
             state.sizes[ino as usize - 1] = state.sizes[ino as usize - 1].max(end);
@@ -325,15 +331,8 @@ impl Filesystem for FuseAdapter {
         reply.error(Errno::EOPNOTSUPP);
     }
     fn opendir(&self, req: &Request, ino: INodeNo, _: OpenFlags, reply: ReplyOpen) {
-        let checked = (|| {
-            let e = self.entry(ino.0)?;
-            if !e.directory {
-                return Err(libc::ENOTDIR);
-            }
-            self.authorize(e, req.uid(), req.gid(), 5)
-        })();
-        match checked {
-            Ok(()) => reply.opened(FileHandle(ino.0), FopenFlags::empty()),
+        match self.directory_as(ino.0, req.uid(), req.gid()) {
+            Ok(_) => reply.opened(FileHandle(ino.0), FopenFlags::empty()),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
@@ -345,14 +344,7 @@ impl Filesystem for FuseAdapter {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let checked = (|| {
-            let e = self.entry(ino.0)?;
-            if !e.directory {
-                return Err(libc::ENOTDIR);
-            }
-            self.authorize(e, req.uid(), req.gid(), 5)?;
-            Ok(e)
-        })();
+        let checked = self.directory_as(ino.0, req.uid(), req.gid());
         let e = match checked {
             Ok(e) => e,
             Err(e) => {

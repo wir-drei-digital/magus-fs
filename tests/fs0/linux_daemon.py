@@ -43,31 +43,58 @@ def get(url, endpoint):
         return json.load(response)
 
 
-def main():
+def focused_setup(report):
+    source = start(['source','--root',str(ROOT / 'fixture-review')], 'source-review')
+    base = ready(source)
+    for label, option, value in [('directory400','--directory-mode','400'),('directory100','--directory-mode','100'),('file444','--file-mode','444'),('file000','--file-mode','000')]:
+        with (ROOT / (label + '-proxy.stderr')).open('w') as error:
+            proxy = subprocess.Popen(['python3','/opt/fs0/permission_source.py','--source',base,option,value],stdout=subprocess.PIPE,stderr=error,text=True)
+        processes.append(proxy)
+        url = ready(proxy)
+        manifest = get(url, '/manifest')
+        report['sources'][label] = {'url':url,'pid':proxy.pid,'manifest':manifest}
+        for view in (['private','ro'] if option == '--file-mode' else ['ro']):
+            name = label + '-' + view
+            path = SHARED / name
+            mounts.append(path)
+            adapter = start(['mount','--backend','fuse','--source',url,'--mountpoint',str(path),'--mode',view,'--expect-digest',manifest['digest']], name)
+            info = json.loads(ready(adapter))
+            deadline = time.monotonic() + 10
+            while not mounted(path):
+                if adapter.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError('real mount failed: ' + name)
+                time.sleep(0.1)
+            report['mounts'][name] = info
+
+
+def main(focused=False):
     ROOT.mkdir(exist_ok=True)
     report = {'sources': {}, 'mounts': {}, 'pids': [], 'cleanup': []}
     try:
-        for label, mode, mask in [('normal', None, 0o022), ('permissions', '640', 0o077), ('locked', '000', 0o022)]:
-            args = ['source','--root',str(ROOT / ('fixture-' + label))]
-            if mode:
-                args += ['--mode', mode]
-            source = start(args, 'source-' + label, mask)
-            url = ready(source)
-            manifest = get(url, '/manifest')
-            report['sources'][label] = {'url': url, 'pid': source.pid, 'manifest': manifest}
-            (ROOT / (label + '-manifest.json')).write_text(json.dumps(manifest))
-            for view in (['ro','private'] if label == 'normal' else ['ro'] if label == 'locked' else ['private']):
-                name = label + '-' + view
-                path = SHARED / name
-                mounts.append(path)
-                adapter = start(['mount','--backend','fuse','--source',url,'--mountpoint',str(path),'--mode',view,'--expect-digest',manifest['digest']], name)
-                info = json.loads(ready(adapter))
-                deadline = time.monotonic() + 10
-                while not mounted(path):
-                    if adapter.poll() is not None or time.monotonic() >= deadline:
-                        raise RuntimeError('real mount failed: ' + name)
-                    time.sleep(0.1)
-                report['mounts'][name] = info
+        if focused:
+            focused_setup(report)
+        else:
+            for label, mode, mask in [('normal', None, 0o022), ('permissions', '640', 0o077), ('locked', '000', 0o022)]:
+                args = ['source','--root',str(ROOT / ('fixture-' + label))]
+                if mode:
+                    args += ['--mode', mode]
+                source = start(args, 'source-' + label, mask)
+                url = ready(source)
+                manifest = get(url, '/manifest')
+                report['sources'][label] = {'url': url, 'pid': source.pid, 'manifest': manifest}
+                (ROOT / (label + '-manifest.json')).write_text(json.dumps(manifest))
+                for view in (['ro','private'] if label == 'normal' else ['ro'] if label == 'locked' else ['private']):
+                    name = label + '-' + view
+                    path = SHARED / name
+                    mounts.append(path)
+                    adapter = start(['mount','--backend','fuse','--source',url,'--mountpoint',str(path),'--mode',view,'--expect-digest',manifest['digest']], name)
+                    info = json.loads(ready(adapter))
+                    deadline = time.monotonic() + 10
+                    while not mounted(path):
+                        if adapter.poll() is not None or time.monotonic() >= deadline:
+                            raise RuntimeError('real mount failed: ' + name)
+                        time.sleep(0.1)
+                    report['mounts'][name] = info
         report['pids'] = [p.pid for p in processes]
         report['mountinfo'] = Path('/proc/self/mountinfo').read_text()
         report['environment'] = {'uname': list(os.uname()), 'capabilities': [line for line in Path('/proc/self/status').read_text().splitlines() if line.startswith(('Cap', 'NoNewPrivs','Seccomp'))], 'packages': subprocess.check_output(['dpkg-query','-W','fuse3','libfuse3-3','python3','util-linux'],text=True)}
@@ -113,4 +140,5 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    import sys
+    main('--focused-permissions' in sys.argv)

@@ -130,6 +130,26 @@ impl Probe {
         if e.mode & 0o222 == 0 {
             return Err("permission denied".into());
         }
+        self.write_authorized(path, offset, bytes)
+    }
+    /// Store bytes after the owning adapter has authorized its actual caller.
+    /// This crate-private path does not reapply a caller-free mode-bit shortcut.
+    /// The read-only view capability, file type and size bounds remain enforced.
+    pub(crate) fn write_authorized(
+        &mut self,
+        path: &str,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<usize> {
+        if !self.writable {
+            return Err("read-only view".into());
+        }
+        let e = self
+            .manifest
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .ok_or("not found")?;
         if e.directory {
             return Err("is directory".into());
         }
