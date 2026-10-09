@@ -593,8 +593,12 @@ impl NFSFileSystem for NfsAdapter {
         Err(nfsstat3::NFS3ERR_INVAL)
     }
     async fn fsinfo(&self, id: fileid3) -> std::result::Result<fsinfo3, nfsstat3> {
+        let obj_attributes = match self.getattr(id).await {
+            Ok(attr) => post_op_attr::attributes(attr),
+            Err(_) => post_op_attr::Void,
+        };
         Ok(fsinfo3 {
-            obj_attributes: post_op_attr::attributes(self.attr(id)?),
+            obj_attributes,
             rtmax: 1048576,
             rtpref: 65536,
             rtmult: 4096,

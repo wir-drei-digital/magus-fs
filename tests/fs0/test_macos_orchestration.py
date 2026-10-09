@@ -3,6 +3,10 @@ import contextlib
 import io
 import copy
 import json
+import os
+import signal
+import sys
+import time
 from pathlib import Path
 import subprocess
 import tempfile
@@ -86,6 +90,76 @@ class MacCoordinator(unittest.TestCase):
         self.assertTrue(profile['supervision']['recovery_action'])
         self.assertTrue(profile['remaining_owned_resources'])
         self.assertEqual(len(result['platforms']['macos']['profiles']),1)
+
+    def test_late_real_parent_signals_fail_cleanup_and_serialized_publication(self):
+        # Catches reconciling only before final cleanup or only before json.dumps.
+        # Native reports are synthetic; handlers, cleanup, encoder and writes run.
+        original_cleanup = run.OwnedOutput.cleanup
+        original_dumps = json.dumps
+        original_aggregate = run.aggregate
+        def runner(output, prepare, chunk, uid, gid, **kwargs):
+            output.mkdir()
+            (output/'result.json').write_text(original_dumps(native_fixture(output, chunk)))
+            return 0
+        for stage in ('cleanup', 'serialization'):
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(stage=stage, signal=signum):
+                    delivered = []
+                    previous = signal.getsignal(signum)
+                    def cleanup(owned, *args, **kwargs):
+                        errors = original_cleanup(owned, *args, **kwargs)
+                        if stage == 'cleanup' and not delivered:
+                            delivered.append(True)
+                            os.kill(os.getpid(), signum)
+                        return errors
+                    def aggregate(*args):
+                        result = original_aggregate(*args)
+                        # Force real indent=2 encoding long enough for the owned sender.
+                        if stage == 'serialization':
+                            result['serialization_probe'] = [{'value': i} for i in range(800000)]
+                        return result
+                    def dumps(value, *args, **kwargs):
+                        if stage != 'serialization' or 'exit_code' not in value or delivered:
+                            return original_dumps(value, *args, **kwargs)
+                        # A separate owned process can deliver while 3.14's C
+                        # encoder holds the GIL. Handshake excludes startup timing.
+                        sender_code = (
+                            'import os,sys,time; print("ready",flush=True); '
+                            'sys.stdin.readline(); time.sleep(.005); '
+                            'sent=time.time(); os.kill(int(sys.argv[1]),int(sys.argv[2])); '
+                            'print(sent,flush=True)')
+                        process = subprocess.Popen(
+                            [sys.executable, '-c', sender_code, str(os.getpid()), str(int(signum))],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+                        try:
+                            self.assertEqual(process.stdout.readline().strip(), 'ready')
+                            started = time.time()
+                            process.stdin.write('encode\n')
+                            process.stdin.flush()
+                            encoded = original_dumps(value, *args, **kwargs)
+                            finished = time.time()
+                            out, err = process.communicate(timeout=5)
+                            self.assertEqual((process.returncode, err), (0, ''))
+                            delivered.append(started < float(out.strip()) < finished)
+                            return encoded
+                        finally:
+                            if process.poll() is None:
+                                process.terminate()
+                                process.communicate(timeout=5)
+                    with patch.object(run.OwnedOutput, 'cleanup', cleanup), \
+                         patch.object(run, 'aggregate', side_effect=aggregate), \
+                         patch.object(run.json, 'dumps', side_effect=dumps):
+                        code, result = self.execute(runner)
+                    self.assertEqual(delivered, [True], 'signal must arrive inside the named stage')
+                    self.assertEqual(code, 1)
+                    self.assertEqual(result['exit_code'], 1)
+                    self.assertEqual(result['state'], 'failed')
+                    self.assertIs(result['passed'], False)
+                    self.assertEqual(result['parent_interrupts'], 1)
+                    self.assertEqual(result['failures'].count(
+                        'parent interrupted; inspect retained owned profile resources'), 1)
+                    self.assertEqual(signal.getsignal(signum), previous)
 
     def test_missing_mac_launcher_is_blocked(self):
         def runner(*args):raise FileNotFoundError('synthetic missing prerequisite')

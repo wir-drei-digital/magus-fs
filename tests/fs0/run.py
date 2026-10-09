@@ -249,15 +249,23 @@ def matrix_main(argv,interrupts):
                 platform['state'] = 'passed'
     required = ('linux','macos') if args.platform == 'all' else (args.platform,)
     result.update(aggregate(result['platforms'],required))
-    if interrupts.count:
-        result.update(state='failed',passed=False,exit_code=1,parent_interrupts=interrupts.count)
-        result.setdefault('failures',[]).append('parent interrupted; inspect retained owned profile resources')
     result['cleanup_errors'] = owned.cleanup(remove_output=False)
     if result['cleanup_errors']:
         result.update(state='failed',passed=False,exit_code=1)
-    save()
     print(path,flush=True)
-    return result['exit_code']
+    # Handlers only record a scalar. Reconcile outside serialization, then retry
+    # publication if a signal arrived while encoding or writing the result.
+    while True:
+        observed_interrupts = interrupts.count
+        if observed_interrupts:
+            result.update(state='failed',passed=False,exit_code=1,parent_interrupts=observed_interrupts)
+            failure = 'parent interrupted; inspect retained owned profile resources'
+            failures = result.setdefault('failures',[])
+            if failure not in failures:
+                failures.append(failure)
+        save()
+        if interrupts.count == observed_interrupts:
+            return result['exit_code']
 
 
 if __name__ == '__main__':

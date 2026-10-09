@@ -343,6 +343,57 @@ class NfsWireTests(unittest.TestCase):
             self.assertEqual(rpc.call(100003, 4, opaque(nested) + words(63))[-4:], words(1 if mode == 0o400 else 2))
             self.assertEqual(rpc.call(100003, 3, opaque(nested) + opaque(b'table.csv'))[:4], words(lookup))
 
+    def test_fsinfo_omits_denied_descendant_attributes_on_wire(self):
+        # Catches FSINFO bypassing GETATTR ancestor authorization, or corrupt XDR
+        # when optional attrs are absent. This endpoint creates no kernel mount.
+        from permission_source import project_manifest
+        with urllib.request.urlopen(self.url + '/manifest') as response:
+            manifest = project_manifest(json.load(response), directory_mode=0o400,
+                                        uid=os.geteuid(), gid=os.getegid())
+        body = json.dumps(manifest, separators=(',', ':')).encode()
+        class Gateway(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+            def do_GET(self):
+                if self.path != '/manifest':
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        gateway = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Gateway)
+        worker = threading.Thread(target=gateway.serve_forever)
+        worker.start()
+        def stop_gateway():
+            gateway.shutdown()
+            gateway.server_close()
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+        self.addCleanup(stop_gateway)
+        rpc, _ = self.endpoint('http://127.0.0.1:' + str(gateway.server_port))
+        root = rpc.mount()
+        nested = rpc.lookup(root, b'nested')
+        child_id = next(i for i, entry in enumerate(manifest['entries'])
+                        if entry['path'] == 'nested/table.csv') + 2
+        forged = nested[:-8] + struct.pack('>Q', child_id)
+        self.assertEqual(rpc.call(100003, 1, opaque(forged)), words(13))
+        allowed = rpc.lookup(root, b'instructions.md')
+        # Full FSINFO payload: seven u32 transfer limits, u64 maxfilesize,
+        # two u32 time_delta fields, and u32 properties. No trailing/missing XDR.
+        info = struct.pack('>7IQ3I', 1048576, 65536, 4096, 1048576,
+                           65536, 4096, 65536, 67108864, 1, 0, 0)
+        for handle, attrs_present in ((root, True), (allowed, True), (forged, False)):
+            with self.subTest(attrs_present=attrs_present, handle=handle.hex()):
+                response = rpc.call(100003, 19, opaque(handle))
+                if attrs_present:
+                    attrs = rpc.call(100003, 1, opaque(handle))
+                    self.assertEqual(attrs[:4], words(0))
+                    self.assertEqual(len(attrs), 88)
+                    self.assertEqual(response, words(0, 1) + attrs[4:] + info)
+                else:
+                    self.assertEqual(response, words(0, 0) + info)
+
     def test_fixed_principal_read_denial(self):
         # Raw RPC cannot bypass the fixed actor's mode check, including root credentials.
         source = self.start("source", "--root", str(self.root / "denied"), "--mode", "000")
