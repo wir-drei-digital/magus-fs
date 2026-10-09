@@ -4,8 +4,15 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChunkSource {
     Unavailable,
-    Local { path: PathBuf },
-    Http { base_url: String },
+    Remote {
+        source: crate::protocol::RemoteSourceId,
+    },
+    Local {
+        path: PathBuf,
+    },
+    Http {
+        base_url: String,
+    },
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct PruneReport {
@@ -59,7 +66,9 @@ impl ChunkSource {
             return Err(FsError::LimitExceeded);
         }
         let bytes = match self {
-            Self::Unavailable => return Err(unavailable(id, SourceFailure::Missing)),
+            Self::Unavailable | Self::Remote { .. } => {
+                return Err(unavailable(id, SourceFailure::Missing))
+            }
             Self::Local { path } => {
                 let store = ObjectStore::open_existing(path, ObjectLimits::default()).map_err(
                     |e| match e {

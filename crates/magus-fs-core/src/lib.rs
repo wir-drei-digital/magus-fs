@@ -25,3 +25,9 @@ pub use archive::*;
 pub mod protocol;
 mod transition;
 pub use transition::*;
+
+mod sync_state;
+pub use sync_state::*;
+
+mod remote_source;
+pub use remote_source::RemoteFetcher;

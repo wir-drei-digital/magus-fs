@@ -71,6 +71,7 @@ pub(crate) struct Core {
     pub(crate) config: ReplicaConfig,
     pub(crate) working: Option<Working>,
     handles: Vec<Weak<HandleData>>,
+    pub(crate) remote_fetcher: Option<Arc<dyn RemoteFetcher>>,
 }
 #[derive(Clone)]
 pub struct Replica {
@@ -103,6 +104,9 @@ impl Handle {
     }
 }
 pub(crate) fn lock(core: &Arc<Mutex<Core>>) -> Result<MutexGuard<'_, Core>, FsError> {
+    if crate::remote_source::fetching() {
+        return Err(FsError::ReplicaBusy);
+    }
     let guard = core.lock().map_err(|_| FsError::ReplicaBusy)?;
     guard.journal.guard()?;
     Ok(guard)
@@ -201,7 +205,7 @@ impl Core {
         Ok(inventory)
     }
     fn protected(&self) -> Result<BTreeSet<ObjectId>, FsError> {
-        let mut protected = BTreeSet::new();
+        let mut protected = self.sync_roots()?;
         if let Some(w) = &self.working {
             if w.dirty {
                 protected.extend(cache::object_set(&w.tree));
@@ -255,7 +259,10 @@ impl Core {
         }
         Ok(referenced)
     }
-    fn recovery_closure(&self, selected: &RevisionId) -> Result<BTreeMap<ObjectId, u64>, FsError> {
+    pub(crate) fn recovery_closure(
+        &self,
+        selected: &RevisionId,
+    ) -> Result<BTreeMap<ObjectId, u64>, FsError> {
         let mut pending = vec![selected.clone()];
         let mut seen = BTreeSet::new();
         let mut objects = BTreeMap::new();
@@ -401,7 +408,12 @@ impl Core {
                             return Err(cache::unavailable(id, SourceFailure::Missing));
                         }
                     }
-                    source.fetch(id, size, Instant::now() + Duration::from_millis(4500))?;
+                    self.fetch_source(
+                        &source,
+                        id,
+                        size,
+                        Instant::now() + Duration::from_millis(4500),
+                    )?;
                 }
             }
             for id in &report.evictable {
@@ -431,6 +443,23 @@ impl Core {
         }
         Ok(())
     }
+    fn fetch_source(
+        &self,
+        source: &ChunkSource,
+        id: &ObjectId,
+        size: u64,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, FsError> {
+        if let ChunkSource::Remote { source } = source {
+            let fetcher = self
+                .remote_fetcher
+                .as_ref()
+                .ok_or_else(|| cache::unavailable(id, SourceFailure::Missing))?;
+            crate::remote_source::fetch(fetcher.as_ref(), source, id, size, deadline)
+        } else {
+            source.fetch(id, size, deadline)
+        }
+    }
     pub(crate) fn fetch(
         &mut self,
         id: &ObjectId,
@@ -454,7 +483,7 @@ impl Core {
             return Err(FsError::CorruptObject);
         }
         self.reserve(&BTreeMap::from([(id.clone(), size)]))?;
-        let bytes = source.fetch(id, size, deadline)?;
+        let bytes = self.fetch_source(&source, id, size, deadline)?;
         self.objects.install(&bytes)?;
         self.journal.db.execute(
             "INSERT OR REPLACE INTO cache VALUES(?,?)",
@@ -543,6 +572,7 @@ impl Replica {
             config,
             working,
             handles: vec![],
+            remote_fetcher: None,
         };
         // Unlinked open handles die with their process; immutable bodies are retained until explicit pruning.
         if let Some(w) = &mut core.working {

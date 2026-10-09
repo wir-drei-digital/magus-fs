@@ -14,9 +14,21 @@ struct Configuration {
     creation_umask: u16,
 }
 pub(crate) type Result<T> = std::result::Result<T, (i32, FsError)>;
-fn args(argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
+fn args(mut argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
+    if argv.first().map(String::as_str) == Some("sync") {
+        if argv.len() < 2 {
+            return Err((2, FsError::InvalidPath));
+        }
+        let sub = argv.remove(1);
+        argv[0] = format!("sync-{sub}");
+    }
     let command = argv.first().cloned().ok_or((2, FsError::InvalidPath))?;
     let allowed = match command.as_str() {
+        "sync-attach" => vec!["state", "profile", "branch", "publication"],
+        "sync-run" => vec!["state", "revision", "operation-id", "enqueue-only", "serve"],
+        "sync-status" => vec!["state", "revision"],
+        "sync-drain" => vec!["state", "revision", "level", "deadline-ms"],
+        "sync-integrate" => vec!["state", "revision", "expected-head"],
         "mount" => vec![
             "state",
             "revision",
@@ -90,6 +102,13 @@ fn bounded_file(path: &Path) -> std::result::Result<Vec<u8>, FsError> {
         return Err(FsError::LimitExceeded);
     }
     Ok(bytes)
+}
+pub(crate) fn outcome_exit(value: &Value) -> i32 {
+    if value["ok"] == false {
+        1
+    } else {
+        0
+    }
 }
 pub fn run(argv: Vec<String>) -> Result<Value> {
     let (command, options) = args(argv)?;
@@ -207,7 +226,9 @@ pub fn run(argv: Vec<String>) -> Result<Value> {
         None
     };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if matches!(command.as_str(), "checkpoint" | "history" | "status") {
+    if matches!(command.as_str(), "checkpoint" | "history" | "status")
+        || command.starts_with("sync-")
+    {
         if let Some(response) =
             crate::adapters::control::request(state, &command, &options).map_err(|e| (1, e))?
         {
@@ -229,6 +250,12 @@ pub fn run(argv: Vec<String>) -> Result<Value> {
             e,
         )
     })?;
+    if matches!(
+        command.as_str(),
+        "mount" | "materialize" | "export" | "restore" | "prune"
+    ) {
+        crate::sync::install_source(&rep).map_err(|e| (1, e))?;
+    }
     let actor = rep
         .actor_for_uid(unsafe { libc::geteuid() })
         .map_err(|e| (2, e))?;
@@ -364,6 +391,7 @@ pub fn run(argv: Vec<String>) -> Result<Value> {
             Ok(json!({"ok":true,"unmounted":mountpoint}))
         }
         "checkpoint" | "status" | "history" => control(&rep, actor, &command, &options),
+        c if c.starts_with("sync-") => control(&rep, actor, &command, &options),
         _ => Err((2, FsError::InvalidPath)),
     }
 }
@@ -374,6 +402,9 @@ pub(crate) fn control(
     command: &str,
     options: &BTreeMap<String, String>,
 ) -> Result<Value> {
+    if command.starts_with("sync-") {
+        return sync_control(rep, command, options);
+    }
     let checkpoint = if command == "checkpoint" {
         Some((
             operation(options)?,
@@ -425,5 +456,247 @@ pub(crate) fn control(
             )
         }
         _ => Err((2, FsError::InvalidPath)),
+    }
+}
+
+fn sync_control(rep: &Replica, command: &str, options: &BTreeMap<String, String>) -> Result<Value> {
+    use magus_fs_core::protocol::*;
+    use std::time::{Duration, Instant};
+    let revision = || RevisionId::parse(required(options, "revision")?).map_err(|e| (2, e));
+    if command == "sync-attach" {
+        let mode = match options.get("publication").map(String::as_str) {
+            None | Some("isolated") => PublicationMode::Isolated,
+            Some("shared-live") => PublicationMode::SharedLive,
+            _ => return Err((2, FsError::InvalidDescriptor)),
+        };
+        return crate::sync::attach(
+            rep,
+            absolute(required(options, "profile")?)?,
+            BranchName::parse(required(options, "branch")?.into()).map_err(|e| (2, e))?,
+            mode,
+        )
+        .map_err(|e| (1, e));
+    }
+    if command == "sync-status" {
+        let status = rep.sync_status().map_err(|e| (1, e))?;
+        return if options.contains_key("revision") {
+            let target = revision()?;
+            let p = status
+                .submissions
+                .into_iter()
+                .find(|p| p.local_revision == target)
+                .ok_or((2, FsError::NotFound))?;
+            Ok(json!({"ok":true,"progress":p}))
+        } else {
+            Ok(json!({"ok":true,"status":status}))
+        };
+    }
+    let controller = crate::sync::SyncController::new(rep).map_err(|e| (1, e))?;
+    let p = match command {
+        "sync-run" => {
+            if options.get("serve").map(String::as_str) == Some("true") {
+                if options.contains_key("revision")
+                    || options.contains_key("operation-id")
+                    || options.contains_key("enqueue-only")
+                {
+                    return Err((2, FsError::InvalidPath));
+                }
+                let _server = crate::adapters::control::Server::start(
+                    rep.clone(),
+                    absolute(required(options, "state")?)?,
+                    false,
+                )
+                .map_err(|e| (1, e))?;
+                loop {
+                    let _ = controller.tick();
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+            if options.contains_key("revision") {
+                let target = revision()?;
+                let operation = operation(options)?;
+                let status = rep.sync_status().map_err(|e| (1, e))?;
+                if let Some(old) = status.submissions.iter().find(|p| p.operation == operation) {
+                    if old.local_revision != target {
+                        return Err((1, FsError::OperationMismatch));
+                    }
+                } else {
+                    let binding = status.binding.ok_or((1, FsError::ConfigMismatch))?;
+                    rep.enqueue_submission(PendingSubmission {
+                        operation,
+                        local_revision: target,
+                        original_view: binding.view.view,
+                        original_head: binding.view.head,
+                        expected_local_generation: rep.status().map_err(|e| (1, e))?.generation,
+                    })
+                    .map_err(|e| (1, e))?;
+                }
+                if options.get("enqueue-only").map(String::as_str) == Some("true") {
+                    return Ok(json!({"ok":true,"status":rep.sync_status().map_err(|e|(1,e))?}));
+                }
+            } else if options.contains_key("operation-id") || options.contains_key("enqueue-only") {
+                return Err((2, FsError::InvalidPath));
+            }
+            controller.tick().map_err(|e| (1, e))?
+        }
+        "sync-drain" => {
+            let level = match required(options, "level")? {
+                "local" => DurabilityLevel::Local,
+                "private-remote" => DurabilityLevel::PrivateRemote,
+                "shared" => DurabilityLevel::Shared,
+                "applied" => DurabilityLevel::Applied,
+                _ => return Err((2, FsError::InvalidDescriptor)),
+            };
+            let millis = options
+                .get("deadline-ms")
+                .map(|s| {
+                    s.parse::<u64>()
+                        .map_err(|_| (2, FsError::InvalidDescriptor))
+                })
+                .transpose()?
+                .unwrap_or(60000);
+            if millis > 60000 {
+                return Err((2, FsError::LimitExceeded));
+            }
+            let progress = controller
+                .drain(
+                    &revision()?,
+                    level,
+                    Instant::now() + Duration::from_millis(millis),
+                )
+                .map_err(|e| (1, e))?;
+            if !progress.reached(level) {
+                let error = if matches!(
+                    progress.state,
+                    SubmissionState::Denied | SubmissionState::Failed
+                ) {
+                    progress.error.as_deref().unwrap_or("durability_unmet")
+                } else if level == DurabilityLevel::Shared
+                    && progress.private_receipt.is_some()
+                    && progress.integration.is_none()
+                    && rep
+                        .sync_status()
+                        .map_err(|e| (1, e))?
+                        .binding
+                        .is_some_and(|b| b.publication == PublicationMode::Isolated)
+                {
+                    "integration_required"
+                } else {
+                    "deadline"
+                };
+                return Ok(
+                    json!({"ok":false,"error":error,"requested_level":level,"progress":progress,"counters":controller.counters()}),
+                );
+            }
+            progress
+        }
+        "sync-integrate" => controller
+            .integrate(
+                &revision()?,
+                HeadToken::parse(required(options, "expected-head")?).map_err(|e| (2, e))?,
+            )
+            .map_err(|e| (1, e))?,
+        _ => return Err((2, FsError::InvalidPath)),
+    };
+    Ok(json!({"ok":true,"progress":p,"counters":controller.counters()}))
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use magus_fs_core::protocol::*;
+    #[test]
+    fn retained_status_does_not_require_transport_files() {
+        let root = PathBuf::from(if cfg!(target_os = "macos") {
+            "/private/tmp"
+        } else {
+            "/tmp"
+        })
+        .join(format!(
+            "fs2-cli-status-{}",
+            RemoteSourceId::random().unwrap().as_str()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let state = root.join("state");
+        let principal = PrincipalId::random().unwrap();
+        let group = GroupId::random().unwrap();
+        let replica = ReplicaId::random().unwrap();
+        let rep = Replica::open(
+            &state,
+            ReplicaConfig {
+                replica: replica.clone(),
+                authorities: vec![Authority {
+                    principal: principal.clone(),
+                    uid: unsafe { libc::geteuid() },
+                    primary_group: group.clone(),
+                    gid: unsafe { libc::getegid() },
+                    groups: vec![group.clone()],
+                    dac_override: false,
+                    ownership_transfer: false,
+                }],
+                content_roots: vec![],
+                cache_bytes: 1024 * 1024,
+                history_administrators: vec![],
+                retained_history_grants: vec![],
+            },
+        )
+        .unwrap();
+        let r = Revision {
+            format: FORMAT.into(),
+            hash: HASH.into(),
+            layout: LAYOUT.into(),
+            parents: vec![],
+            operation: OperationId::random().unwrap(),
+            replica,
+            principal: principal.clone(),
+            captured_at_ns: 0,
+            coverage: vec!["".into()],
+            provenance: "explicit".into(),
+            restoration: None,
+            tree: Tree {
+                root: Root {
+                    id: EntryId::random().unwrap(),
+                    owner: principal,
+                    group,
+                    mode: 0o755,
+                },
+                entries: vec![],
+            },
+        };
+        let revision = revision_id(&r).unwrap();
+        rep.import_revision(
+            ImportDescriptor {
+                expected: revision.clone(),
+                bytes: encode_revision(&r).unwrap(),
+            },
+            ChunkSource::Unavailable,
+        )
+        .unwrap();
+        rep.configure_sync(SyncBinding {
+            id: NamespaceId::random().unwrap(),
+            branch: BranchName::parse("main".into()).unwrap(),
+            publication: PublicationMode::Isolated,
+            source: RemoteSourceId::random().unwrap(),
+            view: ViewBinding {
+                view: ViewId::random().unwrap(),
+                head: HeadToken::random().unwrap(),
+                revision,
+            },
+            transport_profile: root.join("missing-profile"),
+            transport_identity: TransportIdentity::for_bytes(b"fixture").unwrap(),
+        })
+        .unwrap();
+        drop(rep);
+        let result = run(vec![
+            "sync".into(),
+            "status".into(),
+            "--state".into(),
+            state.to_str().unwrap().into(),
+        ]);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            result.is_ok(),
+            "local retained status must remain accessible: {result:?}"
+        );
     }
 }

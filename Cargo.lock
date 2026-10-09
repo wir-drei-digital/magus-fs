@@ -1103,6 +1103,8 @@ dependencies = [
  "libc",
  "magus-fs-core",
  "nfsserve",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

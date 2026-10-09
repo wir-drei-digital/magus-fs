@@ -127,6 +127,9 @@ pub(crate) fn request(
         return Err(FsError::PermissionDenied);
     }
     timeouts(&stream)?;
+    if command.starts_with("sync-") {
+        stream.set_read_timeout(Some(Duration::from_secs(65)))?;
+    }
     let bytes = serde_json::to_vec(&Request {
         command: command.into(),
         options: options.clone(),
@@ -194,11 +197,30 @@ impl Server {
                                 .map_err(|_| (2, FsError::InvalidDescriptor))?;
                             if !matches!(
                                 request.command.as_str(),
-                                "checkpoint" | "history" | "status"
+                                "checkpoint"
+                                    | "history"
+                                    | "status"
+                                    | "sync-attach"
+                                    | "sync-run"
+                                    | "sync-status"
+                                    | "sync-drain"
+                                    | "sync-integrate"
                             ) {
                                 return Err((2, FsError::InvalidPath));
                             }
-                            if read_only && request.command == "checkpoint" {
+                            if request.options.contains_key("serve") {
+                                return Err((2, FsError::InvalidPath));
+                            }
+                            if read_only
+                                && (request.command == "checkpoint"
+                                    || matches!(
+                                        request.command.as_str(),
+                                        "sync-attach"
+                                            | "sync-run"
+                                            | "sync-integrate"
+                                            | "sync-drain"
+                                    ))
+                            {
                                 return Err((1, FsError::ReadOnly));
                             }
                             let actor = rep
@@ -207,7 +229,10 @@ impl Server {
                             crate::cli::control(&rep, actor, &request.command, &request.options)
                         })();
                         let response = match result {
-                            Ok(value) => Response { exit: 0, value },
+                            Ok(value) => Response {
+                                exit: crate::cli::outcome_exit(&value),
+                                value,
+                            },
                             Err((exit, error)) => Response {
                                 exit,
                                 value: json!({"ok":false,"error":error.code(),"details":format!("{error:?}")}),

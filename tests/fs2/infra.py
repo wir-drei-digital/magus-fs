@@ -201,7 +201,9 @@ class OwnedInfra:
             raise RuntimeError('independent S3 probe failed; see s3-probes.json')
         return p
 
-    def wait_s3(self, label):
+    def wait_s3(self, label, require_volumes=False):
+        if require_volumes and not getattr(self, 'expected_volumes', []):
+            raise ValueError('persisted volume IDs required before acknowledged-content restart')
         attempts=[];start=time.monotonic()
         while time.monotonic()-start<30:
             p=self.s3_request('HEAD','/fs2',check=False)

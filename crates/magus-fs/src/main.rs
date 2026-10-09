@@ -1,8 +1,15 @@
 mod adapters;
 mod cli;
+mod sync;
 fn main() {
     match cli::run(std::env::args().skip(1).collect()) {
-        Ok(value) => println!("{}", value),
+        Ok(value) => {
+            let exit = cli::outcome_exit(&value);
+            println!("{}", value);
+            if exit != 0 {
+                std::process::exit(exit);
+            }
+        }
         Err((exit, error)) => {
             eprintln!("magus-fs: {}", error);
             println!(

@@ -49,5 +49,12 @@ class InfrastructureTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 infra.validate_owned(row,{'Id':'replacement-id','Labels':{'magus.fs2.owner':infra.owner}})
 
+    def test_restart_readiness_requires_recorded_volume_ids_when_content_exists(self):
+        with tempfile.TemporaryDirectory() as p:
+            infra=OwnedInfra(Path(p).resolve()/'run')
+            with self.assertRaisesRegex(ValueError,'volume'):
+                infra.wait_s3('acknowledged-content', require_volumes=True)
+            self.assertEqual(infra.commands, [])
+
 if __name__ == '__main__':
     unittest.main()
