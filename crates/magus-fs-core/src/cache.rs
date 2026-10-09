@@ -7,10 +7,17 @@ pub enum ChunkSource {
     Local { path: PathBuf },
     Http { base_url: String },
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PruneReport {
     pub evictable: Vec<ObjectId>,
     pub reclaimable_bytes: u64,
+    pub reachable_bytes: u64,
+    pub candidate_bytes: u64,
+    pub pinned_bytes: u64,
+    pub protected_bytes: u64,
+    pub token: String,
+    pub reclaimed: Vec<ObjectId>,
+    pub reclaimed_bytes: u64,
 }
 use std::{
     collections::{BTreeMap, BTreeSet},

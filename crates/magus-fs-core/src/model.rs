@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{fmt, io};
 
 pub const FORMAT: &str = "magus-fs/v1";
+pub const RESTORE_FORMAT: &str = "magus-fs/v2";
 pub const HASH: &str = "sha256";
 pub const LAYOUT: &str = "fixed262144";
 pub const MAX_CHUNK: u64 = 1_048_576;
@@ -52,6 +53,8 @@ pub enum FsError {
     MappingBlocked,
     DirtyWorkingState,
     TargetCollision,
+    PruneTokenRequired,
+    StalePruneToken,
 }
 impl fmt::Display for FsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -96,6 +99,8 @@ impl FsError {
             Self::MappingBlocked => "mapping_blocked",
             Self::DirtyWorkingState => "dirty_working_state",
             Self::TargetCollision => "target_collision",
+            Self::PruneTokenRequired => "prune_token_required",
+            Self::StalePruneToken => "stale_prune_token",
         }
     }
 }
@@ -189,6 +194,12 @@ pub struct Revision {
     #[serde(deserialize_with = "bounded_vec")]
     pub coverage: Vec<String>,
     pub provenance: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_restoration"
+    )]
+    pub restoration: Option<RestoreProvenance>,
     pub tree: Tree,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,4 +357,42 @@ impl std::error::Error for SourceFailure {
             _ => None,
         }
     }
+}
+
+fn present_restoration<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<RestoreProvenance>, D::Error> {
+    RestoreProvenance::deserialize(d).map(Some)
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreProvenance {
+    pub source_revision: RevisionId,
+    pub restore_metadata: bool,
+    #[serde(deserialize_with = "bounded_recreated")]
+    pub recreated: std::collections::BTreeMap<EntryId, EntryId>,
+}
+fn bounded_recreated<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<std::collections::BTreeMap<EntryId, EntryId>, D::Error> {
+    struct Mapping;
+    impl<'de> serde::de::Visitor<'de> for Mapping {
+        type Value = std::collections::BTreeMap<EntryId, EntryId>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a bounded unique EntryId mapping")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut result = std::collections::BTreeMap::new();
+            while let Some((source, destination)) = map.next_entry()? {
+                if result.len() >= MAX_ENTRIES || result.insert(source, destination).is_some() {
+                    return Err(serde::de::Error::custom("invalid restoration mapping"));
+                }
+            }
+            Ok(result)
+        }
+    }
+    d.deserialize_map(Mapping)
 }

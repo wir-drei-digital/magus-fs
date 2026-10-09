@@ -1,0 +1,15 @@
+FROM rust:1.92.0-bookworm@sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866295e5a90a34a307a2
+RUN rustup component add --toolchain 1.92.0 rustfmt clippy
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY vendor ./vendor
+COPY src ./src
+COPY benches ./benches
+COPY crates ./crates
+COPY tests ./tests
+RUN useradd --uid 1001 --create-home fs1test
+RUN --mount=type=cache,id=fs0-task3-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs1-task7-target,target=/src/target \
+    rustc --version --verbose && cargo fmt --all --check && cargo clippy --locked --workspace --all-targets --all-features -- -D warnings && cargo test --locked --workspace --all-features && \
+    cargo build --locked -p magus-fs && mkdir -p /out && cp target/debug/magus-fs /out/magus-fs && \
+    cargo build --locked -p magus-fs --features test-faults && cp target/debug/magus-fs /out/magus-fs-faults && \
+    runuser -u fs1test -- env MAGUS_FS_BIN=/out/magus-fs-faults MAGUS_TEST_FEATURES=test-faults python3 -m unittest discover -s tests/fs1 -p test_archive_cli.py

@@ -26,6 +26,19 @@ fn args(argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
             "prepare-only",
             "nfs-port",
         ],
+        "prune" => vec!["state", "dry-run", "token"],
+        "export" => vec!["state", "revision", "destination"],
+        "verify" => vec!["archive"],
+        "restore" => vec![
+            "archive",
+            "destination",
+            "config",
+            "state",
+            "revision",
+            "operation-id",
+            "restore-metadata",
+        ],
+        "history-grants" => vec!["state", "config"],
         "init" => vec!["state", "config", "revision-manifest", "source"],
         "capture" => vec!["state", "root", "operation-id"],
         "materialize" => vec!["state", "destination", "revision"],
@@ -40,7 +53,11 @@ fn args(argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
         if !allowed.contains(&key) {
             return Err((2, FsError::InvalidPath));
         }
-        let value = iter.next().ok_or((2, FsError::InvalidPath))?;
+        let value = if key == "dry-run" {
+            "true".into()
+        } else {
+            iter.next().ok_or((2, FsError::InvalidPath))?
+        };
         if value.starts_with("--") || options.insert(key.to_string(), value).is_some() {
             return Err((2, FsError::InvalidPath));
         }
@@ -76,6 +93,30 @@ fn bounded_file(path: &Path) -> std::result::Result<Vec<u8>, FsError> {
 }
 pub fn run(argv: Vec<String>) -> Result<Value> {
     let (command, options) = args(argv)?;
+    if command == "verify" {
+        return verify_archive(absolute(required(&options, "archive")?)?)
+            .map(|v| json!({"ok":true,"verification":v}))
+            .map_err(|e| (1, e));
+    }
+    if command == "restore" && options.contains_key("archive") {
+        if options
+            .keys()
+            .any(|k| !["archive", "destination", "config"].contains(&k.as_str()))
+        {
+            return Err((2, FsError::InvalidPath));
+        }
+        let policy: ArchiveRestorePolicy = serde_json::from_slice(
+            &bounded_file(absolute(required(&options, "config")?)?).map_err(|e| (2, e))?,
+        )
+        .map_err(|_| (2, FsError::InvalidDescriptor))?;
+        return restore_archive(
+            absolute(required(&options, "archive")?)?,
+            absolute(required(&options, "destination")?)?,
+            policy,
+        )
+        .map(|v| json!({"ok":true,"result":v}))
+        .map_err(|e| (1, e));
+    }
     let state = absolute(required(&options, "state")?)?;
     if command == "init" {
         let config_path = Path::new(required(&options, "config")?);
@@ -192,6 +233,55 @@ pub fn run(argv: Vec<String>) -> Result<Value> {
         .actor_for_uid(unsafe { libc::geteuid() })
         .map_err(|e| (2, e))?;
     match command.as_str() {
+        "prune" => {
+            let result = match (options.get("dry-run"), options.get("token")) {
+                (Some(_), None) => rep.prune(true),
+                (None, Some(token)) => rep.apply_prune(token),
+                _ => return Err((2, FsError::PruneTokenRequired)),
+            }
+            .map_err(|e| (1, e))?;
+            Ok(json!({"ok":true,"report":result}))
+        }
+        "restore" => {
+            if options.keys().any(|k| {
+                !["state", "revision", "operation-id", "restore-metadata"].contains(&k.as_str())
+            }) {
+                return Err((2, FsError::InvalidPath));
+            }
+            let revision =
+                RevisionId::parse(required(&options, "revision")?).map_err(|e| (2, e))?;
+            let metadata = match options.get("restore-metadata").map(String::as_str) {
+                None | Some("false") => false,
+                Some("true") => true,
+                _ => return Err((2, FsError::InvalidPath)),
+            };
+            let restored = rep
+                .restore_revision(&revision, &operation(&options)?, metadata, actor)
+                .map_err(|e| (1, e))?;
+            Ok(
+                json!({"ok":true,"source_revision":revision,"revision":restored,"head_changed":true,"materialized":false,"provenance":rep.restore_provenance(&restored).map_err(|e|(1,e))?}),
+            )
+        }
+        "export" => {
+            let revision =
+                RevisionId::parse(required(&options, "revision")?).map_err(|e| (2, e))?;
+            rep.export(
+                &revision,
+                absolute(required(&options, "destination")?)?,
+                actor,
+            )
+            .map(|v| json!({"ok":true,"manifest":v}))
+            .map_err(|e| (1, e))
+        }
+        "history-grants" => {
+            let grants: Vec<RetainedHistoryGrant> = serde_json::from_slice(
+                &bounded_file(absolute(required(&options, "config")?)?).map_err(|e| (2, e))?,
+            )
+            .map_err(|_| (2, FsError::InvalidDescriptor))?;
+            rep.set_retained_history_grants(grants, actor)
+                .map_err(|e| (1, e))?;
+            Ok(json!({"ok":true}))
+        }
         "capture" => {
             let (root, operation) = capture.unwrap();
             let config = rep

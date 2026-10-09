@@ -13,6 +13,7 @@ fn revision() -> Revision {
         captured_at_ns: 0,
         coverage: vec!["".into()],
         provenance: "explicit".into(),
+        restoration: None,
         tree: Tree {
             root: Root {
                 id: EntryId::parse("entry:00000000000000000000000000000004").unwrap(),
@@ -388,4 +389,40 @@ fn directory_content_rejects_a_file_version_even_when_null() {
         "\"kind\":\"directory\",\"version\":null",
     );
     assert!(decode_revision(changed.as_bytes()).is_err());
+}
+
+const CANONICAL_V2: &str = r#"{"format":"magus-fs/v2","hash":"sha256","layout":"fixed262144","parents":["sha256:7b1e3c8da76467f53da36b5642e06f2993b832ca873555b7df7d8fb64314c27b"],"operation":"operation:00000000000000000000000000000001","replica":"replica:00000000000000000000000000000002","principal":"principal:00000000000000000000000000000003","captured_at_ns":0,"coverage":[""],"provenance":"explicit","restoration":{"source_revision":"sha256:7b1e3c8da76467f53da36b5642e06f2993b832ca873555b7df7d8fb64314c27b","restore_metadata":false,"recreated":{}},"tree":{"root":{"id":"entry:00000000000000000000000000000004","owner":"principal:00000000000000000000000000000003","group":"group:00000000000000000000000000000005","mode":493},"entries":[]}}"#;
+#[test]
+fn v2_restoration_literal_and_independent_hash_preserve_v1() {
+    let revision = decode_revision(CANONICAL_V2.as_bytes()).unwrap();
+    assert_eq!(encode_revision(&revision).unwrap(), CANONICAL_V2.as_bytes());
+    assert_eq!(
+        revision_id(&revision).unwrap().as_str(),
+        "sha256:f1b96309415b5606f32a9d3a1c7daf71eacfc6530a502d47d9310ddf25492291"
+    );
+    assert_eq!(
+        encode_revision(&decode_revision(CANONICAL.as_bytes()).unwrap()).unwrap(),
+        CANONICAL.as_bytes()
+    );
+    assert!(matches!(
+        decode_revision(
+            CANONICAL_V2
+                .replace("magus-fs/v2", "magus-fs/v3")
+                .as_bytes()
+        ),
+        Err(FsError::UnsupportedFormat)
+    ));
+    assert!(decode_revision(
+        CANONICAL_V2
+            .replace("magus-fs/v2", "magus-fs/v1")
+            .as_bytes()
+    )
+    .is_err());
+    assert!(decode_revision(
+        CANONICAL
+            .replace("\"tree\":", "\"restoration\":null,\"tree\":")
+            .as_bytes()
+    )
+    .is_err());
+    assert!(decode_revision(CANONICAL_V2.replace("\"parents\":[\"sha256:7b1e3c8da76467f53da36b5642e06f2993b832ca873555b7df7d8fb64314c27b\"]","\"parents\":[]").as_bytes()).is_err());
 }

@@ -961,6 +961,7 @@ impl Replica {
                     .map_err(|_| FsError::LimitExceeded)?,
                 coverage: policy.coverage(&tree),
                 provenance: "native_scan_delete_create".into(),
+                restoration: None,
                 tree,
             };
             let descriptor = encode_revision(&revision)?;

@@ -104,10 +104,14 @@ fn cache_verification_pinning_eviction_and_quota_keep_acknowledged_data() {
     assert!(rep.prune(true).unwrap().evictable.is_empty());
     drop(h);
     rep.pin(&base, true).unwrap();
-    assert!(rep.prune(false).unwrap().evictable.is_empty());
+    assert!(rep
+        .apply_prune(&rep.prune(true).unwrap().token)
+        .unwrap()
+        .evictable
+        .is_empty());
     rep.pin(&base, false).unwrap();
     assert_eq!(rep.prune(true).unwrap().evictable.len(), 1);
-    rep.prune(false).unwrap();
+    rep.apply_prune(&rep.prune(true).unwrap().token).unwrap();
     assert_eq!(rep.status().unwrap().resident_bytes, 0);
     let h = w.open("a", OpenMode::ReadWrite).unwrap();
     let block = vec![1; 262144];
@@ -436,7 +440,7 @@ fn explicit_prune_recovers_small_quota_after_repeated_uncheckpointed_overwrites(
         assert_eq!(dry.reclaimable_bytes, 3);
         assert_eq!(dry.evictable.len(), 1);
         assert_eq!(rep.status().unwrap().resident_bytes, 6);
-        rep.prune(false).unwrap();
+        rep.apply_prune(&rep.prune(true).unwrap().token).unwrap();
         assert_eq!(rep.status().unwrap().resident_bytes, 3);
         let h = w.open("a", OpenMode::Read).unwrap();
         assert_eq!(w.read(&h, 0, 3).unwrap(), bytes);
@@ -461,7 +465,7 @@ fn unreachable_garbage_pruning_retains_committed_local_history() {
     drop(h);
     let report = rep.prune(true).unwrap();
     assert_eq!(report.evictable, vec![ObjectId::for_bytes(b"mid").unwrap()]);
-    rep.prune(false).unwrap();
+    rep.apply_prune(&rep.prune(true).unwrap().token).unwrap();
     assert_eq!(rep.status().unwrap().resident_bytes, 6);
     drop(w);
     drop(rep);
@@ -485,7 +489,12 @@ fn unreachable_unlinked_local_bytes_wait_for_last_handle_close() {
     assert!(rep.prune(true).unwrap().evictable.is_empty());
     assert_eq!(w.read(&h, 0, 3).unwrap(), b"abc");
     drop(h);
-    assert_eq!(rep.prune(false).unwrap().reclaimable_bytes, 3);
+    assert_eq!(
+        rep.apply_prune(&rep.prune(true).unwrap().token)
+            .unwrap()
+            .reclaimable_bytes,
+        3
+    );
     assert_eq!(rep.status().unwrap().resident_bytes, 0);
 }
 #[test]

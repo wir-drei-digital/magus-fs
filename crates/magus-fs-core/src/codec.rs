@@ -6,8 +6,29 @@ use std::{
 };
 
 fn validate_revision(r: &Revision) -> Result<(), FsError> {
-    if r.format != FORMAT || r.hash != HASH || r.layout != LAYOUT {
+    if ![FORMAT, RESTORE_FORMAT].contains(&r.format.as_str())
+        || r.hash != HASH
+        || r.layout != LAYOUT
+    {
         return Err(FsError::UnsupportedFormat);
+    }
+    if (r.format == RESTORE_FORMAT) != r.restoration.is_some() {
+        return Err(FsError::InvalidDescriptor);
+    }
+    if let Some(p) = &r.restoration {
+        if !r.parents.contains(&p.source_revision) || p.recreated.len() > MAX_ENTRIES {
+            return Err(FsError::InvalidDescriptor);
+        }
+        let mut destinations = HashSet::new();
+        let output_ids = r.tree.entries.iter().map(|e| &e.id).collect::<HashSet<_>>();
+        for (source, destination) in &p.recreated {
+            if source == destination
+                || !destinations.insert(destination)
+                || !output_ids.contains(destination)
+            {
+                return Err(FsError::InvalidDescriptor);
+            }
+        }
     }
     validate_tree(&r.tree)?;
     if r.parents.len() > MAX_ENTRIES || r.coverage.len() > MAX_ENTRIES {
@@ -50,6 +71,8 @@ struct CanonicalRevision<'a> {
     captured_at_ns: u64,
     coverage: Vec<&'a str>,
     provenance: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restoration: &'a Option<RestoreProvenance>,
     tree: CanonicalTree<'a>,
 }
 struct BoundedOutput(Vec<u8>);
@@ -82,6 +105,7 @@ pub fn encode_revision(r: &Revision) -> Result<Vec<u8>, FsError> {
         captured_at_ns: r.captured_at_ns,
         coverage,
         provenance: &r.provenance,
+        restoration: &r.restoration,
         tree: CanonicalTree {
             root: &r.tree.root,
             entries,
@@ -136,7 +160,10 @@ pub fn decode_revision(bytes: &[u8]) -> Result<Revision, FsError> {
     }
     let header: Header<'_> =
         serde_json::from_slice(bytes).map_err(|_| FsError::InvalidDescriptor)?;
-    if header.format != Some(FORMAT) || header.hash != Some(HASH) || header.layout != Some(LAYOUT) {
+    if !matches!(header.format, Some(FORMAT | RESTORE_FORMAT))
+        || header.hash != Some(HASH)
+        || header.layout != Some(LAYOUT)
+    {
         return Err(FsError::UnsupportedFormat);
     }
     let mut r: Revision = serde_json::from_slice(bytes).map_err(|_| FsError::InvalidDescriptor)?;
@@ -147,4 +174,74 @@ pub fn decode_revision(bytes: &[u8]) -> Result<Revision, FsError> {
 }
 pub fn revision_id(revision: &Revision) -> Result<RevisionId, FsError> {
     RevisionId::digest(&encode_revision(revision)?)
+}
+
+/// Contextual v2 validation. The decoder validates shape; import/archive validate real parents.
+pub fn validate_restoration_parents(
+    restored: &Revision,
+    source: &Revision,
+    replaced: &Revision,
+) -> Result<(), FsError> {
+    let provenance = restored
+        .restoration
+        .as_ref()
+        .ok_or(FsError::InvalidDescriptor)?;
+    if restored.format != RESTORE_FORMAT
+        || revision_id(source)? != provenance.source_revision
+        || restored.parents.first() != Some(&revision_id(replaced)?)
+        || !restored.parents.contains(&provenance.source_revision)
+        || source.tree.root.id != replaced.tree.root.id
+        || restored.tree.root.id != replaced.tree.root.id
+    {
+        return Err(FsError::InvalidDescriptor);
+    }
+    let source_ids = source
+        .tree
+        .entries
+        .iter()
+        .map(|e| (&e.id, e))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let replaced_ids = replaced
+        .tree
+        .entries
+        .iter()
+        .map(|e| (&e.id, e))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let output_ids = restored
+        .tree
+        .entries
+        .iter()
+        .map(|e| (&e.id, e))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let recreated = source_ids
+        .keys()
+        .filter(|id| !replaced_ids.contains_key(*id))
+        .copied()
+        .collect::<HashSet<_>>();
+    if recreated != provenance.recreated.keys().collect::<HashSet<_>>() {
+        return Err(FsError::InvalidDescriptor);
+    }
+    let all_source_ids = source_ids.keys().copied().collect::<HashSet<_>>();
+    for (id, entry) in source_ids {
+        let target = provenance.recreated.get(id).unwrap_or(id);
+        if target != id
+            && (replaced_ids.contains_key(target)
+                || all_source_ids.contains(target)
+                || target == &source.tree.root.id)
+        {
+            return Err(FsError::InvalidDescriptor);
+        }
+        let output = output_ids.get(target).ok_or(FsError::InvalidDescriptor)?;
+        let expected_parent = provenance
+            .recreated
+            .get(&entry.parent)
+            .unwrap_or(&entry.parent);
+        if output.path != entry.path
+            || output.content != entry.content
+            || &output.parent != expected_parent
+        {
+            return Err(FsError::InvalidDescriptor);
+        }
+    }
+    Ok(())
 }

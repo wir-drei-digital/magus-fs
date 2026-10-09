@@ -19,3 +19,6 @@ mod faults;
 mod materialize;
 pub use capture::*;
 pub use materialize::*;
+
+mod archive;
+pub use archive::*;

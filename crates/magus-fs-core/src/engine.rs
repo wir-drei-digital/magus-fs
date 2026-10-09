@@ -7,6 +7,10 @@ pub struct ReplicaConfig {
     pub authorities: Vec<Authority>,
     pub content_roots: Vec<PathBuf>,
     pub cache_bytes: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history_administrators: Vec<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_history_grants: Vec<RetainedHistoryGrant>,
 }
 #[derive(Clone, Debug)]
 pub struct ImportDescriptor {
@@ -225,11 +229,7 @@ impl Core {
         let pins = statement
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
-        for id in pins {
-            protected.extend(cache::object_set(
-                &self.revision(&RevisionId::parse(id)?)?.tree,
-            ));
-        }
+        protected.extend(self.pinned_closure(&pins)?);
         let mut statement = self
             .journal
             .db
@@ -255,29 +255,132 @@ impl Core {
         }
         Ok(referenced)
     }
+    fn pinned_closure(&self, pins: &[String]) -> Result<BTreeSet<ObjectId>, FsError> {
+        let mut pending = pins
+            .iter()
+            .map(|s| RevisionId::parse(s.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut seen = BTreeSet::new();
+        let mut objects = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if seen.insert(id.clone()) {
+                let r = self.revision(&id)?;
+                pending.extend(r.parents);
+                objects.extend(cache::object_set(&r.tree));
+            }
+        }
+        Ok(objects)
+    }
     fn prune(&mut self, dry_run: bool) -> Result<PruneReport, FsError> {
         let protected = self.protected()?;
         let referenced = self.referenced(&protected)?;
         let inventory = self.inventory()?;
+        let pins = self
+            .journal
+            .db
+            .prepare("SELECT revision FROM pins ORDER BY revision")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let pinned = self.pinned_closure(&pins)?;
+        let revisions = self
+            .journal
+            .db
+            .prepare("SELECT id FROM revisions ORDER BY id")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let sources = self
+            .journal
+            .db
+            .prepare("SELECT object,size,source FROM sources ORDER BY object")?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, u32>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let operation_roots=self.journal.db.prepare("SELECT operation,state FROM operations WHERE state IN ('pending','failed') ORDER BY operation")?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?;
+        let handle_roots = self
+            .handles
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|h| (h.entry.id.clone(), h.generation))
+            .collect::<Vec<_>>();
+        let token = RevisionId::digest(&json(&(
+            self.working.as_ref().map(|w| w.generation),
+            &inventory,
+            &protected,
+            &referenced,
+            &revisions,
+            &pins,
+            &sources,
+            &operation_roots,
+            &handle_roots,
+        ))?)?
+        .as_str()
+        .to_owned();
         let mut report = PruneReport {
             evictable: vec![],
             reclaimable_bytes: 0,
+            reachable_bytes: 0,
+            candidate_bytes: 0,
+            pinned_bytes: 0,
+            protected_bytes: 0,
+            token,
+            reclaimed: vec![],
+            reclaimed_bytes: 0,
         };
-        for (id, size) in inventory {
-            let unreachable = !referenced.contains(&id);
-            let clean_refetchable = !protected.contains(&id)
-                && self
-                    .source(&id)?
-                    .is_some_and(|(_, source)| source.refetchable());
-            if unreachable || clean_refetchable {
-                report.reclaimable_bytes += size;
-                report.evictable.push(id);
+        for (id, size) in &inventory {
+            if referenced.contains(id) {
+                report.reachable_bytes += size;
+            }
+            if pinned.contains(id) {
+                report.pinned_bytes += size;
+            }
+            if protected.contains(id) {
+                report.protected_bytes += size;
+            }
+            if !referenced.contains(id)
+                || (!protected.contains(id)
+                    && self
+                        .source(id)?
+                        .is_some_and(|(_, source)| source.refetchable()))
+            {
+                report.candidate_bytes += size;
+                report.evictable.push(id.clone());
             }
         }
+        report.reclaimable_bytes = report.candidate_bytes;
         if !dry_run {
+            // Verify *every* still-referenced source before removing any candidate. A registered
+            // but expired base is not a replacement copy. Keep all candidates on failure.
+            for id in &report.evictable {
+                if referenced.contains(id) {
+                    let (size, source) = self
+                        .source(id)?
+                        .ok_or_else(|| cache::unavailable(id, SourceFailure::Missing))?;
+                    if let ChunkSource::Local { path } = &source {
+                        use std::os::unix::fs::MetadataExt;
+                        let native = crate::capture::directory(path)
+                            .map_err(|e| match e {
+                                FsError::Io(e) => cache::unavailable(id, SourceFailure::Io(e)),
+                                other => other,
+                            })?
+                            .metadata()?;
+                        let own = self.objects.directory().metadata()?;
+                        if native.dev() == own.dev() && native.ino() == own.ino() {
+                            return Err(cache::unavailable(id, SourceFailure::Missing));
+                        }
+                    }
+                    source.fetch(id, size, Instant::now() + Duration::from_millis(4500))?;
+                }
+            }
             for id in &report.evictable {
                 self.objects.evict(id)?;
+                report.reclaimed.push(id.clone());
             }
+            report.reclaimed_bytes = report.candidate_bytes;
             self.inventory()?;
         }
         Ok(report)
@@ -366,6 +469,15 @@ impl Replica {
                 }
             }
         }
+        let admins = config
+            .history_administrators
+            .iter()
+            .collect::<BTreeSet<_>>();
+        if admins.len() != config.history_administrators.len()
+            || admins.iter().any(|p| !principals.contains(*p))
+        {
+            return Err(FsError::ConfigMismatch);
+        }
         if principals.is_empty() {
             return Err(FsError::ConfigMismatch);
         }
@@ -432,6 +544,13 @@ impl Replica {
         }
         source.validate()?;
         let mut core = lock(&self.core)?;
+        if let Some(provenance) = &r.restoration {
+            validate_restoration_parents(
+                &r,
+                &core.revision(&provenance.source_revision)?,
+                &core.revision(r.parents.first().ok_or(FsError::InvalidDescriptor)?)?,
+            )?;
+        }
         for (object, size) in cache::closure(&r.tree) {
             match core.objects.read_verified(&object) {
                 Ok(bytes) => {
@@ -606,7 +725,18 @@ impl Replica {
         Ok(())
     }
     pub fn prune(&self, dry_run: bool) -> Result<PruneReport, FsError> {
-        lock(&self.core)?.prune(dry_run)
+        if !dry_run {
+            return Err(FsError::PruneTokenRequired);
+        }
+        lock(&self.core)?.prune(true)
+    }
+    pub fn apply_prune(&self, token: &str) -> Result<PruneReport, FsError> {
+        let mut core = lock(&self.core)?;
+        let report = core.prune(true)?;
+        if report.token != token {
+            return Err(FsError::StalePruneToken);
+        }
+        core.prune(false)
     }
     /// Guarded immutable local authority configuration for native adapter mapping.
     pub fn configuration(&self) -> Result<ReplicaConfig, FsError> {
@@ -1231,6 +1361,7 @@ impl Workspace {
             captured_at_ns: attribution.captured_at_ns,
             coverage: attribution.coverage,
             provenance: attribution.provenance,
+            restoration: None,
             tree,
         };
         let descriptor = encode_revision(&revision)?;
@@ -1367,4 +1498,263 @@ fn normalize(extents: Vec<Extent>) -> Result<Vec<Extent>, FsError> {
         return Err(FsError::Backpressure);
     }
     Ok(result)
+}
+
+fn restored_metadata(
+    config: &ReplicaConfig,
+    a: &Authority,
+    current: &Entry,
+    source: &Entry,
+) -> Result<Entry, FsError> {
+    let mut result = current.clone();
+    if current.mode != source.mode {
+        if current.owner != a.principal {
+            return Err(FsError::PermissionDenied);
+        }
+        result.mode = source.mode;
+    }
+    if current.owner != source.owner || current.group != source.group {
+        perm::ownership_change(config, a, &source.owner, &source.group)?;
+        result.owner = source.owner.clone();
+        result.group = source.group.clone();
+    }
+    Ok(result)
+}
+impl Replica {
+    /// Restore source entries as an overlay; omitted current entries are never deletion authority.
+    pub fn restore_revision(
+        &self,
+        source: &RevisionId,
+        operation: &OperationId,
+        restore_metadata: bool,
+        actor: Actor,
+    ) -> Result<RevisionId, FsError> {
+        let mut core = lock(&self.core)?;
+        let a = perm::authority(&core.config, &actor)?.clone();
+        let source_revision = core.revision(source)?;
+        crate::archive::history_access(&core, source, &source_revision, &actor)?;
+        let digest = RevisionId::digest(&json(&("restore", source, restore_metadata, &actor))?)?;
+        let existing = core
+            .journal
+            .db
+            .query_row(
+                "SELECT digest,result,candidate FROM operations WHERE operation=?",
+                [operation.as_str()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((prior, result, _)) = &existing {
+            if prior != digest.as_str() {
+                return Err(FsError::OperationMismatch);
+            }
+            if let Some(result) = result {
+                return RevisionId::parse(result.clone());
+            }
+        }
+        let working = core.working()?.clone();
+        if working.dirty {
+            return Err(FsError::DirtyWorkingState);
+        }
+        if source_revision.tree.root.id != working.tree.root.id {
+            return Err(FsError::BaseMismatch);
+        }
+        let mut next = working.clone();
+        let mut mapping = BTreeMap::from([(
+            source_revision.tree.root.id.clone(),
+            next.tree.root.id.clone(),
+        )]);
+        let mut recreated = BTreeMap::new();
+        let mut metadata = BTreeMap::new();
+        let mut source_entries = source_revision.tree.entries.iter().collect::<Vec<_>>();
+        source_entries.sort_by(|a, b| a.path.cmp(&b.path));
+        for old in source_entries {
+            let current = next.tree.entries.iter().find(|e| e.id == old.id).cloned();
+            let mut entry = if let Some(current) = current {
+                if (current.content == EntryContent::Directory)
+                    != (old.content == EntryContent::Directory)
+                {
+                    return Err(FsError::TargetCollision);
+                }
+                perm::traversal(&next.tree, &current.path, &a)?;
+                if old.content != EntryContent::Directory {
+                    perm::access(&a, &current, 2)?;
+                }
+                if current.path != old.path {
+                    perm::parent_write(&next.tree, &current.path, &a)?;
+                    perm::parent_write(&next.tree, &old.path, &a)?;
+                }
+                current
+            } else {
+                perm::parent_write(&next.tree, &old.path, &a)?;
+                let id = EntryId::random()?;
+                recreated.insert(old.id.clone(), id.clone());
+                Entry {
+                    path: old.path.clone(),
+                    id,
+                    parent: mapping
+                        .get(&old.parent)
+                        .ok_or(FsError::InvalidTree)?
+                        .clone(),
+                    owner: a.principal.clone(),
+                    group: a.primary_group.clone(),
+                    mode: (if old.content == EntryContent::Directory {
+                        0o777
+                    } else {
+                        0o666
+                    }) & !working.umask,
+                    content: old.content.clone(),
+                }
+            };
+            if let Some(displaced) = next
+                .tree
+                .entries
+                .iter()
+                .find(|e| e.path == old.path && e.id != entry.id)
+                .cloned()
+            {
+                perm::parent_write(&next.tree, &old.path, &a)?;
+                if source_revision
+                    .tree
+                    .entries
+                    .iter()
+                    .any(|e| e.id == displaced.id)
+                {
+                    return Err(FsError::TargetCollision);
+                }
+                if (displaced.content == EntryContent::Directory)
+                    != (old.content == EntryContent::Directory)
+                    || next
+                        .tree
+                        .entries
+                        .iter()
+                        .any(|e| e.path.starts_with(&format!("{}/", old.path)))
+                {
+                    return Err(FsError::TargetCollision);
+                }
+                next.tree.entries.retain(|e| e.id != displaced.id);
+                next.orphans.push(displaced);
+            }
+            let prior_path = entry.path.clone();
+            if entry.content == EntryContent::Directory && prior_path != old.path {
+                if old.path.starts_with(&format!("{prior_path}/")) {
+                    return Err(FsError::InvalidPath);
+                }
+                for descendant in &mut next.tree.entries {
+                    if let Some(suffix) = descendant.path.strip_prefix(&format!("{prior_path}/")) {
+                        descendant.path = format!("{}/{suffix}", old.path);
+                    }
+                }
+            }
+            if restore_metadata {
+                metadata.insert(
+                    entry.id.clone(),
+                    restored_metadata(&core.config, &a, &entry, old)?,
+                );
+            }
+            entry.path = old.path.clone();
+            entry.parent = mapping
+                .get(&old.parent)
+                .ok_or(FsError::InvalidTree)?
+                .clone();
+            entry.content = old.content.clone();
+            mapping.insert(old.id.clone(), entry.id.clone());
+            next.tree.entries.retain(|e| e.id != entry.id);
+            next.tree.entries.push(entry);
+        }
+        if restore_metadata {
+            let root = restored_metadata(
+                &core.config,
+                &a,
+                &perm::root_entry(&next.tree),
+                &perm::root_entry(&source_revision.tree),
+            )?;
+            next.tree.root.owner = root.owner;
+            next.tree.root.group = root.group;
+            next.tree.root.mode = root.mode;
+            for e in &mut next.tree.entries {
+                if let Some(m) = metadata.get(&e.id) {
+                    e.owner = m.owner.clone();
+                    e.group = m.group.clone();
+                    e.mode = m.mode;
+                }
+            }
+        }
+        next.tree.entries.sort_by(|a, b| a.path.cmp(&b.path));
+        validate_tree(&next.tree)?;
+        let mut parents = vec![working.head.clone()];
+        if source != &working.head {
+            parents.push(source.clone());
+        }
+        let revision = Revision {
+            format: RESTORE_FORMAT.into(),
+            hash: HASH.into(),
+            layout: LAYOUT.into(),
+            parents,
+            operation: operation.clone(),
+            replica: core.config.replica.clone(),
+            principal: actor.principal().clone(),
+            captured_at_ns: 0,
+            coverage: source_revision.coverage.clone(),
+            provenance: "explicit".into(),
+            restoration: Some(RestoreProvenance {
+                source_revision: source.clone(),
+                restore_metadata,
+                recreated,
+            }),
+            tree: next.tree.clone(),
+        };
+        validate_restoration_parents(&revision, &source_revision, &core.revision(&working.head)?)?;
+        let descriptor = encode_revision(&revision)?;
+        let id = revision_id(&revision)?;
+        // A retry after failed hydration may allocate fresh recreated IDs; no failed candidate is deleted.
+        core.journal.db.execute("INSERT INTO operations VALUES(?,?,'pending',NULL,NULL,?) ON CONFLICT(operation) DO UPDATE SET state='pending',error=NULL,candidate=excluded.candidate",params![operation.as_str(),digest.as_str(),&descriptor])?;
+        let result = (|| {
+            for (object, size) in cache::closure(&revision.tree) {
+                core.fetch(&object, size, Instant::now() + Duration::from_millis(4500))?;
+                core.objects.sync_object(&object)?;
+            }
+            next.head = id.clone();
+            next.generation = next
+                .generation
+                .checked_add(1)
+                .ok_or(FsError::LimitExceeded)?;
+            next.dirty = false;
+            let tx = core
+                .journal
+                .db
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute(
+                "INSERT INTO revisions VALUES(?,?)",
+                params![id.as_str(), descriptor],
+            )?;
+            tx.execute(
+                "UPDATE working SET value=? WHERE singleton=1",
+                [json(&next)?],
+            )?;
+            tx.execute(
+                "UPDATE operations SET state='committed',result=?,error=NULL WHERE operation=?",
+                params![id.as_str(), operation.as_str()],
+            )?;
+            crate::faults::hit("db-commit")?;
+            tx.commit()?;
+            core.working = Some(next);
+            Ok(id)
+        })();
+        if let Err(e) = &result {
+            core.failed(operation, e)?;
+        }
+        result
+    }
+    pub fn restore_provenance(
+        &self,
+        revision: &RevisionId,
+    ) -> Result<Option<RestoreProvenance>, FsError> {
+        Ok(lock(&self.core)?.revision(revision)?.restoration)
+    }
 }

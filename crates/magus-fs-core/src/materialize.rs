@@ -37,6 +37,10 @@ pub struct MaterializationRecovery {
     pub staging: PathBuf,
     #[serde(default)]
     pub staging_path_verified: bool,
+    #[serde(default)]
+    pub destination_identity_verified: bool,
+    #[serde(default)]
+    pub content_verified: bool,
     pub device: u64,
     pub inode: u64,
     pub content_device: Option<u64>,
@@ -194,8 +198,6 @@ fn publish(source: &File, parent: &File, destination: &OsStr) -> Result<(), FsEr
             e.into()
         });
     }
-    parent.sync_all()?;
-    source.sync_all()?;
     Ok(())
 }
 fn manifest(stage: &File, record: &MaterializationRecovery) -> Result<(), FsError> {
@@ -243,7 +245,22 @@ impl Replica {
             .prepare("SELECT manifest FROM materializations ORDER BY rowid")?;
         let mut out = vec![];
         for b in statement.query_map([], |r| r.get::<_, Vec<u8>>(0))? {
-            out.push(crate::engine::from_json(&b?)?);
+            let mut record: MaterializationRecovery = crate::engine::from_json(&b?)?;
+            record.destination_identity_verified = false;
+            record.content_verified = false;
+            if let Ok(dir) = directory(&record.destination) {
+                if let Ok(m) = dir.metadata() {
+                    record.destination_identity_verified =
+                        Some((m.dev(), m.ino())) == record.content_device.zip(record.content_inode);
+                    if record.destination_identity_verified {
+                        record.content_verified = core
+                            .revision(&record.revision)
+                            .and_then(|r| verify_output(&core, &r.tree, &dir))
+                            .is_ok();
+                    }
+                }
+            }
+            out.push(record);
         }
         Ok(out)
     }
@@ -330,6 +347,8 @@ impl Replica {
             destination: destination.into(),
             staging: stage_path.clone(),
             staging_path_verified: true,
+            destination_identity_verified: false,
+            content_verified: false,
             device: metadata.dev(),
             inode: metadata.ino(),
             content_device: None,
@@ -501,6 +520,9 @@ impl Replica {
             location.verify(&core, None)?;
             publish(&stage, &parent, leaf)?;
             published = true;
+            crate::faults::hit("materialize-directory-sync")?;
+            parent.sync_all()?;
+            stage.sync_all()?;
             crate::faults::capture_barrier("materialize-published", 1)?;
             location.verify(&core, Some((content.dev(), content.ino())))?;
             Ok(MaterializationResult {
@@ -570,4 +592,87 @@ impl Replica {
         }
         result
     }
+}
+
+// Recovery observation is read-only: saved status/path never grants cleanup authority.
+fn verify_output(core: &crate::engine::Core, tree: &Tree, root: &File) -> Result<(), FsError> {
+    use std::io::Read;
+    let mut dirs = BTreeMap::from([(String::new(), root.try_clone()?)]);
+    let mut entries = tree.entries.iter().collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    for e in entries {
+        let parent = &dirs[perm::parent(&e.path)];
+        let leaf = e.path.rsplit('/').next().ok_or(FsError::InvalidPath)?;
+        let mut file = open_at(
+            parent.as_raw_fd(),
+            &name(OsStr::new(leaf))?,
+            libc::O_RDONLY
+                | libc::O_NONBLOCK
+                | if e.content == EntryContent::Directory {
+                    libc::O_DIRECTORY
+                } else {
+                    0
+                },
+        )?;
+        let m = file.metadata()?;
+        match &e.content {
+            EntryContent::Directory => {
+                dirs.insert(e.path.clone(), file);
+            }
+            EntryContent::File { version } => {
+                if !m.is_file() || m.nlink() != 1 || m.len() != version.size {
+                    return Err(FsError::CorruptObject);
+                }
+                for extent in &version.extents {
+                    match extent {
+                        Extent::Chunk {
+                            object,
+                            object_size,
+                            offset,
+                            length,
+                        } => {
+                            let expected = core.objects.read_verified(object)?;
+                            if expected.len() as u64 != *object_size {
+                                return Err(FsError::CorruptObject);
+                            }
+                            let mut observed = vec![0; *length as usize];
+                            file.read_exact(&mut observed)?;
+                            if observed != expected[*offset as usize..(*offset + *length) as usize]
+                            {
+                                return Err(FsError::CorruptObject);
+                            }
+                        }
+                        Extent::Hole { length } => {
+                            let mut remaining = *length;
+                            let mut buffer = [0; 8192];
+                            while remaining > 0 {
+                                let n = remaining.min(8192) as usize;
+                                file.read_exact(&mut buffer[..n])?;
+                                if buffer[..n].iter().any(|b| *b != 0) {
+                                    return Err(FsError::CorruptObject);
+                                }
+                                remaining -= n as u64;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (path, dir) in dirs {
+        let expected = tree
+            .entries
+            .iter()
+            .filter(|e| perm::parent(&e.path) == path)
+            .map(|e| e.path.rsplit('/').next().unwrap().as_bytes().to_vec())
+            .collect::<std::collections::BTreeSet<_>>();
+        if crate::capture::names(&dir)?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            != expected
+        {
+            return Err(FsError::CorruptObject);
+        }
+    }
+    Ok(())
 }

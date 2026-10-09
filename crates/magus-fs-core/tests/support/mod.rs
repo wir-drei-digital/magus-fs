@@ -51,6 +51,8 @@ pub fn config() -> ReplicaConfig {
                 ownership_transfer: true,
             },
         ],
+        history_administrators: vec![],
+        retained_history_grants: vec![],
         content_roots: vec![],
         cache_bytes: 32 * 1024 * 1024,
     }
@@ -77,6 +79,7 @@ pub fn revision() -> Revision {
         captured_at_ns: 0,
         coverage: vec!["".into()],
         provenance: "explicit".into(),
+        restoration: None,
         tree: Tree {
             root: Root {
                 id: EntryId::random().unwrap(),

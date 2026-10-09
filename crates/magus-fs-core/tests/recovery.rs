@@ -213,7 +213,7 @@ fn failed_save_published_orphan_is_reclaimable_without_losing_acknowledged_bytes
     assert_eq!(rep.status().unwrap().resident_bytes, 6);
     let dry = rep.prune(true).unwrap();
     assert_eq!(dry.evictable, vec![ObjectId::for_bytes(b"new").unwrap()]);
-    rep.prune(false).unwrap();
+    rep.apply_prune(&rep.prune(true).unwrap().token).unwrap();
     let h = w.open("a", OpenMode::ReadWrite).unwrap();
     assert_eq!(w.read(&h, 0, 3).unwrap(), b"old");
     w.write(&h, 0, b"fix").unwrap();
