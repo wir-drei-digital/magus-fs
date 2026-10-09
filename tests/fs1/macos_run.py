@@ -1,6 +1,7 @@
 """Supervised native durable NFS qualification, with only owned synthetic resources."""
 import argparse,errno,fcntl,hashlib,importlib.util,json,os,platform,shutil,socket,signal,stat,subprocess,sys,threading,time
 from pathlib import Path
+from inventory import tree_inventory
 from macos_wire import BIN,ROOT,Fixture,attrs,opaque,words,read,write
 FAULT_BIN=Path(os.environ.get("MAGUS_FS_FAULT_BIN",ROOT/"target/debug/magus-fs-faults"))
 
@@ -14,6 +15,9 @@ def expected(offset,length):
     return b''.join(hashlib.sha256(str(i).encode()).digest() for i in range(first,end))[offset%32:offset%32+length]
 def case(name,root):
     p=root/'binary'
+    if name=='brain-closure':
+        assert subprocess.check_output([str(root/'report.sh')],text=True)=='synthetic report\n'
+        return tree_inventory(root)
     if name=='metadata':
         names=os.listdir(root);assert {'binary','large','empty'}<=set(names)
         for path in [root,p,root/'empty']:
@@ -260,7 +264,7 @@ def run(output,focused=False,fault_focused=False):
             workload('writes');workload('review-parity');workload('unsupported');report['passed']=True;report['state']='passed';raise StopIteration
         workload('metadata');report['metadata_transfer']=dict(fixture.counts);assert fixture.counts['body_bytes']==0
         workload('partial');cold=dict(fixture.counts);assert 0<cold['body_bytes']<=2097152
-        workload('partial');assert fixture.counts==cold;report['cold_warm_transfer']=cold
+        workload('partial');assert fixture.counts==cold;report['cold_warm_transfer']=cold;report['warm_transfer']=dict(fixture.counts)
         # Real native partial write to an entirely uncached base is qualified before the full scan.
         h=rpc.lookup(rpc.mount(),b'uncached');assert write(rpc,h,b'ACK',100)[-12:-8]==words(2);assert fixture.counts==cold
         report['wire_partial_write_uncached']={'bytes':3,'body_bytes_delta':0,'stability':'FILE_SYNC'}
@@ -281,12 +285,18 @@ def run(output,focused=False,fault_focused=False):
         blocked=fixture.cli('mount','faultstate','--revision',fixture.revision,'--mountpoint',output/'fault','--mode','private','--prepare-only','true',code=1);assert blocked['error']=='unsafe_storage';assert sentinel.read_bytes()==b'owned sentinel';sentinel.unlink()
         report['private_control']={'kernel_peer_api':'getpeereid','owner_uid':meta.st_uid,'socket_mode':'0600','forged':forged,'readonly':ro_control,'regular_file_preserved':True,'foreign_kernel_uid':'blocked by existing noninteractive sudo policy; see task6 foreign-peer.json'}
         unmount('ro')
+        report['mounted_owner_busy']={}
+        for name,args in [('export',['--revision',fixture.revision,'--destination',output/'busy-export']),('restore',['--revision',fixture.revision,'--operation-id','operation:'+'8'*32]),('prune',['--dry-run']),('history-grants',['--config',fixture.config])]:
+            result=fixture.cli(name,'lazy',*args,code=1);assert result['error']=='replica_busy';report['mounted_owner_busy'][name]=result['error']
+        assert not (output/'busy-export').exists()
         report['mounted_status']=fixture.cli('status');fixture.offline();report['source_offline']={'listener_closed':True,'thread_joined':True}
         workload('offline');sidecars=workload('sidecars');report['precrash_sidecars']=sidecars;before=fixture.cli('status');report['prekill_status']=before;crash('view')
-        endpoint('restart');workload('recovered','restart');after=fixture.cli('status');assert after==before,(after,before)
+        endpoint('restart');workload('recovered','restart');after=fixture.cli('status');assert after==before,(after,before);report['dirty_recovery']={'before':before,'after':after}
         op='operation:'+'2'*32;generation=str(before['working_generation'])
         captured=fixture.cli('checkpoint','lazy','--operation-id',op,'--expected-generation',generation);report['checkpoint']=captured
-        crash('restart');endpoint('old');workload('recovered','old');assert fixture.cli('checkpoint','lazy','--operation-id',op,'--expected-generation',generation)==captured
+        crash('restart');endpoint('old');workload('recovered','old');replay=fixture.cli('checkpoint','lazy','--operation-id',op,'--expected-generation',generation);assert replay==captured;report['checkpoint_replay']=replay;report['postcheckpoint_status']=fixture.cli('status')
+        report['checkpoint_mismatch']=fixture.cli('checkpoint','lazy','--operation-id',op,'--expected-generation',str(int(generation)+1),code=1);assert report['checkpoint_mismatch']['error']=='operation_mismatch'
+        report['postmismatch_status']=fixture.cli('status');assert report['postmismatch_status']==report['postcheckpoint_status']
         fixture.online();report['source_online_again']=True
         closure=workload('closure','old')
         expected_files={}
@@ -315,6 +325,11 @@ def run(output,focused=False,fault_focused=False):
         assert complete==original,(complete,original)
         report['complete_base_closure_sha256']=hashlib.sha256(json.dumps(complete,sort_keys=True,separators=(',',':')).encode()).hexdigest()
         full_status=fixture.cli('status','fullstate');assert full_status['missing_bytes']==0 and full_status['ready_mode']=='full';report['full_status']=full_status
+        mounted_closure=workload('brain-closure','full')
+        unmount('full');endpoints['full'][0].terminate();endpoints['full'][0].communicate(timeout=5)
+        fixture.cli('materialize','fullstate','--revision',fixture.original_revision,'--destination',output/'independent-full')
+        independent=workload('brain-closure','independent-full');assert independent==mounted_closure
+        report['full_closure']={'verified':True,'daemon_stopped':True,'revision':fixture.original_revision,'mounted':mounted_closure,'full':independent}
         report['passed']=True;report['state']='passed'
     except StopIteration:pass
     except BaseException as e:report['state']='failed';report['error']=repr(e)

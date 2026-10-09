@@ -4,6 +4,8 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'tests/fs0'))
 from test_nfs import Rpc,words,opaque
+sys.path.remove(str(ROOT/'tests/fs0'))
+from inventory import corpus
 BIN=Path(os.environ.get('MAGUS_FS_BIN',ROOT/'target/debug/magus-fs'))
 P='principal:'+'1'*32;G='group:'+'1'*32;P2='principal:'+'2'*32;G2='group:'+'2'*32
 
@@ -41,6 +43,7 @@ class Fixture:
         if large:
             with (self.tree/'large').open('wb') as file:
                 for start in range(0,2097152,8192):file.write(b''.join(hashlib.sha256(str(i).encode()).digest() for i in range(start,start+8192)))
+        corpus(self.tree)
         self.config=self.d/'config.json'
         self.config.write_text(json.dumps({'replica':{'replica':'replica:'+'1'*32,'authorities':[{'principal':P,'uid':os.geteuid(),'primary_group':G,'gid':self.tree.stat().st_gid,'groups':[G],'dac_override':False,'ownership_transfer':True},{'principal':P2,'uid':10001,'primary_group':G2,'gid':10001,'groups':[G,G2],'dac_override':False,'ownership_transfer':False}], 'content_roots':[str(self.tree)]+[str(self.d/x) for x in ['view','ro','restart','fault','old','recovery1','recovery2','recovery3','history','fault-restart','full']],'cache_bytes':134217728},'root':str(self.tree),'policy':{'included_roots':['.'],'excluded_prefixes':[]},'creation_umask':18}))
         self.cli('init','source','--config',self.config)

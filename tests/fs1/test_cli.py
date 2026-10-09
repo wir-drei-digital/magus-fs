@@ -151,6 +151,23 @@ class CLI(unittest.TestCase):
             self.assertIn(text,out["details"])
         self.assertEqual(self.call("status")["captured_revision"],first)
 
+    def test_hostile_descriptor_names_block_before_storage(self):
+        import copy
+        self.init();first=self.capture()
+        original=self.call('history')['revisions'][0]['descriptor']
+        for index,name in enumerate(['../escape','/absolute','bad\\name','bad:name','bad\x00name','case-collision']):
+            descriptor=copy.deepcopy(original)
+            if name=='case-collision':
+                descriptor['tree']['entries'][-1]['path']='BINARY'
+                descriptor['tree']['entries'].sort(key=lambda e:e['path'])
+            else:descriptor['tree']['entries'][0]['path']=name
+            manifest=self.d/('hostile-'+str(index)+'.json');manifest.write_text(json.dumps(descriptor,separators=(',',':')))
+            state=self.d/('hostile-state-'+str(index))
+            result=self.call('init','--config',self.config,'--revision-manifest',manifest,'--source','file://'+str(self.state/'objects'),state=state,code=1)
+            self.assertIn(result['error'],['invalid_path','invalid_tree'])
+            self.assertFalse(state.exists());self.assertFalse((self.d/'escape').exists())
+            self.assertEqual(self.call('status')['captured_revision'],first)
+
     def test_case_collision_refused_even_on_case_sensitive_host(self):
         self.init()
         if os.uname().sysname == "Darwin": return
@@ -224,6 +241,7 @@ class CLI(unittest.TestCase):
         self.assertNotEqual(retried,first)
         (self.root/"run").write_bytes(b"another native generation")
         self.assertEqual(self.call("capture","--root",self.root,"--operation-id",operation(70),code=1)["error"],"operation_mismatch")
+        self.assertEqual(self.call("status")["captured_revision"],retried)
 
     def test_checkpoint_and_private_owner_boundary(self):
         self.init();first=self.capture()

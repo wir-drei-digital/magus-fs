@@ -385,14 +385,7 @@ impl NFSFileSystem for Adapter {
                 && (!matches!(a.atime, set_atime::DONT_CHANGE)
                     || !matches!(a.mtime, set_mtime::DONT_CHANGE))
             {
-                // Server-now alone requires current write authority or ownership, never bits0.
-                if s.ws.check_access_identity(&e.id, 2).is_err() {
-                    if let Some(h) = &h {
-                        s.ws.chmod_handle(h, e.mode)?
-                    } else {
-                        s.ws.chmod(&e.path, e.mode)?
-                    }
-                }
+                s.ws.check_server_time(&e.id, h.as_ref())?;
             }
             if groups != 0 {
                 s.changed(id, matches!(a.size, set_size3::size(_)));

@@ -67,6 +67,16 @@ class MacWire(unittest.TestCase):
         self.assertEqual(rpc.call(100003,2,opaque(handle)+client_time+words(0))[:4],words(10004))
         self.assertEqual(rpc.call(100003,1,opaque(handle))[8:12],words(0o640))
 
+    def test_server_now_owner_authorization_does_not_dirty_generation(self):
+        _,rpc,_=self.f.endpoint();handle=rpc.lookup(rpc.mount(),b'binary')
+        self.assertEqual(rpc.call(100003,2,opaque(handle)+attrs(0o444)+words(0))[:4],words(0))
+        generation=self.f.cli('status')['working_generation']
+        self.f.cli('checkpoint','lazy','--operation-id','operation:'+'7'*32,'--expected-generation',str(generation))
+        before=self.f.cli('status')
+        self.assertEqual(rpc.call(100003,2,opaque(handle)+words(0,0,0,0,1,1,0))[:4],words(0))
+        self.assertEqual(self.f.cli('status'),before)
+        self.assertEqual(rpc.call(100003,1,opaque(handle))[8:12],words(0o444))
+
     def test_exact_port_recovery_returns_stale_for_lost_process_handles(self):
         p,rpc,info=self.f.endpoint();handle=rpc.lookup(rpc.mount(),b'binary')
         self.assertEqual(write(rpc,handle,b'acknowledged',100)[:4],words(0))

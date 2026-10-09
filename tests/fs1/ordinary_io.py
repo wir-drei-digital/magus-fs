@@ -71,6 +71,10 @@ def run(case):
             finally:os.close(fd)
             if replacement:p.unlink()
         return {'unlinked_replaced_chmod_chown_truncate':True,'no_namespace_resurrection':True,'current_authority_enforced':True}
+    if case=='brain-closure':
+        from inventory import tree_inventory
+        assert subprocess.check_output([str(ROOT/'report.sh')],text=True)=='synthetic report\n'
+        return tree_inventory(ROOT)
     if case=='metadata':
         assert 'large' in os.listdir(ROOT)
         for p in [ROOT,ROOT/'large',ROOT/'empty']:
@@ -131,7 +135,10 @@ def run(case):
         assert (ROOT/'offline-new').read_bytes()==b'ACK survives daemon loss'
         assert (ROOT/'uncached').read_bytes()==b'full offline replacement'
         assert (ROOT/'new').read_bytes()==b'new generation'
-        return {'every_ack_verified':True}
+        assert stat.S_IMODE((ROOT/'new').stat().st_mode)==0o640
+        absent=['made','moved','atomic','unlink-parent/no-write']
+        assert all(not os.path.lexists(ROOT/name) for name in absent)
+        return {'bytes':{'new':'new generation','uncached':'full offline replacement','offline-new':'ACK survives daemon loss'},'modes':{'new':'0640'},'absent':absent}
     if case=='diskfull':
         fd=os.open(ROOT/'large',os.O_WRONLY)
         try: r['errno']=denied(lambda:os.pwrite(fd,b'diskfull-change',0),[errno.ENOSPC])

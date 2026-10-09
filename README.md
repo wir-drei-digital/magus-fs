@@ -6,7 +6,15 @@ The project targets macOS and Linux first. Its core scope includes full local re
 
 ## Current state
 
-The local FS0 branch contains the synthetic fixture/range source and experimentally qualified Linux FUSE adapter for pinned read-only and ephemeral private-byte views. Native macOS NFS now passes the controlled fixed-principal qualification after Network Volumes permission and a narrow dependency permission fix. The combined twelve-profile native matrix passes; task reviews and whole-branch review corrections are complete. FS0 is qualified as an unmerged experimental checkpoint, with the final signal-stream reporting limitation recorded in the runbook. The [combined qualification runbook](docs/fs0-qualification.md) describes six fresh profiles per platform, strict reports and exact limits; platform details are in the [Linux](docs/fs0-linux.md) and [macOS](docs/fs0-macos.md) runbooks. No filesystem release or integrated PoC is claimed.
+The unmerged `codex/fs-poc` branch contains the qualified FS0 mount checkpoint and FS1's durable local engine, lazy Linux FUSE/macOS NFS adapters, private revisions and independent recovery archives. The [FS1 combined qualification runbook](docs/fs1-qualification.md) defines two fresh V1–V12 journeys per OS, source/binary/image provenance and fail-closed cleanup. Task and whole-range reviews remain separate completion gates. No filesystem release, shared synchronization or integrated PoC is claimed.
+
+Run the complete FS1 gate on the qualified macOS host with Rancher Desktop running:
+
+```sh
+python3 tests/fs1/run.py --platform all --output /private/tmp/FS1_NEW_SHORT_NAME
+```
+
+The output path must be new. The command builds separate default/fault binaries and a fresh Linux image; it uses only synthetic owned resources. Exit0 requires every mandatory case on both platforms, exit1 means failure and exit2 means a missing prerequisite. See the [local CLI](docs/fs1-local.md), [durability](docs/fs1-durability.md), [format](docs/fs1-format.md) and [recovery](docs/fs1-recovery.md) contracts.
 
 ## Shared specifications and progress
 
@@ -16,4 +24,4 @@ Set `MAGUS_ICM_ROOT` to the active ICM checkout when using a nonstandard layout.
 
 ## Development and distribution
 
-Repository: [wir-drei-digital/magus-fs](https://github.com/wir-drei-digital/magus-fs). Initial documentation is published on `main`; FS0 development continues locally on `codex/fs-poc`. No runtime release exists. License and redistributable dependencies will be selected before external distribution; no license is granted by this planning README. Build/test commands are documented in the qualification runbook; no packaged installation exists.
+Repository: [wir-drei-digital/magus-fs](https://github.com/wir-drei-digital/magus-fs). Initial documentation is published on `main`; FS1 development continues locally on `codex/fs-poc`. No runtime release exists. License and redistributable dependencies will be selected before external distribution; no license is granted by this planning README. Build/test commands are documented in the qualification runbook; no packaged installation exists.

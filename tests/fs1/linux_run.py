@@ -59,6 +59,15 @@ def run(output,image,only_review=False):
             report['transfer']['full']=request({'action':'stats'})
             request({'action':'copy-full'});native=workload('native-full','full',view='full');assert native==full
             workload('native-metadata','metadata',view='full')
+            request({'action':'stop','name':'view'})
+            request({'action':'mount','name':'view','state':'parity'})
+            mounted_closure=workload('mounted-closure','brain-closure',user='0:0')
+            request({'action':'stop','name':'view'})
+            full_closure=workload('full-closure-daemon-stopped','brain-closure',view='full',user='0:0')
+            assert full_closure==mounted_closure
+            report['full_closure']={'verified':True,'daemon_stopped':True,'revision':report['fixture']['revision'],'mounted':mounted_closure,'full':full_closure}
+            request({'action':'mount','name':'view'})
+            report['mounted_owner_busy']=request({'action':'owner-busy'})
             workload('owner-permissions','owner',permissions=True);workload('group','group',user='1002:1002',permissions=True);workload('other','other',user='1003:1003',permissions=True)
             workload('writes','writes')
             for case in ['review-create','review-append','review-metadata']:workload(case,case)
@@ -80,13 +89,16 @@ def run(output,image,only_review=False):
             history=request({'action':'cli','command':'history'});assert len(history['revisions'])==2 and history['revisions'][0]['revision']==report['fixture']['revision'];report['checkpoint']=cp
             report['fault_point']='after native fsync + checkpoint ACK; owned SIGKILL; bounded umount before restart'
             report['loss']=request({'action':'stop','name':'view','kill':True});request({'action':'mount','name':'view'});workload('recovered','recovered')
-            retry=request({'action':'cli','command':'checkpoint','args':['--operation-id','operation:'+'5'*32,'--expected-generation',str(generation)]});assert retry==cp
+            retry=request({'action':'cli','command':'checkpoint','args':['--operation-id','operation:'+'5'*32,'--expected-generation',str(generation)]});assert retry==cp;report['checkpoint_replay']=retry;report['postcheckpoint_status']=request({'action':'cli','command':'status'})
+            report['checkpoint_mismatch']=request({'action':'cli','command':'checkpoint','args':['--operation-id','operation:'+'5'*32,'--expected-generation',str(generation+1)],'code':1});assert report['checkpoint_mismatch']['error']=='operation_mismatch'
+            report['postmismatch_status']=request({'action':'cli','command':'status'});assert report['postmismatch_status']==report['postcheckpoint_status']
             request({'action':'online'});request({'action':'mount','name':'fault','state':'faultstate','fault':True});before=request({'action':'cli','command':'status','state':'faultstate'})
             workload('diskfull','diskfull',view='fault');after=request({'action':'cli','command':'status','state':'faultstate'});assert before['captured_revision']==after['captured_revision'] and before['working_generation']==after['working_generation'];report['diskfull_head']={'before':before,'after':after}
             request({'action':'stop','name':'fault'});request({'action':'mount','name':'fault','state':'faultstate'});workload('old-head','old-head',view='fault')
             request({'action':'stop','name':'view'});request({'action':'mount','name':'view','mode':'read-only'});workload('old-revision','historical')
         report['passed']=True
-    except Exception as e:
+    except BaseException as e:
+        report['interrupted']=isinstance(e,(KeyboardInterrupt,InterruptedError))
         report['error']=repr(e)
         if report.get('prerequisite_phase'): report['blocked']=True
     finally:

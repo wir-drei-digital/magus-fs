@@ -963,6 +963,36 @@ impl Workspace {
         let e = self.resolve_entry(&core, &tree, &e.path)?;
         self.access(&core, &e, bits)
     }
+    /// Authorize session-only timestamps without advancing durable working state.
+    /// Retained handles preserve identity after unlink or replacement.
+    pub fn check_server_time(&self, id: &EntryId, handle: Option<&Handle>) -> Result<(), FsError> {
+        perm::mutation(self.read_only)?;
+        let core = lock(&self.core)?;
+        let e = if let Some(handle) = handle {
+            let entry = self.handle_entry(&core, handle)?;
+            if &entry.id != id {
+                return Err(FsError::NotFound);
+            }
+            entry
+        } else {
+            let tree = self.tree(&core)?;
+            let entry = if &tree.root.id == id {
+                perm::root_entry(&tree)
+            } else {
+                tree.entries
+                    .iter()
+                    .find(|e| &e.id == id)
+                    .cloned()
+                    .ok_or(FsError::NotFound)?
+            };
+            self.resolve_entry(&core, &tree, &entry.path)?
+        };
+        if e.owner == *self.actor.principal() {
+            Ok(())
+        } else {
+            self.access(&core, &e, 2)
+        }
+    }
     /// Attributes through an existing open capability, including unlinked identities.
     pub fn handle_attributes(&self, handle: &Handle) -> Result<Entry, FsError> {
         let core = lock(&self.core)?;

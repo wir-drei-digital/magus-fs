@@ -2,10 +2,10 @@
 import errno,hashlib,http.server,json,os,signal,socket,subprocess,threading,time
 from pathlib import Path
 P=Path('/private'); S=Path('/shared'); processes=[]; mounts={}; counts={'body_bytes':0,'requests':0}; offline=False; source=None; source_thread=None; report={'cleanup':[],'reaped':[]}
-def cli(command,state='lazy',*args,binary='magus-fs'):
+def cli(command,state='lazy',*args,binary='magus-fs',code=0):
     argv=[binary,command,'--state',str(P/state),*map(str,args)]
     r=subprocess.run(argv,capture_output=True,text=True,timeout=15)
-    if r.returncode: raise RuntimeError((argv,r.returncode,r.stdout,r.stderr))
+    if r.returncode!=code: raise RuntimeError((argv,r.returncode,r.stdout,r.stderr))
     return json.loads(r.stdout)
 def mounted(path): return any(x.split()[4]==str(path) for x in Path('/proc/self/mountinfo').read_text().splitlines())
 def stop(name,kill=False):
@@ -72,9 +72,16 @@ def command(d):
         meta=(P/'lazy/control.sock').stat();assert meta.st_uid==0 and meta.st_mode&0o777==0o600
         return {'forged_actor':forged,'readonly_checkpoint':readonly,'stale_regular_file_preserved':True,'mode':oct(meta.st_mode&0o777),'uid':meta.st_uid}
 
+    if action=='owner-busy':
+        results={}
+        for name,args in [('export',['--revision',revision,'--destination','/private/busy-export']),('restore',['--revision',revision,'--operation-id','operation:'+'8'*32]),('prune',['--dry-run']),('history-grants',['--config','/private/config.json'])]:
+            r=subprocess.run(['magus-fs',name,'--state','/private/lazy',*args],capture_output=True,text=True,timeout=5)
+            value=json.loads(r.stdout);assert r.returncode==1 and value['error']=='replica_busy',(name,r.stdout);results[name]=value['error']
+        assert not Path('/private/busy-export').exists()
+        return results
     if action=='mount': return mount(d['name'],d.get('state','lazy'),d.get('mode','private'),d.get('fault',False))
     if action=='stop': return stop(d['name'],d.get('kill',False))
-    if action=='cli': return cli(d['command'],d.get('state','lazy'),*d.get('args',[]))
+    if action=='cli': return cli(d['command'],d.get('state','lazy'),*d.get('args',[]),code=d.get('code',0))
     if action=='copy-full':
         return cli('materialize','source','--revision',revision,'--destination','/shared/full')
     raise ValueError(action)
@@ -100,6 +107,8 @@ def main():
         if name!='empty': (tree/name/('no-write' if name=='unlink-parent' else 'child')).write_bytes(b'child')
         (tree/name).chmod(mode)
     (tree/'unlink-parent/no-write').chmod(0o444)
+    from inventory import corpus
+    corpus(tree)
     for root,dirs,files in os.walk(tree):
         os.chown(root,1001,1001)
         for name in files: os.chown(Path(root)/name,1001,1001)
@@ -114,7 +123,7 @@ def main():
     source=http.server.ThreadingHTTPServer(('127.0.0.1',8765),Source);source_thread=threading.Thread(target=source.serve_forever);source_thread.start()
     control=http.server.HTTPServer(('127.0.0.1',9001),Control);control_thread=threading.Thread(target=control.serve_forever);control_thread.start()
     try:
-        for state in ['lazy','readonly','faultstate']:
+        for state in ['lazy','readonly','faultstate','parity']:
             cli('init',state,'--config',cfg,'--revision-manifest',manifest,'--source','http://127.0.0.1:8765')
         report['capabilities']=[line for line in Path('/proc/self/status').read_text().splitlines() if line.startswith(('Cap','NoNewPrivs'))]
         report['binaries']={name:hashlib.sha256(Path('/usr/local/bin',name).read_bytes()).hexdigest() for name in ['magus-fs','magus-fs-faults']}
