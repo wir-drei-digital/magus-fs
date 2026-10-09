@@ -31,6 +31,20 @@ def command(argv,records,expected=0,env=None,input_data=None):
     if r.returncode!=expected: raise AssertionError(record)
     return r.stdout
 
+class PrerequisiteUnavailable(RuntimeError):
+    """The native qualification could not start; no product result is implied."""
+
+
+def docker_prerequisites(image,records):
+    # Check only availability here. Errors after these probes remain test failures.
+    for argv in [['docker','info','--format','{{.ServerVersion}}'],
+                 ['docker','image','inspect',image]]:
+        try:
+            command(argv,records)
+        except AssertionError as e:
+            raise PrerequisiteUnavailable(str(e)) from e
+
+
 def prepare(base,binary,uid=None):
     base.mkdir(exist_ok=False)
     original=base/'original';original.mkdir();tree=original/'tree';tree.mkdir();(tree/'empty').mkdir()
@@ -130,6 +144,7 @@ def run_host(output,binary):
 def run_linux(output,image):
     records=[];token=uuid.uuid4().hex;producer='fs1-recovery-producer-'+token;worker_name='fs1-recovery-worker-'+token;owned=[]
     try:
+        docker_prerequisites(image,records)
         command(['docker','create','--name',producer,'--network','none',image,'python3','/src/tests/fs1/recovery_io.py','--prepare','/tmp/fixture','--binary','/out/magus-fs','--uid','1001'],records);owned.append(producer)
         command(['docker','start','--attach',producer],records)
         assert command(['docker','inspect','--format','{{.State.ExitCode}}',producer],records).strip()=='0'
@@ -170,7 +185,7 @@ def main():
         if args.platform in ['all','linux']:
             out=args.output/'linux';out.mkdir();report['platforms']['linux']=run_linux(out,args.image)
         report['status']='passed';return 0
-    except FileNotFoundError as e:report['status']='unavailable';report['error']=repr(e);return 2
+    except (FileNotFoundError,PrerequisiteUnavailable) as e:report['status']='unavailable';report['error']=repr(e);return 2
     except Exception as e:report['error']=repr(e);return 1
     finally:write(args.output/'result.json',report)
 if __name__=='__main__':sys.exit(main())
