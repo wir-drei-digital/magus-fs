@@ -488,3 +488,25 @@ fn unreachable_unlinked_local_bytes_wait_for_last_handle_close() {
     assert_eq!(rep.prune(false).unwrap().reclaimable_bytes, 3);
     assert_eq!(rep.status().unwrap().resident_bytes, 0);
 }
+#[test]
+fn adapter_identity_lookup_and_handle_attributes_do_not_resurrect_or_leak_unsearchable_children() {
+    let (_d, rep, w, _base) = setup();
+    assert_eq!(rep.configuration().unwrap(), config());
+    let h = w.create("held", 0o600).unwrap();
+    w.write(&h, 0, b"held bytes").unwrap();
+    let id = w.lookup("held").unwrap().id;
+    w.rename("held", "moved").unwrap();
+    assert_eq!(w.lookup_identity(&id).unwrap().path, "moved");
+    w.unlink("moved").unwrap();
+    err(w.lookup_identity(&id), "not_found");
+    assert_eq!(w.handle_attributes(&h).unwrap().id, id);
+    w.mkdir("directory", 0o700).unwrap();
+    w.create("directory/child", 0o600).unwrap();
+    w.chmod("directory", 0o400).unwrap();
+    let names = w.directory_entries("directory").unwrap();
+    assert_eq!(names.len(), 1);
+    assert_eq!(names[0].0, "child");
+    assert!(!names[0].2);
+    err(w.lookup_identity(&names[0].1), "permission_denied");
+    err(w.lookup("directory/child"), "permission_denied");
+}

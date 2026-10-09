@@ -13,10 +13,11 @@ struct Configuration {
     policy: CapturePolicy,
     creation_umask: u16,
 }
-type Result<T> = std::result::Result<T, (i32, FsError)>;
+pub(crate) type Result<T> = std::result::Result<T, (i32, FsError)>;
 fn args(argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
     let command = argv.first().cloned().ok_or((2, FsError::InvalidPath))?;
     let allowed = match command.as_str() {
+        "mount" => vec!["state", "revision", "mountpoint", "mode", "source"],
         "init" => vec!["state", "config", "revision-manifest", "source"],
         "capture" => vec!["state", "root", "operation-id"],
         "materialize" => vec!["state", "destination", "revision"],
@@ -142,7 +143,7 @@ pub fn run(argv: Vec<String>) -> Result<Value> {
     } else {
         None
     };
-    let checkpoint = if command == "checkpoint" {
+    let _checkpoint = if command == "checkpoint" {
         Some((
             operation(&options)?,
             options
@@ -156,6 +157,19 @@ pub fn run(argv: Vec<String>) -> Result<Value> {
     } else {
         None
     };
+    #[cfg(target_os = "linux")]
+    if matches!(command.as_str(), "checkpoint" | "history" | "status") {
+        if let Some(response) =
+            crate::adapters::control::request(state, &command, &options).map_err(|e| (1, e))?
+        {
+            if response.exit != 0 {
+                eprintln!("magus-fs: {}", response.value["error"]);
+                println!("{}", response.value);
+                std::process::exit(response.exit);
+            }
+            return Ok(response.value);
+        }
+    }
     let rep = Replica::reopen(state).map_err(|e| {
         (
             if matches!(&e,FsError::Io(err)if err.kind()==std::io::ErrorKind::NotFound) {
@@ -192,6 +206,66 @@ pub fn run(argv: Vec<String>) -> Result<Value> {
                 json!({"ok":true,"result":output,"recovery":rep.materialization_recovery().map_err(|e|(1,e))?}),
             )
         }
+        "mount" => {
+            let revision =
+                RevisionId::parse(required(&options, "revision")?).map_err(|e| (2, e))?;
+            let mountpoint = absolute(required(&options, "mountpoint")?)?;
+            let read_only = match required(&options, "mode")? {
+                "read-only" => true,
+                "private" => false,
+                _ => return Err((2, FsError::InvalidPath)),
+            };
+            if let Some(url) = options.get("source") {
+                let source = if let Some(path) = url.strip_prefix("file://") {
+                    ChunkSource::Local {
+                        path: absolute(path)?.into(),
+                    }
+                } else {
+                    ChunkSource::Http {
+                        base_url: url.clone(),
+                    }
+                };
+                let bytes = encode_revision(&rep.revision(&revision).map_err(|e| (1, e))?)
+                    .map_err(|e| (1, e))?;
+                rep.import_revision(
+                    ImportDescriptor {
+                        expected: revision.clone(),
+                        bytes,
+                    },
+                    source,
+                )
+                .map_err(|e| (1, e))?;
+            }
+            crate::adapters::mount(rep, state, &revision, mountpoint, read_only)
+                .map_err(|e| (1, e))?;
+            Ok(json!({"ok":true,"unmounted":mountpoint}))
+        }
+        "checkpoint" | "status" | "history" => control(&rep, actor, &command, &options),
+        _ => Err((2, FsError::InvalidPath)),
+    }
+}
+/// Both standalone CLI and mounted owner use exactly these command semantics.
+pub(crate) fn control(
+    rep: &Replica,
+    actor: Actor,
+    command: &str,
+    options: &BTreeMap<String, String>,
+) -> Result<Value> {
+    let checkpoint = if command == "checkpoint" {
+        Some((
+            operation(options)?,
+            options
+                .get("expected-generation")
+                .map(|v| {
+                    v.parse::<u64>()
+                        .map_err(|_| (2, FsError::InvalidDescriptor))
+                })
+                .transpose()?,
+        ))
+    } else {
+        None
+    };
+    match command {
         "checkpoint" => {
             let status = rep.status().map_err(|e| (1, e))?;
             let base = status.head.ok_or((2, FsError::NotFound))?;

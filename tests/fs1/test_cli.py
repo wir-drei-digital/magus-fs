@@ -48,6 +48,10 @@ class CLI(unittest.TestCase):
         self.assertEqual(v["ok"],code==0)
         return v
 
+    def test_missing_state_is_a_prerequisite_block(self):
+        result = self.call("status", state=self.d/"missing", code=2)
+        self.assertEqual(result["error"], "io_error")
+
     def init(self):
         return self.call("init","--config",self.config)
 

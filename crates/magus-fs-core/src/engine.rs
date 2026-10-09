@@ -608,6 +608,14 @@ impl Replica {
     pub fn prune(&self, dry_run: bool) -> Result<PruneReport, FsError> {
         lock(&self.core)?.prune(dry_run)
     }
+    /// Guarded immutable local authority configuration for native adapter mapping.
+    pub fn configuration(&self) -> Result<ReplicaConfig, FsError> {
+        Ok(lock(&self.core)?.config.clone())
+    }
+    /// Apply the same whole-control-root native identity boundary to a mount target.
+    pub fn check_content_path(&self, path: &Path) -> Result<(), FsError> {
+        lock(&self.core)?.journal.check_content_path(path)
+    }
     pub fn actor_for_uid(&self, uid: u32) -> Result<Actor, FsError> {
         lock(&self.core)?
             .config
@@ -719,6 +727,51 @@ impl Workspace {
             .collect::<Vec<_>>();
         names.sort();
         Ok(names)
+    }
+    /// Readdir names, stable identities and kinds only; child attributes still require search.
+    pub fn directory_entries(&self, path: &str) -> Result<Vec<(String, EntryId, bool)>, FsError> {
+        let core = lock(&self.core)?;
+        let tree = self.tree(&core)?;
+        let entry = self.resolve_entry(&core, &tree, path)?;
+        if entry.content != EntryContent::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        self.access(&core, &entry, 4)?;
+        Ok(tree
+            .entries
+            .iter()
+            .filter(|e| perm::parent(&e.path) == path)
+            .map(|e| {
+                (
+                    e.path.rsplit('/').next().unwrap_or("").to_owned(),
+                    e.id.clone(),
+                    e.content == EntryContent::Directory,
+                )
+            })
+            .collect())
+    }
+    /// Resolve an inode identity through its current path and current traversal authority.
+    pub fn lookup_identity(&self, id: &EntryId) -> Result<Entry, FsError> {
+        let core = lock(&self.core)?;
+        let tree = self.tree(&core)?;
+        let path = if &tree.root.id == id {
+            ""
+        } else {
+            &tree
+                .entries
+                .iter()
+                .find(|e| &e.id == id)
+                .ok_or(FsError::NotFound)?
+                .path
+        };
+        self.resolve_entry(&core, &tree, path)
+    }
+    /// Attributes through an existing open capability, including unlinked identities.
+    pub fn handle_attributes(&self, handle: &Handle) -> Result<Entry, FsError> {
+        let core = lock(&self.core)?;
+        let entry = self.handle_entry(&core, handle)?;
+        self.access(&core, &entry, 0)?;
+        Ok(entry)
     }
     pub fn open(&self, path: &str, mode: OpenMode) -> Result<Handle, FsError> {
         if mode != OpenMode::Read {

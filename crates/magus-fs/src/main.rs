@@ -1,3 +1,4 @@
+mod adapters;
 mod cli;
 fn main() {
     match cli::run(std::env::args().skip(1).collect()) {
