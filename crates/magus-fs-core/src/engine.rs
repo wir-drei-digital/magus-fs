@@ -233,6 +233,7 @@ impl Core {
     }
     fn protected(&self) -> Result<BTreeSet<ObjectId>, FsError> {
         let mut protected = self.sync_roots()?;
+        protected.extend(self.native_roots()?);
         if let Some(w) = &self.working {
             if w.dirty {
                 protected.extend(cache::object_set(&w.tree));

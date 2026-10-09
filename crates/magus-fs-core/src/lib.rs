@@ -34,3 +34,6 @@ pub use remote_source::RemoteFetcher;
 
 mod live;
 pub use live::*;
+
+mod native_apply;
+pub use native_apply::*;

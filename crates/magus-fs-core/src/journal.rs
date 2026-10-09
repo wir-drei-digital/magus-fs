@@ -137,6 +137,9 @@ impl Journal {
   CREATE TABLE IF NOT EXISTS operations (operation TEXT PRIMARY KEY,digest TEXT NOT NULL,state TEXT NOT NULL,result TEXT REFERENCES revisions(id),error TEXT,candidate BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS capture_attempts (operation TEXT PRIMARY KEY REFERENCES operations(operation), record BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS native (singleton INTEGER PRIMARY KEY CHECK(singleton=1), configuration BLOB NOT NULL, scan BLOB);
+  CREATE TABLE IF NOT EXISTS native_incoming (revision TEXT PRIMARY KEY REFERENCES revisions(id));
+  CREATE TABLE IF NOT EXISTS native_apply (operation TEXT PRIMARY KEY, record BLOB NOT NULL);
+  CREATE TABLE IF NOT EXISTS native_status (singleton INTEGER PRIMARY KEY CHECK(singleton=1), record BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS materializations (id TEXT PRIMARY KEY, manifest BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS sync_binding (singleton INTEGER PRIMARY KEY CHECK(singleton=1), value BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS live_authority_history (generation INTEGER PRIMARY KEY, revision TEXT);

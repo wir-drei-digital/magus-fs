@@ -138,23 +138,23 @@ pub struct UnsupportedEntry {
     pub reason: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Observation {
-    dev: u64,
-    ino: u64,
-    kind: u32,
-    size: u64,
-    mtime: i64,
-    mtime_ns: i64,
-    ctime: i64,
-    ctime_ns: i64,
-    uid: u32,
-    gid: u32,
-    mode: u32,
-    nlink: u64,
-    names: Vec<Vec<u8>>,
+pub(crate) struct Observation {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) kind: u32,
+    pub(crate) size: u64,
+    pub(crate) mtime: i64,
+    pub(crate) mtime_ns: i64,
+    pub(crate) ctime: i64,
+    pub(crate) ctime_ns: i64,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) mode: u32,
+    pub(crate) nlink: u64,
+    pub(crate) names: Vec<Vec<u8>>,
 }
 impl Observation {
-    fn metadata(m: &Metadata) -> Self {
+    pub(crate) fn metadata(m: &Metadata) -> Self {
         Self {
             dev: m.dev(),
             ino: m.ino(),
@@ -171,15 +171,15 @@ impl Observation {
             names: vec![],
         }
     }
-    fn same_identity(&self, other: &Self) -> bool {
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
         self.dev == other.dev && self.ino == other.ino && self.kind == other.kind
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
-struct ScanRecord {
-    observations: BTreeMap<String, Observation>,
-    ids: BTreeMap<String, EntryId>,
-    diagnostics: Vec<NativeMetadataDisposition>,
+pub(crate) struct ScanRecord {
+    pub(crate) observations: BTreeMap<String, Observation>,
+    pub(crate) ids: BTreeMap<String, EntryId>,
+    pub(crate) diagnostics: Vec<NativeMetadataDisposition>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct CaptureAttempt {
@@ -187,9 +187,9 @@ struct CaptureAttempt {
     head: Option<RevisionId>,
     generation: u64,
 }
-struct Observed {
-    info: Observation,
-    file: File,
+pub(crate) struct Observed {
+    pub(crate) info: Observation,
+    pub(crate) file: File,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeMetadataDisposition {
@@ -198,11 +198,11 @@ pub struct NativeMetadataDisposition {
     pub value_bytes: u64,
     pub disposition: String,
 }
-struct Scan {
-    nodes: BTreeMap<String, Observed>,
-    unsupported: Vec<UnsupportedEntry>,
-    diagnostics: Vec<NativeMetadataDisposition>,
-    deadline: Instant,
+pub(crate) struct Scan {
+    pub(crate) nodes: BTreeMap<String, Observed>,
+    pub(crate) unsupported: Vec<UnsupportedEntry>,
+    pub(crate) diagnostics: Vec<NativeMetadataDisposition>,
+    pub(crate) deadline: Instant,
 }
 
 pub(crate) fn absolute_native(path: &Path) -> Result<(), FsError> {
@@ -377,7 +377,11 @@ pub(crate) fn metadata_inventory(
     Ok((unsupported, diagnostics))
 }
 impl Scan {
-    fn observe(root: &Path, policy: &CapturePolicy, deadline: Instant) -> Result<Self, FsError> {
+    pub(crate) fn observe(
+        root: &Path,
+        policy: &CapturePolicy,
+        deadline: Instant,
+    ) -> Result<Self, FsError> {
         let file = directory(root)?;
         let mut result = Self {
             nodes: BTreeMap::new(),
@@ -506,7 +510,7 @@ impl Scan {
         self.nodes.insert(path.into(), Observed { info, file });
         Ok(())
     }
-    fn observations(&self) -> BTreeMap<String, Observation> {
+    pub(crate) fn observations(&self) -> BTreeMap<String, Observation> {
         self.nodes
             .iter()
             .map(|(p, o)| (p.clone(), o.info.clone()))
@@ -526,7 +530,7 @@ fn mapped(config: &ReplicaConfig, info: &Observation) -> Result<(PrincipalId, Gr
         .ok_or(FsError::MappingBlocked)?;
     Ok((owner.principal.clone(), group.primary_group.clone()))
 }
-fn authorize_capture(
+pub(crate) fn authorize_capture(
     config: &ReplicaConfig,
     actor: &Actor,
     old: Option<&Tree>,
@@ -690,6 +694,7 @@ impl Replica {
             return Err(FsError::ConfigMismatch);
         }
         perm::authority(&core.config, &actor)?;
+        crate::native_apply::authority_revision(&core)?;
         if core.working.as_ref().is_some_and(|w| w.dirty) {
             return Err(FsError::DirtyWorkingState);
         }
@@ -920,6 +925,7 @@ impl Replica {
                 core.working.as_ref().map(|w| &w.tree),
                 &tree,
             )?;
+            crate::native_apply::authorize_native_capture(&core, &actor, &tree)?;
             let digest =
                 RevisionId::digest(&json(&(root, &policy, &actor, &tree, &observations))?)?;
             let existing = core
