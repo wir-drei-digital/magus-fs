@@ -14,4 +14,8 @@ pub use cache::*;
 pub use engine::*;
 pub use journal::Pragmas;
 pub use permissions::*;
+mod capture;
 mod faults;
+mod materialize;
+pub use capture::*;
+pub use materialize::*;

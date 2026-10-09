@@ -52,25 +52,25 @@ use std::{
     time::{Duration, Instant},
 };
 #[derive(Clone, Serialize, Deserialize)]
-struct Working {
-    base: RevisionId,
-    head: RevisionId,
-    generation: u64,
-    dirty: bool,
-    umask: u16,
-    tree: Tree,
-    orphans: Vec<Entry>,
+pub(crate) struct Working {
+    pub(crate) base: RevisionId,
+    pub(crate) head: RevisionId,
+    pub(crate) generation: u64,
+    pub(crate) dirty: bool,
+    pub(crate) umask: u16,
+    pub(crate) tree: Tree,
+    pub(crate) orphans: Vec<Entry>,
 }
-struct Core {
-    journal: Journal,
-    objects: ObjectStore,
-    config: ReplicaConfig,
-    working: Option<Working>,
+pub(crate) struct Core {
+    pub(crate) journal: Journal,
+    pub(crate) objects: ObjectStore,
+    pub(crate) config: ReplicaConfig,
+    pub(crate) working: Option<Working>,
     handles: Vec<Weak<HandleData>>,
 }
 #[derive(Clone)]
 pub struct Replica {
-    core: Arc<Mutex<Core>>,
+    pub(crate) core: Arc<Mutex<Core>>,
 }
 #[derive(Clone)]
 pub struct Workspace {
@@ -98,19 +98,19 @@ impl Handle {
         self.inner.generation
     }
 }
-fn lock(core: &Arc<Mutex<Core>>) -> Result<MutexGuard<'_, Core>, FsError> {
+pub(crate) fn lock(core: &Arc<Mutex<Core>>) -> Result<MutexGuard<'_, Core>, FsError> {
     let guard = core.lock().map_err(|_| FsError::ReplicaBusy)?;
     guard.journal.guard()?;
     Ok(guard)
 }
-fn json<T: Serialize>(value: &T) -> Result<Vec<u8>, FsError> {
+pub(crate) fn json<T: Serialize>(value: &T) -> Result<Vec<u8>, FsError> {
     let bytes = serde_json::to_vec(value).map_err(|_| FsError::InvalidDescriptor)?;
     if bytes.len() > MAX_DESCRIPTOR * 2 {
         return Err(FsError::LimitExceeded);
     }
     Ok(bytes)
 }
-fn from_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, FsError> {
+pub(crate) fn from_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, FsError> {
     if bytes.len() > MAX_DESCRIPTOR * 2 {
         return Err(FsError::LimitExceeded);
     }
@@ -120,7 +120,7 @@ impl Core {
     fn working(&self) -> Result<&Working, FsError> {
         self.working.as_ref().ok_or(FsError::BaseMismatch)
     }
-    fn revision(&self, id: &RevisionId) -> Result<Revision, FsError> {
+    pub(crate) fn revision(&self, id: &RevisionId) -> Result<Revision, FsError> {
         let bytes = self
             .journal
             .db
@@ -282,7 +282,7 @@ impl Core {
         }
         Ok(report)
     }
-    fn reserve(&mut self, objects: &BTreeMap<ObjectId, u64>) -> Result<(), FsError> {
+    pub(crate) fn reserve(&mut self, objects: &BTreeMap<ObjectId, u64>) -> Result<(), FsError> {
         let inventory = self.objects.inventory()?;
         let existing: BTreeSet<_> = inventory.iter().map(|(id, _)| id.clone()).collect();
         let additional: u64 = objects
@@ -300,7 +300,12 @@ impl Core {
         }
         Ok(())
     }
-    fn fetch(&mut self, id: &ObjectId, size: u64, deadline: Instant) -> Result<Vec<u8>, FsError> {
+    pub(crate) fn fetch(
+        &mut self,
+        id: &ObjectId,
+        size: u64,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, FsError> {
         match self.objects.read_verified(id) {
             Ok(bytes) => {
                 if bytes.len() as u64 != size {
@@ -326,7 +331,7 @@ impl Core {
         )?;
         Ok(bytes)
     }
-    fn failed(&self, operation: &OperationId, error: &FsError) -> Result<(), FsError> {
+    pub(crate) fn failed(&self, operation: &OperationId, error: &FsError) -> Result<(), FsError> {
         self.journal.db.execute(
             "UPDATE operations SET state='failed',error=? WHERE operation=? AND state!='committed'",
             params![error.code(), operation.as_str()],
@@ -365,8 +370,15 @@ impl Replica {
             return Err(FsError::ConfigMismatch);
         }
         let journal = Journal::open(state.as_ref(), &config)?;
+        Self::from_journal(state.as_ref(), config, journal)
+    }
+    pub(crate) fn from_journal(
+        state: &Path,
+        config: ReplicaConfig,
+        journal: Journal,
+    ) -> Result<Self, FsError> {
         let objects = ObjectStore::open(
-            state.as_ref().join("objects"),
+            state.join("objects"),
             ObjectLimits {
                 content_roots: config.content_roots.clone(),
                 ..ObjectLimits::default()
@@ -999,17 +1011,7 @@ impl Workspace {
         let mut core = lock(&self.core)?;
         let mut next = core.working()?.clone();
         let a = self.actor(&core)?;
-        if !a.ownership_transfer || !a.groups.contains(&group) {
-            return Err(FsError::PermissionDenied);
-        }
-        if !core
-            .config
-            .authorities
-            .iter()
-            .any(|a| a.principal == owner && a.groups.contains(&group))
-        {
-            return Err(FsError::UnknownPrincipal);
-        }
+        perm::ownership_change(&core.config, a, &owner, &group)?;
         perm::traversal(&next.tree, path, a)?;
         let mut e = perm::entry(&next.tree, path)?;
         e.owner = owner;

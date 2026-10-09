@@ -1,3 +1,4 @@
+use crate::UnsupportedEntry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{fmt, io};
@@ -46,6 +47,11 @@ pub enum FsError {
     StaleHandle,
     GenerationMismatch,
     OperationMismatch,
+    UnstableCapture,
+    UnsupportedEntries(Vec<UnsupportedEntry>),
+    MappingBlocked,
+    DirtyWorkingState,
+    TargetCollision,
 }
 impl fmt::Display for FsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -85,6 +91,11 @@ impl FsError {
             Self::StaleHandle => "stale_handle",
             Self::GenerationMismatch => "generation_mismatch",
             Self::OperationMismatch => "operation_mismatch",
+            Self::UnstableCapture => "unstable_capture",
+            Self::UnsupportedEntries(_) => "unsupported_entries",
+            Self::MappingBlocked => "mapping_blocked",
+            Self::DirtyWorkingState => "dirty_working_state",
+            Self::TargetCollision => "target_collision",
         }
     }
 }

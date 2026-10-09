@@ -19,18 +19,35 @@ pub(crate) struct Journal {
     pub db: Connection,
     control: ObjectStore,
     _lock: File,
-    path: PathBuf,
+    pub(crate) path: PathBuf,
 }
 impl Journal {
     pub fn open(path: &Path, config: &ReplicaConfig) -> Result<Self, FsError> {
-        let control = ObjectStore::open(
+        Self::open_configured(path, Some(config.clone())).map(|v| v.0)
+    }
+    pub(crate) fn reopen(path: &Path) -> Result<(Self, ReplicaConfig), FsError> {
+        Self::open_configured(path, None)
+    }
+    fn open_configured(
+        path: &Path,
+        requested: Option<ReplicaConfig>,
+    ) -> Result<(Self, ReplicaConfig), FsError> {
+        let open = if requested.is_some() {
+            ObjectStore::open
+        } else {
+            ObjectStore::open_existing
+        };
+        let control = open(
             path,
             ObjectLimits {
-                content_roots: config.content_roots.clone(),
+                content_roots: requested
+                    .as_ref()
+                    .map(|c| c.content_roots.clone())
+                    .unwrap_or_default(),
                 ..ObjectLimits::default()
             },
         )?;
-        let lock = control.control_file("owner.lock", true)?;
+        let lock = control.control_file("owner.lock", requested.is_some())?;
         // SAFETY: lock is a live owned ordinary file. Nonblocking exclusive lock lasts until drop.
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let e = std::io::Error::last_os_error();
@@ -40,7 +57,7 @@ impl Journal {
                 Err(e.into())
             };
         }
-        let dbfile = control.control_file("journal.sqlite", true)?;
+        let dbfile = control.control_file("journal.sqlite", requested.is_some())?;
         for leaf in [
             "journal.sqlite-wal",
             "journal.sqlite-shm",
@@ -67,6 +84,22 @@ impl Journal {
         {
             return Err(FsError::UnsafeStorage);
         }
+        let config = match requested {
+            Some(config) => config,
+            None => {
+                let encoded: Vec<u8> = db.query_row(
+                    "SELECT value FROM configuration WHERE singleton=1",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let config: ReplicaConfig =
+                    serde_json::from_slice(&encoded).map_err(|_| FsError::ConfigMismatch)?;
+                for root in &config.content_roots {
+                    control.check_content_path(path, root)?;
+                }
+                config
+            }
+        };
         db.busy_timeout(Duration::from_millis(5000))?;
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version > 1 {
@@ -102,8 +135,11 @@ impl Journal {
   CREATE TABLE IF NOT EXISTS cache (object TEXT PRIMARY KEY, size INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS pins (revision TEXT PRIMARY KEY REFERENCES revisions(id));
   CREATE TABLE IF NOT EXISTS operations (operation TEXT PRIMARY KEY,digest TEXT NOT NULL,state TEXT NOT NULL,result TEXT REFERENCES revisions(id),error TEXT,candidate BLOB NOT NULL);
+  CREATE TABLE IF NOT EXISTS capture_attempts (operation TEXT PRIMARY KEY REFERENCES operations(operation), record BLOB NOT NULL);
+  CREATE TABLE IF NOT EXISTS native (singleton INTEGER PRIMARY KEY CHECK(singleton=1), configuration BLOB NOT NULL, scan BLOB);
+  CREATE TABLE IF NOT EXISTS materializations (id TEXT PRIMARY KEY, manifest BLOB NOT NULL);
   PRAGMA user_version=1;")?;
-        let encoded = serde_json::to_vec(config).map_err(|_| FsError::InvalidDescriptor)?;
+        let encoded = serde_json::to_vec(&config).map_err(|_| FsError::InvalidDescriptor)?;
         if let Some(existing) = tx
             .query_row(
                 "SELECT value FROM configuration WHERE singleton=1",
@@ -121,7 +157,11 @@ impl Journal {
         tx.commit()?;
         result.guard()?;
         result.control.directory().sync_all()?;
-        Ok(result)
+        Ok((result, config))
+    }
+    pub(crate) fn check_content_path(&self, content: &Path) -> Result<(), FsError> {
+        self.guard()?;
+        self.control.check_content_path(&self.path, content)
     }
     pub fn guard(&self) -> Result<(), FsError> {
         self.control.assert_path(&self.path)?;

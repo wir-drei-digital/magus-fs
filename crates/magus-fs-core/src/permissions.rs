@@ -119,3 +119,22 @@ pub(crate) fn parent_write(tree: &Tree, path: &str, a: &Authority) -> Result<Ent
     access(a, &p, 3)?;
     Ok(p)
 }
+
+pub(crate) fn ownership_change(
+    config: &ReplicaConfig,
+    authority: &Authority,
+    owner: &PrincipalId,
+    group: &GroupId,
+) -> Result<(), FsError> {
+    if !authority.ownership_transfer || !authority.groups.contains(group) {
+        return Err(FsError::PermissionDenied);
+    }
+    if !config
+        .authorities
+        .iter()
+        .any(|a| &a.principal == owner && a.groups.contains(group))
+    {
+        return Err(FsError::UnknownPrincipal);
+    }
+    Ok(())
+}

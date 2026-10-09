@@ -24,7 +24,7 @@ pub(crate) fn unavailable(object: &ObjectId, cause: SourceFailure) -> FsError {
     }
 }
 impl ChunkSource {
-    pub(crate) fn validate(&self) -> Result<(), FsError> {
+    pub fn validate(&self) -> Result<(), FsError> {
         if let Self::Http { base_url } = self {
             let authority = base_url
                 .strip_prefix("http://")

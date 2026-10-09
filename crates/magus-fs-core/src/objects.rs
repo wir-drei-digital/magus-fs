@@ -32,7 +32,7 @@ pub struct ObjectStore {
     limits: ObjectLimits,
 }
 
-fn name(value: &OsStr) -> Result<CString, FsError> {
+pub(crate) fn name(value: &OsStr) -> Result<CString, FsError> {
     CString::new(value.as_bytes()).map_err(|_| FsError::UnsafeStorage)
 }
 fn syscall_error() -> FsError {
@@ -43,7 +43,7 @@ fn syscall_error() -> FsError {
         FsError::Io(e)
     }
 }
-fn open_at(parent: RawFd, n: &std::ffi::CStr, flags: i32) -> Result<File, FsError> {
+pub(crate) fn open_at(parent: RawFd, n: &std::ffi::CStr, flags: i32) -> Result<File, FsError> {
     // SAFETY: name is NUL terminated, parent is live (or AT_FDCWD), mode is supplied for O_CREAT.
     let fd = unsafe {
         libc::openat(
@@ -192,7 +192,26 @@ impl Drop for Stage<'_> {
     }
 }
 impl ObjectStore {
+    pub(crate) fn check_content_path(&self, storage: &Path, content: &Path) -> Result<(), FsError> {
+        self.assert_path(storage)?;
+        let storage = inspect_no_symlink(&absolute(storage)?)?;
+        let content = inspect_no_symlink(&absolute(content)?)?;
+        refuse_native_overlap(&storage, &content)
+    }
+    pub(crate) fn create_owned(
+        path: impl AsRef<Path>,
+        limits: ObjectLimits,
+    ) -> Result<Self, FsError> {
+        Self::open_directory(path, limits, true)
+    }
     pub fn open(path: impl AsRef<Path>, limits: ObjectLimits) -> Result<Self, FsError> {
+        Self::open_directory(path, limits, false)
+    }
+    fn open_directory(
+        path: impl AsRef<Path>,
+        limits: ObjectLimits,
+        require_new: bool,
+    ) -> Result<Self, FsError> {
         if limits.max_chunk_size == 0 || limits.max_chunk_size > MAX_CHUNK {
             return Err(FsError::LimitExceeded);
         }
@@ -231,6 +250,9 @@ impl ObjectStore {
                     && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
                 {
                     return Err(syscall_error());
+                }
+                if require_new && !made {
+                    return Err(FsError::AlreadyExists);
                 }
                 let child = open_at(dir.as_raw_fd(), &n, libc::O_RDONLY | libc::O_DIRECTORY)?;
                 if made {
@@ -499,5 +521,30 @@ impl ObjectStore {
         let dir = native.directories.pop().ok_or(FsError::UnsafeStorage)?;
         private(&dir, true)?;
         Ok(Self { dir, limits })
+    }
+}
+
+#[cfg(test)]
+mod owned_directory_tests {
+    use super::*;
+    #[test]
+    fn new_control_staging_never_claims_an_existing_private_directory() {
+        let d = tempfile::Builder::new()
+            .prefix("fs1-task4-owned-")
+            .tempdir_in(if cfg!(target_os = "macos") {
+                "/private/tmp"
+            } else {
+                "/tmp"
+            })
+            .unwrap();
+        let path = d.path().join("stage");
+        let original = ObjectStore::open(&path, ObjectLimits::default()).unwrap();
+        std::fs::write(path.join("user-file"), b"retain").unwrap();
+        assert!(matches!(
+            ObjectStore::create_owned(&path, ObjectLimits::default()),
+            Err(FsError::AlreadyExists)
+        ));
+        assert_eq!(std::fs::read(path.join("user-file")).unwrap(), b"retain");
+        drop(original);
     }
 }
