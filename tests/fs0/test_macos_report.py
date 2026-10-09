@@ -70,6 +70,46 @@ class MacEvidence(unittest.TestCase):
             with self.subTest(case=case):
                 commands=result['cases'][case]['command']
                 for name in contributors:self.assertIn(self.native['cases'][name]['command'],commands)
+    def test_required_mount_modes_and_access_argv_are_independent(self):
+        for name in self.native['mounts']:
+            for change in ('missing-mode','wrong-mode','wrong-argv','missing-argv-mode'):
+                with self.subTest(name=name,change=change):
+                    native=copy.deepcopy(self.native);mount=native['mounts'][name]
+                    private=name in ('normal-private','resumed-private')
+                    if change=='missing-mode':del mount['mode']
+                    elif change=='wrong-mode':
+                        mount['mode']='ro' if private else 'private'
+                        mount['actual_mount_command'][2]=mount['actual_mount_command'][2].replace('rw,','ro,') if private else mount['actual_mount_command'][2].replace('ro,','rw,')
+                        mount['mount_table_entry']=mount['mount_table_entry'].replace('read-only,','') if not private else mount['mount_table_entry'].replace(' (',' (read-only,')
+                    else:
+                        access='rw' if private else 'ro'
+                        mount['actual_mount_command'][2]=mount['actual_mount_command'][2].replace(access+',',('ro' if private else 'rw')+',' if change=='wrong-argv' else '')
+                    for row in native['commands']:
+                        if row.get('name')==name+'-mount':row['command']=mount['actual_mount_command']
+                    self.assertNotEqual(self.state(native,'mount'),'passed')
+
+    def test_both_lock_details_require_structured_flock_contention(self):
+        for name in ('readonly','private'):
+            for change in ('missing','acquired','open','wrong-errno','wrong-exit'):
+                with self.subTest(name=name,change=change):
+                    native=copy.deepcopy(self.native)
+                    lock=native['cases'][name]['observed']['locks_observation']
+                    if change=='missing':del lock['detail']
+                    elif change=='acquired':lock['detail'].update(state='acquired',contender_returncode=0)
+                    elif change=='open':lock['detail']['operation']='open'
+                    elif change=='wrong-errno':lock['detail']['errno']=2
+                    else:lock['detail']['contender_returncode']=1
+                    self.assertNotEqual(self.state(native,'readonly_view' if name=='readonly' else 'private_writes'),'passed')
+
+    def test_final_cleanup_fields_must_be_explicit_empty_lists(self):
+        for key in ('cleanup_errors','remaining_owned_resources'):
+            for change in ('missing',None,False,'',{},0):
+                with self.subTest(key=key,change=change):
+                    native=copy.deepcopy(self.native)
+                    if change=='missing':del native[key]
+                    else:native[key]=change
+                    self.assertNotEqual(self.state(native,'cleanup'),'passed')
+
     def test_failed_worker_cannot_pass_from_outer_flag(self):
         self.native['cases']['partial-cold']['state']='failed'
         self.assertNotEqual(self.state(self.native,'partial_cold'),'passed')

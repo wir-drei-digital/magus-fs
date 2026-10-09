@@ -48,14 +48,21 @@ def summarize_macos(native, journey, chunk, evidence):
         root=get(name,'root_metadata','detail')
         return (isinstance(root,dict) and len(actor)==2 and root.get('uid')==actor[0]
                 and root.get('gid')==actor[1] and root.get('mode')==0o755)
+    def locks_ok(name):
+        detail=get(name,'locks_observation','detail')
+        # Darwin EAGAIN/EWOULDBLOCK are both35, even when parsing on Linux.
+        return (isinstance(detail,dict) and detail.get('state')=='contended'
+                and detail.get('operation')=='flock' and type(detail.get('errno')) is int
+                and detail['errno']==35 and detail.get('contender_returncode')==75
+                and bool(detail.get('command')))
     def metadata_ok(name):
         expected=[{'path':entry['path'],'uid_gid_mode':[entry['uid'],entry['gid'],entry['mode']]} for entry in manifest.get('entries',[])]
         return bool(expected) and get(name,'metadata_permissions','detail')==expected
     readonly_required=BASE+tuple('readonly_'+op for op in ('write','truncate','chmod','unlink','rename','create'))
-    ro=states('readonly',readonly_required) and root_ok('readonly') and metadata_ok('readonly')
+    ro=states('readonly',readonly_required) and root_ok('readonly') and metadata_ok('readonly') and locks_ok('readonly')
     ro=ro and all(errno_ok(get('readonly','readonly_'+op,'detail'),(errno.EROFS,errno.EACCES,errno.EPERM)) for op in ('write','truncate','chmod','unlink','rename','create'))
     private_required=BASE+('private_writes','rename_replacement_old_handle','private_execute0755','old_handle_mmap_visibility')
-    private=states('private',private_required) and root_ok('private') and metadata_ok('private')
+    private=states('private',private_required) and root_ok('private') and metadata_ok('private') and locks_ok('private')
     private=private and errno_ok(get('private','private_execute0644_denied')) and get('private','private_execute0755','stdout')=='synthetic\n'
     private=private and get('private','rename_replacement_old_handle','errno')==errno.EROFS and get('private','rename_replacement_old_handle','observed_support')=='unsupported CREATE; replacement was not performed'
     rename=get('private','rename_existing_classification')
@@ -106,8 +113,18 @@ def summarize_macos(native, journey, chunk, evidence):
         actual=mount.get('actual_mount_command',[])
         rows=[row for row in commands if row.get('name')==name+'-mount']
         row=mount.get('mount_table_entry','')
+        expected_mode='private' if name in ('normal-private','resumed-private') else 'ro'
+        access='rw' if expected_mode=='private' else 'ro'
+        argv_options=set(actual[2].split(',')) if len(actual)==5 and isinstance(actual[2],str) else set()
+        server=mount.get('server_command',[])
+        mode_index=server.index('--mode') if '--mode' in server else -1
+        requested_mode=server[mode_index+1] if 0<=mode_index<len(server)-1 else None
         mounted=mounted and (point==native.get('owned_output','')+'/mount-'+name and bool(row) and ' on '+point+' (' in row
-                            and ('read-only' in row)==(mount.get('mode')=='ro')
+                            and mount.get('mode')==expected_mode and requested_mode==expected_mode
+                            and ('read-only' in row)==(expected_mode=='ro')
+                            and {access,'locallocks','vers=3','tcp','actimeo=1'}<=argv_options
+                            and ('ro' if access=='rw' else 'rw') not in argv_options
+                            and actual[:2]==['/sbin/mount_nfs','-o']
                             and len(actual)==5 and actual[-1]==point and len(rows)==1 and rows[0].get('command')==actual and command_ok(rows[0])
                             and {'locallocks','vers=3','tcp'}<=options and 'nolocks' not in options
                             and {key+'=1' for key in ('acregmin','acregmax','acdirmin','acdirmax','acrootdirmin','acrootdirmax')}<=options
@@ -122,7 +139,7 @@ def summarize_macos(native, journey, chunk, evidence):
            and len(owned)==len(set(owned))==15 and {item.get('pid') for item in reaped}==set(owned) and len(reaped)==len(owned)
            and {mount.get('pid') for mount in mounts.values()}<=set(owned) and all(type(item.get('returncode')) is int for item in reaped)
            and all(command_ok(row) for row in commands) and bool(commands)
-           and not native.get('cleanup_errors') and not native.get('remaining_owned_resources') and not native.get('remaining_owned_command_pids')
+           and native.get('cleanup_errors')==[] and native.get('remaining_owned_resources')==[] and not native.get('remaining_owned_command_pids')
            and not native.get('cleanup_pending') and not native.get('cleanup_interrupts') and native.get('state')=='passed' and native.get('passed') is True and not native.get('error'))
     transfer=native.get('transfer',{})
     def report_case(names,expected,passed,detail=None):
@@ -143,13 +160,16 @@ def summarize_macos(native, journey, chunk, evidence):
         'partial_warm':report_case(('partial-warm',),'warm repetition adds zero source content bytes',get('partial-warm','exact_head_tail') is True and validate_content_profile(transfer)),
         'full_scan':report_case(('full-scan',),'actual64MiB scan equals independently known fixture SHA-256; exact deltas recorded',observed('full-scan')==transfer.get('full_scan') and validate_content_profile(transfer)),
         'cleanup':{'state':'passed' if clean else 'failed','expected':'all13 owned mounts absent; all15 owned PIDs reaped; no unresolved commands/interrupts/unknown cleanup',
-                   'observed':{'cleanup':cleanup,'reaped':reaped,'remaining':native.get('remaining_owned_resources'),'interrupts':native.get('cleanup_interrupts')},
+                   'observed':{'cleanup':cleanup,'reaped':reaped,'cleanup_errors':native.get('cleanup_errors'),'remaining':native.get('remaining_owned_resources'),'interrupts':native.get('cleanup_interrupts')},
                    'command':[row['command'] for row in commands if row.get('name','').endswith('-unmount') and row.get('command')]},
     }
     profile_cases['mount']['command']=[row['command'] for row in commands if row.get('name')=='readonly' or row.get('name','').endswith(('-mount','-mount-table','-effective-options'))]
+    def resource_list(key):
+        raw=native.get(key)
+        return raw if isinstance(raw,list) else []
     return {'journey':journey,'chunk_size':chunk,'manifest_digest':digest,'owned_token':native.get('owned_token'),
-            'cases':profile_cases,'transfer':transfer,'cleanup_errors':native.get('cleanup_errors',[]),
-            'remaining_owned_resources':[*native.get('remaining_owned_resources',[]),*native.get('remaining_owned_command_pids',[])],
+            'cases':profile_cases,'transfer':transfer,'cleanup_errors':resource_list('cleanup_errors'),
+            'remaining_owned_resources':[*resource_list('remaining_owned_resources'),*resource_list('remaining_owned_command_pids')],
             'owned_resources':{'pids':owned,'command_pids':[row['pid'] for row in commands if 'pid' in row],'mountpoints':list(expected_paths),'output':native.get('owned_output')},
             'fixture_identity':native.get('fixture_identity'),'fixture_uid_gid':native.get('fixture_uid_gid'),'additional_fixture_digests':native.get('generation_digests'),
             'root_metadata':get('readonly','root_metadata','detail'),'source_revision':native.get('revision'),'binary_sha256':native.get('binary_sha256'),'environment':native.get('environment'),

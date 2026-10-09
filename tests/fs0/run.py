@@ -7,6 +7,7 @@ import sys
 
 from inventory import collect
 from macos_report import summarize_macos
+from macos_supervisor import Interrupts
 from preflight import check
 from qualification import aggregate, CHUNKS, owned_containers_absent
 from resources import OwnedOutput
@@ -94,11 +95,19 @@ def run_native_profile(runner, normalizer, output, runner_args, journey, chunk):
             runner_error['command'] = error.cmd
         if hasattr(error, 'timeout'):
             runner_error['timeout'] = error.timeout
+        if hasattr(error,'supervision'):
+            profile['supervision']=error.supervision
+            runner_error['supervision_evidence']=error.supervision.get('evidence')
         profile['orchestration_error'] = runner_error
     profile['native_returncode'] = code
     profile['profile_started'] = output.is_dir()
     try:
-        native = json.loads(evidence.read_text())
+        try:
+            native = json.loads(evidence.read_text())
+        except (OSError,ValueError):
+            native=profile.get('supervision',{}).get('native_snapshot')
+            if not native:
+                raise
         if not isinstance(native, dict):
             raise ValueError('native report must be a JSON object')
         profile.update(normalizer(native,journey,chunk,evidence))
@@ -107,7 +116,17 @@ def run_native_profile(runner, normalizer, output, runner_args, journey, chunk):
     if runner_error or 'native_report_error' in profile:
         if native is not None:
             profile['native_report_snapshot'] = native
-    if runner_error and (native is not None or profile['profile_started']):
+    supervision_file=output.with_name(output.name+'.supervision.json')
+    if 'supervision' not in profile and supervision_file.exists():
+        profile['supervision']=json.loads(supervision_file.read_text())
+    supervision=profile.get('supervision')
+    if supervision:
+        resources=profile.setdefault('owned_resources',{})
+        resources['supervisor_runner_pids']=[supervision['runner_pid']]
+        resources['supervision_evidence']=supervision.get('evidence')
+        if supervision.get('runner_alive'):
+            profile['remaining_owned_resources'].append('retained native runner PID '+str(supervision['runner_pid']))
+    if runner_error and (native is not None or profile['profile_started'] or supervision):
         profile['cleanup_errors'].append({'phase':'native_runner_exception', **runner_error})
         cleanup = profile['cases'].setdefault('cleanup', {'expected':'verified owned-resource cleanup', 'command':[]})
         cleanup.update(state='failed', observed={'native_cleanup':cleanup.get('observed'), 'exception':runner_error})
@@ -139,6 +158,11 @@ def run_macos_profile(runner, output, journey, chunk, uid, gid):
 
 
 def main(argv=None):
+    with Interrupts() as interrupts:
+        return matrix_main(argv,interrupts)
+
+
+def matrix_main(argv,interrupts):
     parser = argparse.ArgumentParser()
     parser.add_argument('--preflight',action='store_true')
     parser.add_argument('--platform',choices=('all','linux','macos'),default='all')
@@ -185,6 +209,9 @@ def main(argv=None):
                         print(f'Linux fresh journey{journey}, chunk_size{chunk}',flush=True)
                         profile, state, reason = run_linux_profile(run,output,args.image,journey,chunk,args.fixture_uid,args.fixture_gid)
                         platform['profiles'].append(profile)
+                        if interrupts.count and state=='passed':
+                            profile['state']=state='failed'
+                            reason='parent interrupted'
                         if state != 'passed':
                             platform.update(state=state,reason=reason)
                             stopped = True
@@ -195,16 +222,21 @@ def main(argv=None):
                         break
                 if not stopped:
                     platform['state'] = 'passed'
-        if args.platform in ('all','macos'):
+        if args.platform in ('all','macos') and not interrupts.count:
             platform = result['platforms']['macos'] = {'state':'blocked','profiles':[]}
-            from macos_run import run
+            from macos_supervisor import run
+            def supervised(output,*options):
+                return run(output,*options,interrupts=interrupts)
             stopped = False
             for journey in (1,2):
                 for chunk in CHUNKS:
                     output = owned.path / f'macos-{journey}-{chunk}'
                     print(f'Mac fresh journey{journey}, chunk_size{chunk}',flush=True)
-                    profile, state, reason = run_macos_profile(run,output,journey,chunk,args.fixture_uid,args.fixture_gid)
+                    profile, state, reason = run_macos_profile(supervised,output,journey,chunk,args.fixture_uid,args.fixture_gid)
                     platform['profiles'].append(profile)
+                    if interrupts.count and state=='passed':
+                        profile['state']=state='failed'
+                        reason='parent interrupted'
                     if state != 'passed':
                         platform.update(state=state,reason=reason)
                         stopped = True
@@ -217,6 +249,9 @@ def main(argv=None):
                 platform['state'] = 'passed'
     required = ('linux','macos') if args.platform == 'all' else (args.platform,)
     result.update(aggregate(result['platforms'],required))
+    if interrupts.count:
+        result.update(state='failed',passed=False,exit_code=1,parent_interrupts=interrupts.count)
+        result.setdefault('failures',[]).append('parent interrupted; inspect retained owned profile resources')
     result['cleanup_errors'] = owned.cleanup(remove_output=False)
     if result['cleanup_errors']:
         result.update(state='failed',passed=False,exit_code=1)

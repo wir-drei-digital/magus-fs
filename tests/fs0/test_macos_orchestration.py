@@ -1,4 +1,6 @@
 """Real coordinator over synthetic native-report writers; no native mount actions."""
+import contextlib
+import io
 import copy
 import json
 from pathlib import Path
@@ -7,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import macos_run
+import macos_supervisor
 import run
 from permission_source import project_manifest
 
@@ -42,18 +44,18 @@ class MacCoordinator(unittest.TestCase):
             return subprocess.CompletedProcess(args,0,'synthetic revision','')
         with tempfile.TemporaryDirectory(prefix='fs0-mac-coordinator-') as folder:
             output=Path(folder)/'combined'
-            with patch.object(run,'collect',return_value={'scope':'synthetic inventory'}),patch.object(run.subprocess,'run',side_effect=prerequisite),patch.object(macos_run,'run',side_effect=runner):
+            with patch.object(run,'collect',return_value={'scope':'synthetic inventory'}),patch.object(run.subprocess,'run',side_effect=prerequisite),patch.object(macos_supervisor,'run',side_effect=runner),patch('macos_run.run',side_effect=AssertionError('unbounded native call forbidden in unit test')),contextlib.redirect_stdout(io.StringIO()):
                 code=run.main(['--platform','macos','--output',str(output)])
             return code,json.loads((output/'result.json').read_text())
     def test_schedules_two_fresh_three_size_journeys(self):
-        def runner(output,prepare,chunk,uid,gid):
+        def runner(output,prepare,chunk,uid,gid,**kwargs):
             self.assertFalse(prepare);self.assertEqual((uid,gid),(501,20))
             output.mkdir();(output/'result.json').write_text(json.dumps(native_fixture(output,chunk)));return 0
         code,result=self.execute(runner)
         self.assertEqual(code,0)
         self.assertEqual([(p['journey'],p['chunk_size']) for p in result['platforms']['macos']['profiles']],[(j,c) for j in (1,2) for c in (65536,262144,1048576)])
     def test_existing_mac_failure_and_escaping_cleanup_timeout_preserve_resources(self):
-        def runner(output,prepare,chunk,uid,gid):
+        def runner(output,prepare,chunk,uid,gid,**kwargs):
             output.mkdir();report=native_fixture(output,chunk)
             report.update(passed=False,state='failed',error='synthetic mounted read failure',cleanup_errors=['synthetic cleanup timeout'],remaining_owned_resources=[str(output/'mount-normal-ro')])
             report['cases']['partial-cold']['state']='failed'
@@ -68,6 +70,23 @@ class MacCoordinator(unittest.TestCase):
         self.assertEqual(profile['orchestration_error']['type'],'TimeoutExpired')
         self.assertTrue(profile['native_report_snapshot'])
         self.assertTrue(profile['remaining_owned_resources'])
+    def test_pending_supervised_runner_fails_and_retains_exact_child(self):
+        def runner(output,prepare,chunk,uid,gid,**kwargs):
+            output.mkdir();report=native_fixture(output,chunk)
+            report.update(state='cleanup_pending',passed=False,cleanup_errors=['synthetic pending'],remaining_owned_resources=[str(output/'mount-normal-ro')])
+            (output/'result.json').write_text(json.dumps(report))
+            record={'state':'failed_pending','reason':'native cleanup pending','runner_pid':999999,'runner_alive':True,'native_snapshot':report,
+                    'native_evidence':str(output/'result.json'),'recovery_action':{'instruction':'retain serving child'}}
+            raise macos_supervisor.SupervisionFailure(record)
+        code,result=self.execute(runner)
+        self.assertEqual(code,1)
+        profile=result['platforms']['macos']['profiles'][0]
+        self.assertEqual(profile['supervision']['runner_pid'],999999)
+        self.assertIn(999999,profile['owned_resources']['supervisor_runner_pids'])
+        self.assertTrue(profile['supervision']['recovery_action'])
+        self.assertTrue(profile['remaining_owned_resources'])
+        self.assertEqual(len(result['platforms']['macos']['profiles']),1)
+
     def test_missing_mac_launcher_is_blocked(self):
         def runner(*args):raise FileNotFoundError('synthetic missing prerequisite')
         code,result=self.execute(runner)
