@@ -6,7 +6,7 @@ The project targets macOS and Linux first. Its core scope includes full local re
 
 ## Current state
 
-The unmerged `codex/fs-poc` branch contains the qualified FS0 mount checkpoint and FS1's durable local engine, lazy Linux FUSE/macOS NFS adapters, private revisions and independent recovery archives. The [FS1 combined qualification runbook](docs/fs1-qualification.md) defines two fresh V1–V12 journeys per OS, source/binary/image provenance and fail-closed cleanup. Task and whole-range reviews remain separate completion gates. No filesystem release, shared synchronization or integrated PoC is claimed.
+The unmerged `codex/fs-poc` branch contains the qualified FS0 mount checkpoint and FS1's durable local engine, lazy Linux FUSE/macOS NFS adapters, private revisions and independent recovery archives. The [FS1 combined qualification runbook](docs/fs1-qualification.md) defines two fresh V1–V12 journeys per OS, source/binary/image provenance and fail-closed cleanup. FS1 task, whole-range and scoped correction reviews are complete at code `b9e3fe1`; see the runbook for the distinct original-matrix and correction evidence. No filesystem release, shared synchronization or integrated PoC is claimed.
 
 Run the complete FS1 gate on the qualified macOS host with Rancher Desktop running:
 

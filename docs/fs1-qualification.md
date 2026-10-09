@@ -64,3 +64,21 @@ Durable local working bytes, a private captured revision and future shared publi
 The retained combined run at `/private/tmp/fs1-combined-2/result.json` passed48 V-case results across two fresh journeys per OS. It records the actual dirty source snapshot based on `efe631a`,129 contributing source hashes, and image `sha256:29a1304ef9d737aa422623f4658877c69b22f7a43d4365e9938bb37eab05a40c`. A separate final audit confirmed those sources and absence of every recorded owned host PID, native mountpoint, container and Linux VM path. Task and whole-FS1 reviews remain separate prerequisites for milestone qualification.
 
 Both journeys measured metadata0 bytes, macOS cold1,310,720 bytes and Linux cold524,288 bytes, with warm0 additional bytes. Every64MiB scan matched SHA256 `0d9f8390657caaf114fa00a6a191f1559b488bb89f7c61b9e8d95b392330c3e4`. Offline missing-base EIO returned within0.057s on macOS and0.004s on Linux. Mac full-scan cumulative source count was67,723,304 bytes including earlier binary/partial-write checks; Linux's full-scan count was67,108,864 bytes. All observed native errors, acknowledged/recovered heads and exact command logs remain in the report. The earlier `/private/tmp/fs1-combined-1` failure is retained separately: its newly added full-closure scan had legitimately warmed the later offline-negative file, fixed by isolating the parity replica.
+
+## Qualified local FS1 milestone
+
+FS1 is qualified at code `b9e3fe197adf09c60014774cf6ddc7f721edb036`, following all eight task reviews, the whole-FS1 review and one scoped correction review. This is an unmerged development checkpoint, not a runtime release or FS2 synchronization claim.
+
+The whole review corrected three supported interactions: native capture beneath a searchable non-writable parent, current permission presentation on historical mounts, and recovery pins whose selected ancestry contains never-fetched chunks. The corrected code passed host111/Linux114 primary Rust tests plus one nested worker each, fmt/clippy, host/Linux CLI18 each, Mac wire8, and focused native history15 Linux/7 Mac cases. Normal unmount and exact owned-resource cleanup were verified. The independent review found all four findings (including prune documentation) addressed and no new Critical/Important breakage.
+
+Correction evidence is `/private/tmp/fs1-final-fix`, with130 contributing source hashes and final image `sha256:1deff50cf288c3a6abd4945248c984c950dcd06f1686408902a0b4303167e0c4`. Host binary hash is `fe3a5c11d036c86d357ff6c176a9bc1ecafcb8259d68f8a98758b71da67dc7c1`; Linux is `8b2faff726b21717ff80b2bc4b196dc7982bc284ce465221aa765e497155b699`. The original48-case combined run and later validator-only normalization retain their original source/image identities; they were not rerun or relabeled for these corrections.
+
+The additional historical-permission runner uses real native mounts:
+
+```sh
+python3 tests/fs1/history_permissions.py --binary ABSOLUTE_MAGUS_FS_BINARY --output ABSOLUTE_NEW_SHORT_PATH
+```
+
+On Linux, run it inside the existing owned FUSE qualification container setup, not an unrestricted host or arbitrary root shell. Exact container argv is retained in `linux-native-history-final.command.json` under the correction evidence. macOS uses the existing fixed-actor loopback profile. The runner does not replace the full combined gate.
+
+Historical native traversal still requires current rights on each traversed historical directory identity. Moving a readable file elsewhere does not grant search through a former directory whose current mode denies search or whose identity was deleted. Explicit export/restore retains its separate, current retained-history grant policy. This preserves the declared authority boundary; no broader moved-path native guarantee is claimed.
