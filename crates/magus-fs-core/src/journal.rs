@@ -139,6 +139,10 @@ impl Journal {
   CREATE TABLE IF NOT EXISTS native (singleton INTEGER PRIMARY KEY CHECK(singleton=1), configuration BLOB NOT NULL, scan BLOB);
   CREATE TABLE IF NOT EXISTS materializations (id TEXT PRIMARY KEY, manifest BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS sync_binding (singleton INTEGER PRIMARY KEY CHECK(singleton=1), value BLOB NOT NULL);
+  CREATE TABLE IF NOT EXISTS live_authority_history (generation INTEGER PRIMARY KEY, revision TEXT);
+  CREATE TABLE IF NOT EXISTS live_authority (singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision TEXT);
+  CREATE TABLE IF NOT EXISTS sync_sources (id TEXT PRIMARY KEY, binding BLOB NOT NULL);
+  CREATE TABLE IF NOT EXISTS revision_sources (revision TEXT PRIMARY KEY, source BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS sync_queue (operation TEXT PRIMARY KEY, record BLOB NOT NULL);
   PRAGMA user_version=1;")?;
         let encoded = serde_json::to_vec(&config).map_err(|_| FsError::InvalidDescriptor)?;

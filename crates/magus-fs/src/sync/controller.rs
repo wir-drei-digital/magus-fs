@@ -100,7 +100,7 @@ impl SyncController {
         let config = rep.configuration()?;
         let execution = SyncExecution::for_replica(&config.replica)?;
         let transport = Transport::new(binding, &config)?;
-        rep.set_remote_fetcher(Arc::new(transport.clone()))?;
+        super::live::install_sources(rep, None)?;
         Ok(Self {
             rep: rep.clone(),
             transport,
@@ -144,7 +144,20 @@ impl SyncController {
             .ok_or(FsError::NotFound)?;
         self.target_tick(p, deadline)
     }
-    fn target_tick(&self, mut p: SyncProgress, deadline: Instant) -> Result<SyncProgress, FsError> {
+    fn target_tick(&self, p: SyncProgress, deadline: Instant) -> Result<SyncProgress, FsError> {
+        let mut transport = Transport::new(
+            self.rep.submission_binding(&p.operation)?,
+            &self.rep.configuration()?,
+        )?;
+        transport.counters = self.transport.counters.clone();
+        Self {
+            rep: self.rep.clone(),
+            transport,
+            execution: self.execution.clone(),
+        }
+        .run_target(p, deadline)
+    }
+    fn run_target(&self, mut p: SyncProgress, deadline: Instant) -> Result<SyncProgress, FsError> {
         for attempt in 0..3 {
             if attempt > 0 {
                 self.transport.counters.lock().unwrap().retries += 1;
@@ -426,7 +439,18 @@ impl SyncController {
     ) -> Result<SyncProgress, FsError> {
         let mut p = self.get(revision)?;
         if level == DurabilityLevel::Applied {
-            return Err(FsError::UnsupportedMode);
+            // Incoming adoption needs the same gate: never hold it while awaiting native ACK.
+            if !p.reached(DurabilityLevel::Shared) {
+                p = self.drain(revision, DurabilityLevel::Shared, deadline)?;
+            }
+            while !p.reached(level) && Instant::now() < deadline {
+                std::thread::sleep(
+                    Duration::from_millis(100)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+                p = self.get(revision)?;
+            }
+            return Ok(p);
         }
         let deadline = deadline.min(Instant::now() + Duration::from_secs(60));
         if p.reached(level) {
@@ -575,6 +599,16 @@ pub fn attach(
     Ok(
         json!({"ok":true,"binding":binding,"counters":*t.counters.lock().unwrap(),"applied_revision":null}),
     )
+}
+
+/// Trusted profile configuration selects attribution; no workload/control request may supply it.
+pub(crate) fn publication_actor(rep: &Replica, fallback: Actor) -> Result<Actor, FsError> {
+    match rep.sync_status()?.binding {
+        Some(binding) => {
+            Transport::new(binding, &rep.configuration()?)?.publication_actor(fallback)
+        }
+        None => Ok(fallback),
+    }
 }
 
 #[cfg(test)]

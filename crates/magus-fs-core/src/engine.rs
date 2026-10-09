@@ -57,6 +57,12 @@ use std::{
 };
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Working {
+    #[serde(default)]
+    pub(crate) epoch: u64,
+    #[serde(default)]
+    pub(crate) remote_source: Option<crate::protocol::RemoteSourceId>,
+    #[serde(default)]
+    pub(crate) applied: bool,
     pub(crate) base: RevisionId,
     pub(crate) head: RevisionId,
     pub(crate) generation: u64,
@@ -71,6 +77,7 @@ pub(crate) struct Core {
     pub(crate) config: ReplicaConfig,
     pub(crate) working: Option<Working>,
     handles: Vec<Weak<HandleData>>,
+    pub(crate) epochs: BTreeMap<u64, Working>,
     pub(crate) remote_fetcher: Option<Arc<dyn RemoteFetcher>>,
 }
 #[derive(Clone)]
@@ -90,12 +97,16 @@ struct HandleData {
     mode: OpenMode,
     workspace: OperationId,
     generation: u64,
+    epoch: u64,
 }
 #[derive(Clone)]
 pub struct Handle {
     inner: Arc<HandleData>,
 }
 impl Handle {
+    pub fn epoch(&self) -> u64 {
+        self.inner.epoch
+    }
     pub fn entry_id(&self) -> &EntryId {
         &self.inner.entry.id
     }
@@ -125,7 +136,20 @@ pub(crate) fn from_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<
     serde_json::from_slice(bytes).map_err(|_| FsError::InvalidDescriptor)
 }
 impl Core {
-    fn working(&self) -> Result<&Working, FsError> {
+    pub(crate) fn retain_epoch(&mut self, old: Working) {
+        self.handles.retain(|h| h.strong_count() > 0);
+        let live: BTreeSet<_> = self
+            .handles
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|h| h.epoch)
+            .collect();
+        self.epochs.retain(|epoch, _| live.contains(epoch));
+        if live.contains(&old.epoch) {
+            self.epochs.insert(old.epoch, old);
+        }
+    }
+    pub(crate) fn working(&self) -> Result<&Working, FsError> {
         self.working.as_ref().ok_or(FsError::BaseMismatch)
     }
     pub(crate) fn revision(&self, id: &RevisionId) -> Result<Revision, FsError> {
@@ -152,6 +176,7 @@ impl Core {
             .checked_add(1)
             .ok_or(FsError::LimitExceeded)?;
         next.dirty = true;
+        next.applied = false;
         self.handles.retain(|h| h.strong_count() > 0);
         let live: BTreeSet<_> = self
             .handles
@@ -212,6 +237,14 @@ impl Core {
             }
         }
         for h in self.handles.iter().filter_map(Weak::upgrade) {
+            if let Some(epoch) = self.epochs.get(&h.epoch) {
+                protected.extend(cache::object_set(&epoch.tree));
+                for e in &epoch.orphans {
+                    let mut ids = BTreeMap::new();
+                    cache::entry_objects(e, &mut ids);
+                    protected.extend(ids.into_keys());
+                }
+            }
             let mut ids = BTreeMap::new();
             cache::entry_objects(&h.entry, &mut ids);
             protected.extend(ids.into_keys());
@@ -460,6 +493,32 @@ impl Core {
             source.fetch(id, size, deadline)
         }
     }
+    pub(crate) fn fetch_from(
+        &mut self,
+        source: &ChunkSource,
+        id: &ObjectId,
+        size: u64,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, FsError> {
+        match self.objects.read_verified(id) {
+            Ok(bytes) => {
+                if bytes.len() as u64 != size {
+                    return Err(FsError::CorruptObject);
+                }
+                return Ok(bytes);
+            }
+            Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        self.reserve(&BTreeMap::from([(id.clone(), size)]))?;
+        let bytes = self.fetch_source(source, id, size, deadline)?;
+        self.objects.install(&bytes)?;
+        self.journal.db.execute(
+            "INSERT OR REPLACE INTO cache VALUES(?,?)",
+            params![id.as_str(), size as u32],
+        )?;
+        Ok(bytes)
+    }
     pub(crate) fn fetch(
         &mut self,
         id: &ObjectId,
@@ -572,6 +631,7 @@ impl Replica {
             config,
             working,
             handles: vec![],
+            epochs: BTreeMap::new(),
             remote_fetcher: None,
         };
         // Unlinked open handles die with their process; immutable bodies are retained until explicit pruning.
@@ -629,6 +689,10 @@ impl Replica {
             "INSERT OR IGNORE INTO revisions VALUES(?,?)",
             params![id.as_str(), canonical],
         )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO revision_sources VALUES(?,?)",
+            params![id.as_str(), json(&source)?],
+        )?;
         for (object, size) in cache::closure(&r.tree) {
             let old = tx
                 .query_row(
@@ -671,6 +735,23 @@ impl Replica {
                 }
             } else {
                 let w = Working {
+                    epoch: 0,
+                    remote_source: core
+                        .journal
+                        .db
+                        .query_row(
+                            "SELECT source FROM revision_sources WHERE revision=?",
+                            [base.as_str()],
+                            |r| r.get::<_, Vec<u8>>(0),
+                        )
+                        .optional()?
+                        .map(|b| from_json::<ChunkSource>(&b))
+                        .transpose()?
+                        .and_then(|s| match s {
+                            ChunkSource::Remote { source } => Some(source),
+                            _ => None,
+                        }),
+                    applied: false,
                     base: base.clone(),
                     head: base.clone(),
                     generation: 0,
@@ -692,6 +773,37 @@ impl Replica {
             view: read_only.then_some(r),
             token: OperationId::random()?,
         })
+    }
+    pub fn begin_live(
+        &self,
+        base: &RevisionId,
+        actor: Actor,
+        read_only: bool,
+    ) -> Result<Workspace, FsError> {
+        let mut ws = self.begin(base, actor, false)?;
+        ws.read_only = read_only;
+        let mut core = lock(&self.core)?;
+        if core.working()?.remote_source.is_none() {
+            if let Some(bytes) = core
+                .journal
+                .db
+                .query_row(
+                    "SELECT value FROM sync_binding WHERE singleton=1",
+                    [],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .optional()?
+            {
+                let binding: SyncBinding = from_json(&bytes)?;
+                let mut w = core.working()?.clone();
+                w.remote_source = Some(binding.source);
+                core.journal
+                    .db
+                    .execute("UPDATE working SET value=? WHERE singleton=1", [json(&w)?])?;
+                core.working = Some(w);
+            }
+        }
+        Ok(ws)
     }
     pub fn status(&self) -> Result<ReplicaStatus, FsError> {
         let mut core = lock(&self.core)?;
@@ -829,10 +941,71 @@ impl Workspace {
         })
     }
     fn actor<'a>(&self, core: &'a Core) -> Result<&'a Authority, FsError> {
+        if self.view.is_none() {
+            let authority = core
+                .journal
+                .db
+                .query_row(
+                    "SELECT revision FROM live_authority WHERE singleton=1",
+                    [],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            if authority == Some(None) {
+                return Err(FsError::PermissionDenied);
+            }
+        }
         perm::authority(&core.config, &self.actor)
     }
     fn access(&self, core: &Core, e: &Entry, bits: u16) -> Result<(), FsError> {
         let a = self.actor(core)?;
+        if self.view.is_none() {
+            if let Some(Some(id)) = core
+                .journal
+                .db
+                .query_row(
+                    "SELECT revision FROM live_authority WHERE singleton=1",
+                    [],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+            {
+                let authority = core.revision(&RevisionId::parse(id)?)?;
+                let current = if e.id == authority.tree.root.id {
+                    Some(perm::root_entry(&authority.tree))
+                } else {
+                    authority
+                        .tree
+                        .entries
+                        .iter()
+                        .find(|v| v.id == e.id)
+                        .cloned()
+                };
+                if let Some(current) = current {
+                    perm::traversal(&authority.tree, &current.path, a)?;
+                    perm::access(a, &current, bits)?;
+                } else {
+                    let base = core.revision(&core.working()?.base)?;
+                    if base.tree.entries.iter().any(|v| v.id == e.id) {
+                        return Err(FsError::PermissionDenied);
+                    }
+                    // Locally created entries inherit current remote search authority
+                    // through their nearest known parent; absence alone is not revocation.
+                    let parent = if e.parent == core.working()?.tree.root.id {
+                        perm::root_entry(&core.working()?.tree)
+                    } else {
+                        core.working()?
+                            .tree
+                            .entries
+                            .iter()
+                            .find(|p| p.id == e.parent)
+                            .cloned()
+                            .ok_or(FsError::PermissionDenied)?
+                    };
+                    self.access(core, &parent, 1)?;
+                }
+            }
+        }
         if self.view.is_some() {
             if let Some(w) = &core.working {
                 let current = if e.id == w.tree.root.id {
@@ -851,6 +1024,35 @@ impl Workspace {
         }
         perm::access(a, e, bits)
     }
+    fn metadata_owner(&self, core: &Core, entry: &Entry) -> Result<PrincipalId, FsError> {
+        self.access(core, entry, 0)?;
+        if self.view.is_none() {
+            if let Some(Some(id)) = core
+                .journal
+                .db
+                .query_row(
+                    "SELECT revision FROM live_authority WHERE singleton=1",
+                    [],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+            {
+                let authority = core.revision(&RevisionId::parse(id)?)?;
+                if entry.id == authority.tree.root.id {
+                    return Ok(authority.tree.root.owner);
+                }
+                if let Some(e) = authority
+                    .tree
+                    .entries
+                    .into_iter()
+                    .find(|e| e.id == entry.id)
+                {
+                    return Ok(e.owner);
+                }
+            }
+        }
+        Ok(entry.owner.clone())
+    }
     fn resolve_entry(&self, core: &Core, tree: &Tree, path: &str) -> Result<Entry, FsError> {
         if !path.is_empty() {
             crate::paths::validate_path(path)?;
@@ -864,9 +1066,43 @@ impl Workspace {
         self.access(core, &entry, 0)?;
         Ok(entry)
     }
+    fn current_access(&self, core: &Core, entry: &Entry, bits: u16) -> Result<(), FsError> {
+        let tree = &core.working()?.tree;
+        let current = tree
+            .entries
+            .iter()
+            .find(|e| e.id == entry.id)
+            .ok_or(FsError::PermissionDenied)?;
+        perm::traversal(tree, &current.path, self.actor(core)?)?;
+        self.access(core, current, bits)
+    }
+    fn writable_handle(&self, core: &Core, h: &Handle) -> Result<(), FsError> {
+        if h.inner.workspace != self.token || h.inner.epoch != core.working()?.epoch {
+            return Err(FsError::StaleHandle);
+        }
+        Ok(())
+    }
+    pub fn epoch(&self) -> Result<u64, FsError> {
+        Ok(lock(&self.core)?.working()?.epoch)
+    }
     fn handle_entry(&self, core: &Core, h: &Handle) -> Result<Entry, FsError> {
         if h.inner.workspace != self.token {
             return Err(FsError::StaleHandle);
+        }
+        if self.view.is_none() && h.inner.epoch != core.working()?.epoch {
+            let entry = core
+                .epochs
+                .get(&h.inner.epoch)
+                .ok_or(FsError::StaleHandle)?
+                .tree
+                .entries
+                .iter()
+                .chain(&core.epochs[&h.inner.epoch].orphans)
+                .find(|e| e.id == h.inner.entry.id)
+                .cloned()
+                .ok_or(FsError::StaleHandle)?;
+            self.current_access(core, &entry, 0)?;
+            return Ok(entry);
         }
         if self.view.is_some() {
             Ok(h.inner.entry.clone())
@@ -887,6 +1123,7 @@ impl Workspace {
             mode,
             workspace: self.token.clone(),
             generation: core.working.as_ref().map(|w| w.generation).unwrap_or(0),
+            epoch: core.working.as_ref().map(|w| w.epoch).unwrap_or(0),
         });
         core.handles.push(Arc::downgrade(&inner));
         Ok(Handle { inner })
@@ -901,6 +1138,36 @@ impl Workspace {
     pub fn native_attributes(&self, entry: &Entry) -> Result<Entry, FsError> {
         let core = lock(&self.core)?;
         let mut projected = entry.clone();
+        if self.view.is_none() {
+            self.access(&core, entry, 0)?;
+            let remote = core
+                .journal
+                .db
+                .query_row(
+                    "SELECT revision FROM live_authority WHERE singleton=1",
+                    [],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+            let authority = remote
+                .map(|id| core.revision(&RevisionId::parse(id)?))
+                .transpose()?;
+            let tree = authority
+                .as_ref()
+                .map(|r| &r.tree)
+                .unwrap_or(&core.working()?.tree);
+            let current = if entry.id == tree.root.id {
+                Some(perm::root_entry(tree))
+            } else {
+                tree.entries.iter().find(|e| e.id == entry.id).cloned()
+            };
+            if let Some(current) = current {
+                projected.owner = current.owner;
+                projected.group = current.group;
+                projected.mode = current.mode;
+            }
+        }
         if let (Some(view), Some(working)) = (&self.view, &core.working) {
             let historical = perm::entry(&view.tree, &entry.path)?;
             if historical.id != entry.id {
@@ -1058,6 +1325,7 @@ impl Workspace {
         perm::mutation(self.read_only)?;
         let core = lock(&self.core)?;
         let e = if let Some(handle) = handle {
+            self.writable_handle(&core, handle)?;
             let entry = self.handle_entry(&core, handle)?;
             if &entry.id != id {
                 return Err(FsError::NotFound);
@@ -1076,7 +1344,7 @@ impl Workspace {
             };
             self.resolve_entry(&core, &tree, &entry.path)?
         };
-        if e.owner == *self.actor.principal() {
+        if self.metadata_owner(&core, &e)? == *self.actor.principal() {
             Ok(())
         } else {
             self.access(&core, &e, 2)
@@ -1120,7 +1388,11 @@ impl Workspace {
         }
         let mut core = lock(&self.core)?;
         let e = self.handle_entry(&core, handle)?;
-        self.access(&core, &e, 4)?;
+        if self.view.is_none() && handle.inner.epoch != core.working()?.epoch {
+            self.current_access(&core, &e, 4)?;
+        } else {
+            self.access(&core, &e, 4)?;
+        }
         let EntryContent::File { version } = e.content else {
             return Err(FsError::IsDirectory);
         };
@@ -1143,7 +1415,45 @@ impl Workspace {
                         offset: object_offset,
                         ..
                     } => {
-                        let bytes = core.fetch(object, *object_size, deadline)?;
+                        let base = if let Some(view) = &self.view {
+                            revision_id(view)?
+                        } else if handle.inner.epoch != core.working()?.epoch {
+                            core.epochs[&handle.inner.epoch].base.clone()
+                        } else {
+                            core.working()?.base.clone()
+                        };
+                        let epoch_source = if self.view.is_some() {
+                            None
+                        } else if handle.inner.epoch == core.working()?.epoch {
+                            core.working()?.remote_source.clone()
+                        } else {
+                            core.epochs
+                                .get(&handle.inner.epoch)
+                                .and_then(|w| w.remote_source.clone())
+                        };
+                        let source = core
+                            .journal
+                            .db
+                            .query_row(
+                                "SELECT source FROM revision_sources WHERE revision=?",
+                                [base.as_str()],
+                                |r| r.get::<_, Vec<u8>>(0),
+                            )
+                            .optional()?
+                            .map(|b| from_json::<ChunkSource>(&b))
+                            .transpose()?;
+                        let source = if self.view.is_none() {
+                            epoch_source
+                                .map(|source| ChunkSource::Remote { source })
+                                .or(source)
+                        } else {
+                            source
+                        };
+                        let bytes = if let Some(source @ ChunkSource::Remote { .. }) = source {
+                            core.fetch_from(&source, object, *object_size, deadline)?
+                        } else {
+                            core.fetch(object, *object_size, deadline)?
+                        };
                         let start = (object_offset + from - position) as usize;
                         result.extend_from_slice(&bytes[start..start + (to - from) as usize]);
                     }
@@ -1173,6 +1483,7 @@ impl Workspace {
             return Err(FsError::LimitExceeded);
         }
         let mut core = lock(&self.core)?;
+        self.writable_handle(&core, handle)?;
         if handle.inner.mode == OpenMode::Read {
             return Err(FsError::PermissionDenied);
         }
@@ -1236,6 +1547,7 @@ impl Workspace {
             return Err(FsError::LimitExceeded);
         }
         let mut core = lock(&self.core)?;
+        self.writable_handle(&core, handle)?;
         if handle.inner.mode == OpenMode::Read {
             return Err(FsError::PermissionDenied);
         }
@@ -1272,6 +1584,7 @@ impl Workspace {
         let mut next = core.working()?.clone();
         let a = self.actor(core)?;
         let parent = perm::parent_write(&next.tree, path, a)?;
+        self.access(core, &parent, 3)?;
         if perm::entry(&next.tree, path).is_ok() {
             return Err(FsError::AlreadyExists);
         }
@@ -1314,9 +1627,12 @@ impl Workspace {
         let mut core = lock(&self.core)?;
         let mut next = core.working()?.clone();
         let a = self.actor(&core)?;
-        perm::parent_write(&next.tree, from, a)?;
+        let from_parent = perm::parent_write(&next.tree, from, a)?;
+        self.access(&core, &from_parent, 3)?;
         let parent = perm::parent_write(&next.tree, to, a)?;
+        self.access(&core, &parent, 3)?;
         let e = perm::entry(&next.tree, from)?;
+        self.access(&core, &e, 0)?;
         if from == to {
             return Ok(());
         }
@@ -1324,6 +1640,7 @@ impl Workspace {
             return Err(FsError::InvalidPath);
         }
         if let Ok(replaced) = perm::entry(&next.tree, to) {
+            self.access(&core, &replaced, 0)?;
             if (replaced.content == EntryContent::Directory)
                 != (e.content == EntryContent::Directory)
             {
@@ -1354,8 +1671,10 @@ impl Workspace {
         perm::mutation(self.read_only)?;
         let mut core = lock(&self.core)?;
         let mut next = core.working()?.clone();
-        perm::parent_write(&next.tree, path, self.actor(&core)?)?;
+        let parent = perm::parent_write(&next.tree, path, self.actor(&core)?)?;
+        self.access(&core, &parent, 3)?;
         let e = perm::entry(&next.tree, path)?;
+        self.access(&core, &e, 0)?;
         if next
             .tree
             .entries
@@ -1375,7 +1694,7 @@ impl Workspace {
         let mut next = core.working()?.clone();
         perm::traversal(&next.tree, path, self.actor(&core)?)?;
         let mut e = perm::entry(&next.tree, path)?;
-        if e.owner != *self.actor.principal() {
+        if self.metadata_owner(&core, &e)? != *self.actor.principal() {
             return Err(FsError::PermissionDenied);
         }
         e.mode = mode;
@@ -1390,6 +1709,7 @@ impl Workspace {
         perm::ownership_change(&core.config, a, &owner, &group)?;
         perm::traversal(&next.tree, path, a)?;
         let mut e = perm::entry(&next.tree, path)?;
+        self.access(&core, &e, 0)?;
         e.owner = owner;
         e.group = group;
         replace_entry(&mut next, e)?;
@@ -1400,8 +1720,9 @@ impl Workspace {
         perm::mutation(self.read_only)?;
         perm::mode(mode)?;
         let mut core = lock(&self.core)?;
+        self.writable_handle(&core, handle)?;
         let mut entry = self.handle_entry(&core, handle)?;
-        if entry.owner != *self.actor.principal() {
+        if self.metadata_owner(&core, &entry)? != *self.actor.principal() {
             return Err(FsError::PermissionDenied);
         }
         entry.mode = mode;
@@ -1417,8 +1738,10 @@ impl Workspace {
     ) -> Result<(), FsError> {
         perm::mutation(self.read_only)?;
         let mut core = lock(&self.core)?;
+        self.writable_handle(&core, handle)?;
         let mut entry = self.handle_entry(&core, handle)?;
         perm::ownership_change(&core.config, self.actor(&core)?, &owner, &group)?;
+        self.access(&core, &entry, 0)?;
         entry.owner = owner;
         entry.group = group;
         let mut next = core.working()?.clone();

@@ -481,3 +481,193 @@ fn admitted_staged_descriptor_budget_keeps_separate_base_roots_through_prune_res
         candidate_bytes
     );
 }
+
+#[test]
+fn live_binding_advancement_keeps_old_sources_and_rejects_pending_work() {
+    let (d, rep, w, base) = setup();
+    let b = binding(base.clone());
+    rep.configure_sync(b.clone()).unwrap();
+    let mut r = rep.revision(&base).unwrap();
+    r.operation = OperationId::random().unwrap();
+    let next = import(&rep, &r, ChunkSource::Unavailable);
+    let mut newer = b.clone();
+    newer.source = RemoteSourceId::random().unwrap();
+    newer.view = ViewBinding {
+        view: ViewId::random().unwrap(),
+        head: HeadToken::random().unwrap(),
+        revision: next.clone(),
+    };
+    let p = pending(&rep, &b, base.clone());
+    rep.enqueue_submission(p.clone()).unwrap();
+    err(
+        rep.adopt_remote_view(newer.clone(), w.generation().unwrap(), actor()),
+        "dirty_working_state",
+    );
+    assert_eq!(rep.pending_submissions().unwrap(), vec![p.clone()]);
+    let mut progress = rep.sync_status().unwrap().submissions.remove(0);
+    progress.state = SubmissionState::PrivateRemote;
+    progress.private_receipt = Some(PrivateReceipt {
+        operation: p.operation.clone(),
+        replica: config().replica,
+        submitted_revision: base,
+        original_view: b.view.view.clone(),
+        original_head: b.view.head.clone(),
+        receipt: ReceiptId::random().unwrap(),
+    });
+    rep.record_sync_progress(&p.operation, SubmissionState::Queued, progress.clone())
+        .unwrap();
+    rep.adopt_remote_view(newer.clone(), w.generation().unwrap(), actor())
+        .unwrap();
+    assert_eq!(rep.sync_status().unwrap().submissions[0], progress);
+    assert_eq!(rep.sync_sources().unwrap().len(), 2);
+    drop(w);
+    drop(rep);
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    assert_eq!(rep.sync_status().unwrap().binding, Some(newer));
+    assert!(rep.sync_sources().unwrap().contains(&b));
+}
+
+#[test]
+fn registered_incoming_source_is_immutable_and_can_be_adopted() {
+    let (_d, rep, w, base) = setup();
+    let original = binding(base.clone());
+    rep.configure_sync(original.clone()).unwrap();
+    let mut r = rep.revision(&base).unwrap();
+    r.operation = OperationId::random().unwrap();
+    let next = import(&rep, &r, ChunkSource::Unavailable);
+    let mut incoming = original.clone();
+    incoming.source = RemoteSourceId::random().unwrap();
+    incoming.view = ViewBinding {
+        view: ViewId::random().unwrap(),
+        head: HeadToken::random().unwrap(),
+        revision: next,
+    };
+    rep.register_sync_source(incoming.clone()).unwrap();
+    rep.observe_remote_authority(
+        Some(&incoming.view.revision),
+        rep.live_status().unwrap().authority_generation,
+    )
+    .unwrap();
+    assert_eq!(
+        rep.live_status().unwrap().pending_source,
+        Some(incoming.source.clone())
+    );
+    let mut retargeted = incoming.clone();
+    retargeted.view.view = ViewId::random().unwrap();
+    err(rep.register_sync_source(retargeted), "config_mismatch");
+    rep.adopt_remote_view(incoming.clone(), w.generation().unwrap(), actor())
+        .unwrap();
+    assert_eq!(rep.sync_status().unwrap().binding, Some(incoming));
+    assert!(rep.sync_sources().unwrap().contains(&original));
+}
+
+#[test]
+fn applied_receipt_requires_matching_shared_head_and_adapter_ack() {
+    let (_d, rep, w, base) = setup();
+    let mut b = binding(base.clone());
+    b.publication = PublicationMode::SharedLive;
+    rep.configure_sync(b.clone()).unwrap();
+    let p = pending(&rep, &b, base.clone());
+    rep.enqueue_submission(p.clone()).unwrap();
+    let private = PrivateReceipt {
+        operation: p.operation.clone(),
+        replica: config().replica,
+        submitted_revision: base.clone(),
+        original_view: b.view.view.clone(),
+        original_head: b.view.head.clone(),
+        receipt: ReceiptId::random().unwrap(),
+    };
+    let mut progress = rep.sync_status().unwrap().submissions.remove(0);
+    let op = OperationId::random().unwrap();
+    let head = HeadToken::random().unwrap();
+    progress.private_receipt = Some(private.clone());
+    progress.integration = Some(IntegrationRequest {
+        operation: op.clone(),
+        replica: config().replica,
+        candidate_receipt: private.receipt,
+        expected_head: b.view.head.clone(),
+        branch: b.branch.clone(),
+    });
+    progress.shared_receipt = Some(SharedReceipt {
+        receipt: ReceiptId::random().unwrap(),
+        operation: op,
+        replica: config().replica,
+        submitted_revision: base.clone(),
+        branch: b.branch.clone(),
+        head: head.clone(),
+    });
+    progress.state = SubmissionState::Shared;
+    rep.record_sync_progress(&p.operation, SubmissionState::Queued, progress)
+        .unwrap();
+    let mut r = rep.revision(&base).unwrap();
+    r.operation = OperationId::random().unwrap();
+    let next = import(&rep, &r, ChunkSource::Unavailable);
+    b.source = RemoteSourceId::random().unwrap();
+    b.view = ViewBinding {
+        view: ViewId::random().unwrap(),
+        head,
+        revision: next.clone(),
+    };
+    let adoption = rep
+        .adopt_remote_view(b, w.generation().unwrap(), actor())
+        .unwrap();
+    assert!(!rep.sync_status().unwrap().submissions[0].reached(DurabilityLevel::Applied));
+    rep.acknowledge_adoption(&next, adoption.epoch).unwrap();
+    let progress = rep.sync_status().unwrap().submissions.remove(0);
+    assert!(progress.reached(DurabilityLevel::Applied));
+    assert_eq!(progress.applied_revision, Some(next));
+}
+
+#[test]
+fn identical_content_new_view_keeps_each_epochs_source_identity() {
+    use std::sync::{Arc, Mutex};
+    struct Fetch {
+        seen: Mutex<Vec<RemoteSourceId>>,
+    }
+    impl RemoteFetcher for Fetch {
+        fn fetch(
+            &self,
+            source: &RemoteSourceId,
+            object: &ObjectId,
+            _: u64,
+            _: std::time::Instant,
+        ) -> Result<Vec<u8>, FsError> {
+            self.seen.lock().unwrap().push(source.clone());
+            Ok(if *object == ObjectId::for_bytes(b"old-a")? {
+                b"old-a".to_vec()
+            } else {
+                b"fresh-b".to_vec()
+            })
+        }
+    }
+    let d = scratch();
+    let rep = Replica::open(d.path().join("state"), config()).unwrap();
+    let mut r = revision();
+    add_file(&mut r, "a", b"old-a");
+    add_file(&mut r, "b", b"fresh-b");
+    let mut b = binding(revision_id(&r).unwrap());
+    let base = import(
+        &rep,
+        &r,
+        ChunkSource::Remote {
+            source: b.source.clone(),
+        },
+    );
+    rep.configure_sync(b.clone()).unwrap();
+    let w = rep.begin_live(&base, actor(), false).unwrap();
+    let held = w.open("a", OpenMode::Read).unwrap();
+    let original = b.source.clone();
+    b.source = RemoteSourceId::random().unwrap();
+    b.view.view = ViewId::random().unwrap();
+    let current = b.source.clone();
+    rep.adopt_remote_view(b, w.generation().unwrap(), actor())
+        .unwrap();
+    let fetch = Arc::new(Fetch {
+        seen: Mutex::new(vec![]),
+    });
+    rep.set_remote_fetcher(fetch.clone()).unwrap();
+    assert_eq!(w.read(&held, 0, 99).unwrap(), b"old-a");
+    let fresh = w.open("b", OpenMode::Read).unwrap();
+    assert_eq!(w.read(&fresh, 0, 99).unwrap(), b"fresh-b");
+    assert_eq!(*fetch.seen.lock().unwrap(), vec![original, current]);
+}

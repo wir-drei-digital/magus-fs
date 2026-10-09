@@ -2,10 +2,13 @@
 use fuser::*;
 use magus_fs_core::*;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     path::Path,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 type Result<T> = std::result::Result<T, FsError>;
@@ -40,7 +43,9 @@ struct OpenFile {
 struct State {
     config: ReplicaConfig,
     workspaces: BTreeMap<u32, Workspace>,
-    inodes: Vec<EntryId>,
+    inodes: Vec<(EntryId, u64)>,
+    epoch: u64,
+    directories: BTreeSet<EntryId>,
     handles: BTreeMap<u64, OpenFile>,
     next_handle: u64,
 }
@@ -55,18 +60,27 @@ impl State {
         ino.0
             .checked_sub(1)
             .and_then(|n| self.inodes.get(n as usize))
+            .map(|v| &v.0)
             .ok_or(FsError::StaleHandle)
     }
     fn inode(&mut self, id: &EntryId) -> INodeNo {
-        if let Some(i) = self.inodes.iter().position(|v| v == id) {
+        if let Some(i) = self
+            .inodes
+            .iter()
+            .position(|v| &v.0 == id && (v.1 == self.epoch || self.directories.contains(id)))
+        {
             INodeNo(i as u64 + 1)
         } else {
-            self.inodes.push(id.clone());
+            self.inodes.push((id.clone(), self.epoch));
             INodeNo(self.inodes.len() as u64)
         }
     }
     fn entry(&self, req: &Request, ino: INodeNo) -> Result<Entry> {
-        self.ws(req)?.lookup_identity(self.identity(ino)?)
+        let id = self.identity(ino)?;
+        if !self.directories.contains(id) && self.inodes[(ino.0 - 1) as usize].1 != self.epoch {
+            return Err(FsError::NotFound);
+        }
+        self.ws(req)?.lookup_identity(id)
     }
     fn child(&self, req: &Request, parent: INodeNo, name: &OsStr) -> Result<String> {
         let entry = self.entry(req, parent)?;
@@ -85,6 +99,9 @@ impl State {
     }
     fn attr(&mut self, req: &Request, e: &Entry) -> Result<FileAttr> {
         let e = self.ws(req)?.native_attributes(e)?;
+        if e.content == EntryContent::Directory {
+            self.directories.insert(e.id.clone());
+        }
         let uid = self
             .config
             .authorities
@@ -145,7 +162,11 @@ impl State {
                     let id = self.identity(ino)?;
                     self.handles
                         .values()
-                        .find(|file| file.uid == req.uid() && file.handle.entry_id() == id)
+                        .find(|file| {
+                            file.uid == req.uid()
+                                && file.handle.entry_id() == id
+                                && file.handle.epoch() == self.inodes[(ino.0 - 1) as usize].1
+                        })
                         .ok_or(FsError::NotFound)?
                 }
                 Err(error) => return Err(error),
@@ -200,7 +221,7 @@ impl State {
     }
 }
 struct Adapter {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     read_only: bool,
 }
 impl Adapter {
@@ -250,7 +271,9 @@ impl Filesystem for Adapter {
     fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         match self.with(|s| {
             let (e, _) = s.metadata_target(req, ino, fh)?;
-            s.attr(req, &e)
+            let mut attr = s.attr(req, &e)?;
+            attr.ino = ino;
+            Ok(attr)
         }) {
             Ok(a) => reply.attr(&Duration::ZERO, &a),
             Err(e) => reply.error(e),
@@ -661,18 +684,24 @@ pub fn mount(
     for a in &config.authorities {
         workspaces.insert(
             a.uid,
-            rep.begin(revision, rep.actor_for_uid(a.uid)?, read_only)?,
+            if rep.sync_status()?.binding.is_some() {
+                rep.begin_live(revision, rep.actor_for_uid(a.uid)?, read_only)?
+            } else {
+                rep.begin(revision, rep.actor_for_uid(a.uid)?, read_only)?
+            },
         );
     }
     let root = rep.revision(revision)?.tree.root.id;
     let adapter = Adapter {
-        state: Mutex::new(State {
+        state: Arc::new(Mutex::new(State {
             config,
             workspaces,
-            inodes: vec![root],
+            directories: BTreeSet::from([root.clone()]),
+            inodes: vec![(root, 0)],
+            epoch: rep.live_status().map(|v| v.epoch).unwrap_or(0),
             handles: BTreeMap::new(),
             next_handle: 1,
-        }),
+        })),
         read_only,
     };
     let _control = super::control::Server::start(rep.clone(), state, read_only)?;
@@ -691,7 +720,120 @@ pub fn mount(
             MountOption::RW
         },
     ];
-    fuser::mount(adapter, mountpoint, &cfg)?;
+    let live_state = adapter.state.clone();
+    let session = fuser::Session::new(adapter, mountpoint, &cfg)?;
+    let notifier = session.notifier();
+    let stop = Arc::new(AtomicBool::new(false));
+    let incoming = if rep
+        .sync_status()?
+        .binding
+        .as_ref()
+        .is_some_and(|b| b.publication == PublicationMode::SharedLive)
+    {
+        let stop = stop.clone();
+        let rep = rep.clone();
+        let mountpoint = mountpoint.to_path_buf();
+        Some(std::thread::spawn(move || {
+            let hints = crate::sync::subscribe(rep.clone(), stop.clone());
+            let mut incoming = match crate::sync::Incoming::new(&rep) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut pending = rep.live_status().ok().and_then(|status| {
+                rep.revision(&status.revision).ok().map(|r| Adoption {
+                    revision: status.revision,
+                    epoch: status.epoch,
+                    entries: r.tree.entries,
+                })
+            });
+            while !stop.load(Ordering::Relaxed) {
+                let result = incoming.poll(|binding, generation| {
+                    let mut state = live_state.lock().map_err(|_| FsError::ReplicaBusy)?;
+                    let actor = Actor::new(state.config.authorities[0].principal.clone());
+                    let adoption = rep.adopt_remote_view(binding, generation, actor)?;
+                    state.epoch = adoption.epoch;
+                    Ok(adoption)
+                });
+                if let Ok(Some(adoption)) = result {
+                    pending = Some(adoption);
+                }
+                if let Some(adoption) = &pending {
+                    let started = std::time::Instant::now();
+                    let result = (|| -> Result<()> {
+                        // Do not hold state while notifying: the kernel may issue callbacks.
+                        let inodes = live_state
+                            .lock()
+                            .map_err(|_| FsError::ReplicaBusy)?
+                            .inodes
+                            .clone();
+                        for (i, _) in inodes.iter().enumerate() {
+                            notifier.inval_inode(INodeNo(i as u64 + 1), 0, 0)?;
+                        }
+                        for entry in &adoption.entries {
+                            if entry.path.is_empty() {
+                                continue;
+                            }
+                            for (i, (id, _)) in inodes
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, v)| v.0 == entry.parent)
+                            {
+                                let _ = id;
+                                notifier.inval_entry(
+                                    INodeNo(i as u64 + 1),
+                                    OsStr::new(entry.path.rsplit('/').next().unwrap()),
+                                )?;
+                            }
+                        }
+                        let current = rep.revision(&adoption.revision)?;
+                        // An ordinary kernel path walk verifies post-invalidation names and attrs.
+                        for e in &current.tree.entries {
+                            let observed = std::fs::metadata(mountpoint.join(&e.path))?;
+                            match &e.content {
+                                EntryContent::File { version }
+                                    if observed.is_file() && observed.len() == version.size => {}
+                                EntryContent::Directory if observed.is_dir() => {}
+                                _ => return Err(FsError::StaleHandle),
+                            }
+                        }
+                        for e in &adoption.entries {
+                            if !e.path.is_empty()
+                                && !current.tree.entries.iter().any(|v| v.path == e.path)
+                                && mountpoint.join(&e.path).try_exists()?
+                            {
+                                return Err(FsError::StaleHandle);
+                            }
+                        }
+                        rep.acknowledge_adoption(&adoption.revision, adoption.epoch)
+                    })();
+                    if result.is_ok() {
+                        eprintln!(
+                            "live_applied epoch={} revision={} invalidation_us={}",
+                            adoption.epoch,
+                            adoption.revision.as_str(),
+                            started.elapsed().as_micros()
+                        );
+                        pending = None;
+                    }
+                }
+                for _ in 0..10 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            let _ = hints.join();
+        }))
+    } else {
+        None
+    };
+    let result = session.run();
+    stop.store(true, Ordering::Relaxed);
+    if let Some(thread) = incoming {
+        let _ = thread.join();
+    }
+    result?;
     // Leave the empty mountpoint for its owner. Never remove a pathname after daemon loss.
     Ok(())
 }

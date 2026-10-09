@@ -405,6 +405,11 @@ pub(crate) fn control(
     if command.starts_with("sync-") {
         return sync_control(rep, command, options);
     }
+    let actor = if command == "checkpoint" {
+        crate::sync::publication_actor(rep, actor).map_err(|e| (1, e))?
+    } else {
+        actor
+    };
     let checkpoint = if command == "checkpoint" {
         Some((
             operation(options)?,
@@ -488,7 +493,7 @@ fn sync_control(rep: &Replica, command: &str, options: &BTreeMap<String, String>
                 .ok_or((2, FsError::NotFound))?;
             Ok(json!({"ok":true,"progress":p}))
         } else {
-            Ok(json!({"ok":true,"status":status}))
+            Ok(json!({"ok":true,"status":status,"live":rep.live_status().ok()}))
         };
     }
     let controller = crate::sync::SyncController::new(rep).map_err(|e| (1, e))?;

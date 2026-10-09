@@ -35,6 +35,8 @@ pub struct Profile {
     pub replica: ReplicaId,
     pub ca_file: PathBuf,
     pub token_file: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_principal: Option<PrincipalId>,
 }
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Counters {
@@ -210,6 +212,7 @@ impl reqwest::dns::Resolve for BoundedResolver {
 pub struct Transport {
     pub binding: SyncBinding,
     roots: Vec<PathBuf>,
+    principals: Vec<PrincipalId>,
     replica: ReplicaId,
     dns_lookup: DnsLookup,
     pub counters: Arc<Mutex<Counters>>,
@@ -220,6 +223,11 @@ impl Transport {
         let t = Self {
             binding,
             roots: config.content_roots.clone(),
+            principals: config
+                .authorities
+                .iter()
+                .map(|a| a.principal.clone())
+                .collect(),
             replica: config.replica.clone(),
             dns_lookup: system_lookup,
             counters: Arc::new(Mutex::new(Counters::default())),
@@ -235,7 +243,25 @@ impl Transport {
         {
             return Err(FsError::ConfigMismatch);
         }
+        if p.publication_principal
+            .as_ref()
+            .is_some_and(|p| !self.principals.contains(p))
+        {
+            return Err(FsError::UnknownPrincipal);
+        }
         Ok((p, ca, token))
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn credential_stamp(&self) -> std::result::Result<ObjectId, FsError> {
+        ObjectId::for_bytes(self.credentials()?.2.as_bytes())
+    }
+    pub(super) fn publication_actor(&self, fallback: Actor) -> std::result::Result<Actor, FsError> {
+        Ok(self
+            .credentials()?
+            .0
+            .publication_principal
+            .map(Actor::new)
+            .unwrap_or(fallback))
     }
     pub fn bytes(
         &self,
@@ -520,6 +546,7 @@ mod dns_tests {
             p
         };
         let p = Profile {
+            publication_principal: None,
             endpoint: "https://slow-dns.invalid:9".into(),
             namespace: NamespaceId::random().unwrap(),
             replica: ReplicaId::random().unwrap(),
@@ -603,5 +630,198 @@ mod dns_tests {
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Transport {
+    /// One bounded authenticated WSS connection. Hints carry no content authority.
+    /// It owns no SyncExecution/Core lock and shares HTTP's outstanding DNS budget.
+    pub(super) fn hints(
+        &self,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> std::result::Result<(), FsError> {
+        use futures_util::StreamExt;
+        use reqwest::dns::Resolve;
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+        use std::sync::atomic::Ordering;
+        use tokio_tungstenite::{
+            tungstenite::{client::IntoClientRequest, protocol::WebSocketConfig},
+            Connector,
+        };
+        let (profile, ca, token) = self.credentials()?;
+        let endpoint = validate_endpoint(&profile.endpoint)?;
+        let host = endpoint
+            .host_str()
+            .ok_or(FsError::InvalidSource)?
+            .to_owned();
+        let port = endpoint
+            .port_or_known_default()
+            .ok_or(FsError::InvalidSource)?;
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(&ca) {
+            roots
+                .add(cert.map_err(|_| FsError::InvalidSource)?)
+                .map_err(|_| FsError::InvalidSource)?;
+        }
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let url = format!(
+            "{}/v1/n/{}/notifications?branch={}&after=0&limit=128",
+            profile.endpoint.replacen("https:", "wss:", 1),
+            profile.namespace.as_str(),
+            self.binding.branch.as_str()
+        );
+        let mut request = url
+            .into_client_request()
+            .map_err(|_| FsError::InvalidSource)?;
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {token}")
+                .parse()
+                .map_err(|_| FsError::InvalidSource)?,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(4)
+            .build()?;
+        let result = runtime.block_on(async {
+            let connect = async {
+                let resolver = BoundedResolver {
+                    lookup: self.dns_lookup,
+                    exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                };
+                let mut addresses = resolver
+                    .resolve(host.parse().map_err(|_| FsError::InvalidSource)?)
+                    .await
+                    .map_err(|_| FsError::InvalidSource)?;
+                let mut address = addresses.next().ok_or(FsError::InvalidSource)?;
+                address.set_port(port);
+                let socket = tokio::net::TcpStream::connect(address).await?;
+                let config = WebSocketConfig::default()
+                    .max_message_size(Some(1024))
+                    .max_frame_size(Some(1024));
+                tokio_tungstenite::client_async_tls_with_config(
+                    request,
+                    socket,
+                    Some(config),
+                    Some(Connector::Rustls(Arc::new(tls))),
+                )
+                .await
+                .map_err(|_| FsError::InvalidSource)
+            };
+            let (mut ws, _) = tokio::time::timeout(Duration::from_secs(2), connect)
+                .await
+                .map_err(|_| FsError::InvalidSource)??;
+            let start = Instant::now();
+            while !stop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(30) {
+                match tokio::time::timeout(Duration::from_millis(200), ws.next()).await {
+                    Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                        #[derive(Deserialize)]
+                        #[serde(deny_unknown_fields)]
+                        struct Hint {
+                            cursor: i64,
+                        }
+                        let hint: Hint =
+                            serde_json::from_str(&text).map_err(|_| FsError::InvalidDescriptor)?;
+                        if hint.cursor < 0 {
+                            return Err(FsError::InvalidDescriptor);
+                        }
+                        eprintln!("live_hint cursor={}", hint.cursor);
+                    }
+                    Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))))
+                    | Ok(None)
+                    | Ok(Some(Err(_))) => break,
+                    _ => {}
+                }
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(200), ws.close(None)).await;
+            Ok(())
+        });
+        runtime.shutdown_timeout(Duration::ZERO);
+        result
+    }
+}
+
+#[cfg(test)]
+mod publication_actor_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn private_publication_actor_is_validated_and_bound_to_transport_identity() {
+        let root = PathBuf::from(if cfg!(target_os = "macos") {
+            "/private/tmp"
+        } else {
+            "/tmp"
+        })
+        .join(format!(
+            "fs2-publication-{}",
+            RemoteSourceId::random().unwrap().as_str()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let private = |name: &str, bytes: &[u8]| {
+            let p = root.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+            p
+        };
+        let principal = PrincipalId::parse(format!("principal:{}", "a".repeat(32))).unwrap();
+        let group = GroupId::parse(format!("group:{}", "a".repeat(32))).unwrap();
+        let replica = ReplicaId::random().unwrap();
+        let namespace = NamespaceId::random().unwrap();
+        let mut profile = serde_json::json!({"endpoint":"https://localhost:9","namespace":namespace,"replica":replica,"ca_file":private("ca",include_bytes!("../../tests/fixtures/client-ca.pem")),"token_file":private("token","a".repeat(64).as_bytes()),"publication_principal":principal});
+        let path = private("profile", &serde_json::to_vec(&profile).unwrap());
+        let (_, identity, _, _) = load(&path, &[]).unwrap();
+        let binding = SyncBinding {
+            id: namespace,
+            branch: BranchName::parse("main".into()).unwrap(),
+            publication: PublicationMode::Isolated,
+            source: RemoteSourceId::random().unwrap(),
+            view: ViewBinding {
+                view: ViewId::random().unwrap(),
+                head: HeadToken::random().unwrap(),
+                revision: RevisionId::parse(format!("sha256:{}", "0".repeat(64))).unwrap(),
+            },
+            transport_profile: path.clone(),
+            transport_identity: identity,
+        };
+        let mut config = ReplicaConfig {
+            replica,
+            authorities: vec![Authority {
+                principal: principal.clone(),
+                uid: 1001,
+                primary_group: group.clone(),
+                gid: 1001,
+                groups: vec![group],
+                dac_override: false,
+                ownership_transfer: false,
+            }],
+            content_roots: vec![],
+            cache_bytes: 1,
+            history_administrators: vec![],
+            retained_history_grants: vec![],
+        };
+        assert!(Transport::new(binding.clone(), &config).is_ok());
+        config.authorities.clear();
+        assert_eq!(
+            Transport::new(binding.clone(), &config)
+                .err()
+                .unwrap()
+                .code(),
+            "unknown_principal"
+        );
+        profile["publication_principal"] =
+            serde_json::json!("principal:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        private("profile", &serde_json::to_vec(&profile).unwrap());
+        assert_eq!(
+            Transport::new(binding, &config).err().unwrap().code(),
+            "config_mismatch"
+        );
+        profile["publication_principal"] = serde_json::json!("invalid");
+        private("profile", &serde_json::to_vec(&profile).unwrap());
+        assert!(load(&path, &[]).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

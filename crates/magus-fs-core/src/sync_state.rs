@@ -117,7 +117,7 @@ impl SyncProgress {
             DurabilityLevel::Local => true,
             DurabilityLevel::PrivateRemote => self.private_receipt.is_some(),
             DurabilityLevel::Shared => self.shared_receipt.is_some(),
-            DurabilityLevel::Applied => false,
+            DurabilityLevel::Applied => self.applied_revision.is_some(),
         }
     }
 }
@@ -135,7 +135,7 @@ pub(crate) struct Record {
     pub progress: SyncProgress,
 }
 impl Record {
-    fn unresolved(&self) -> bool {
+    pub(crate) fn unresolved(&self) -> bool {
         match self.progress.state {
             SubmissionState::Shared => false,
             SubmissionState::PrivateRemote => {
@@ -231,10 +231,89 @@ impl Replica {
             // Active view advancement belongs to Tasks4/5. Never retarget an opaque source.
             return Err(FsError::ConfigMismatch);
         }
+        core.journal.db.execute(
+            "INSERT INTO sync_sources VALUES(?,?)",
+            params![binding.source.as_str(), json(&binding)?],
+        )?;
         core.journal
             .db
             .execute("INSERT INTO sync_binding VALUES(1,?)", [json(&binding)?])?;
         Ok(())
+    }
+    pub fn register_sync_source(&self, binding: SyncBinding) -> Result<(), FsError> {
+        let core = lock(&self.core)?;
+        let active: SyncBinding = from_json(&core.journal.db.query_row(
+            "SELECT value FROM sync_binding WHERE singleton=1",
+            [],
+            |r| r.get::<_, Vec<u8>>(0),
+        )?)?;
+        if binding.id != active.id
+            || binding.branch != active.branch
+            || binding.publication != active.publication
+            || binding.transport_identity != active.transport_identity
+            || binding.transport_profile != active.transport_profile
+        {
+            return Err(FsError::ConfigMismatch);
+        }
+        if let Some(bytes) = core
+            .journal
+            .db
+            .query_row(
+                "SELECT binding FROM sync_sources WHERE id=?",
+                [binding.source.as_str()],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        {
+            return if from_json::<SyncBinding>(&bytes)? == binding {
+                Ok(())
+            } else {
+                Err(FsError::ConfigMismatch)
+            };
+        }
+        core.journal.db.execute(
+            "INSERT INTO sync_sources VALUES(?,?)",
+            params![binding.source.as_str(), json(&binding)?],
+        )?;
+        Ok(())
+    }
+    pub fn submission_binding(&self, operation: &OperationId) -> Result<SyncBinding, FsError> {
+        lock(&self.core)?
+            .sync_records()?
+            .into_iter()
+            .find(|r| &r.pending.operation == operation)
+            .map(|r| r.binding)
+            .ok_or(FsError::NotFound)
+    }
+    pub fn sync_sources(&self) -> Result<Vec<SyncBinding>, FsError> {
+        let core = lock(&self.core)?;
+        let bytes = core
+            .journal
+            .db
+            .prepare("SELECT binding FROM sync_sources ORDER BY id")?
+            .query_map([], |r| r.get::<_, Vec<u8>>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut result: Vec<SyncBinding> = bytes
+            .iter()
+            .map(|b| from_json(b))
+            .collect::<Result<_, _>>()?;
+        // Upgrade existing Task3 journals without changing the original identity.
+        if let Some(bytes) = core
+            .journal
+            .db
+            .query_row(
+                "SELECT value FROM sync_binding WHERE singleton=1",
+                [],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        {
+            let active: SyncBinding = from_json(&bytes)?;
+            if !result.iter().any(|b| b.source == active.source) {
+                result.push(active);
+            }
+        }
+        Ok(result)
     }
     pub fn enqueue_submission(&self, pending: PendingSubmission) -> Result<(), FsError> {
         let mut core = lock(&self.core)?;

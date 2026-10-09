@@ -16,6 +16,8 @@ reqwest = { version = "=0.13.5", default-features = false, features = ["rustls",
 rustls = { version = "=0.23.45", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+futures-util = "=0.3.32"
+tokio-tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 fuser = { version = "=0.18.0", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]

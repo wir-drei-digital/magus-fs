@@ -973,6 +973,9 @@ impl Replica {
             let descriptor = encode_revision(&revision)?;
             let id = revision_id(&revision)?;
             let next = Working {
+                epoch: core.working.as_ref().map(|w| w.epoch).unwrap_or(0),
+                remote_source: core.working.as_ref().and_then(|w| w.remote_source.clone()),
+                applied: false,
                 base: core
                     .working
                     .as_ref()

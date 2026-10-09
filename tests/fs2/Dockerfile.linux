@@ -15,6 +15,9 @@ RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=
 RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target cargo build --locked -p magus-fs-service --features test-faults && mkdir /out && cp target/debug/magus-fs-service /out/magus-fs-service-faults && cargo build --locked -p magus-fs-service && cp target/debug/magus-fs-service /out/magus-fs-service
 RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target cargo build --locked -p magus-fs --features test-faults && cp target/debug/magus-fs /out/magus-fs-client-faults && cargo build --locked -p magus-fs --examples && cp target/debug/examples/client_probe /out/client_probe && cargo build --locked -p magus-fs && cp target/debug/magus-fs /out/magus-fs
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
-RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates fuse3 util-linux && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/ /usr/local/bin/
 COPY --from=builder /src/ /src/
+
+ENV PYTHONPATH=/src/tests/fs1:/src/tests/fs0
+RUN mkdir -p /opt && ln -s /src/tests/fs1 /opt/fs1 && ln -s /usr/local/bin/magus-fs-client-faults /usr/local/bin/magus-fs-faults
