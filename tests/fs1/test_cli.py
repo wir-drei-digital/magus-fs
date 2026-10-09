@@ -315,6 +315,54 @@ class CLI(unittest.TestCase):
         self.assertEqual(set(os.listdir(self.root)),before)
         self.assertEqual(self.call("status")["materializations"],[])
 
+    def test_historical_bytes_preserve_narrower_current_access_metadata(self):
+        config=json.loads(self.config.read_text());config["replica"]["authorities"][0]["ownership_transfer"]=False
+        self.config.write_text(json.dumps(config));self.init()
+        (self.root/"run").chmod(0o644);first=self.capture()
+        self.root.chmod(0o700);(self.root/"empty").chmod(0o700);(self.root/"run").chmod(0o600)
+        second=self.capture(2)
+        target=self.d/"current-policy-output"
+        out=self.call("materialize","--revision",first,"--destination",target)
+        self.assertEqual(out["result"]["revision"],first)
+        for path,mode in [(target,0o700),(target/"empty",0o700),(target/"run",0o600)]:
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode),mode)
+        self.assertEqual((target/"run").read_bytes(),(self.root/"run").read_bytes())
+        self.assertEqual(self.call("status")["captured_revision"],second)
+        print(json.dumps({"evidence":"current_access_metadata","source_revision":first,"current_revision":second,"output_file_mode":"0600","output_root_directory_mode":"0700","ownership_transfer":False}))
+
+    def test_external_parent_movement_never_reports_ready(self):
+        if os.environ.get("MAGUS_TEST_FEATURES")!="test-faults":return
+        self.init();revision=self.capture()
+        for phase in ["materialize-publish","materialize-published","materialize-ack"]:
+            for inside_content in [False,True]:
+                label=phase+str(inside_content);parent=self.d/("parent-"+label);parent.mkdir()
+                moved=(self.root if inside_content else self.d)/("moved-"+label)
+                marker=self.d/("marker-"+label)
+                env=os.environ.copy();env.update(MAGUS_TEST_FAULT_POINT=phase,MAGUS_TEST_FAULT_ACTION="barrier",MAGUS_TEST_FAULT_MARKER=str(marker))
+                process=subprocess.Popen([str(BIN),"materialize","--state",str(self.state),"--revision",revision,"--destination",str(parent/"out")],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env)
+                try:
+                    observed=Path(str(marker)+".1");deadline=time.monotonic()+12
+                    while not observed.exists() and process.poll() is None and time.monotonic()<deadline:time.sleep(.01)
+                    self.assertTrue(observed.exists(),phase)
+                    parent.rename(moved);parent.mkdir();(parent/"user-file").write_bytes(b"unrelated keep exact")
+                    Path(str(marker)+".1.release").write_text("release")
+                    stdout,stderr=process.communicate(timeout=15)
+                finally:
+                    if process.poll() is None:process.kill();process.communicate()
+                self.assertEqual(process.returncode,1,(phase,inside_content,stdout,stderr))
+                self.assertEqual(json.loads(stdout)["error"],"unsafe_storage")
+                self.assertFalse((parent/"out").exists())
+                self.assertEqual((parent/"user-file").read_bytes(),b"unrelated keep exact")
+                record=self.call("status")["materializations"][-1]
+                self.assertEqual(record["status"],"failed" if phase=="materialize-publish" else "unacknowledged")
+                self.assertFalse(record["staging_path_verified"])
+                actual_stage=moved/Path(record["staging"]).name
+                metadata=actual_stage.stat();self.assertEqual((metadata.st_dev,metadata.st_ino),(record["device"],record["inode"]))
+                if phase!="materialize-publish":
+                    self.assertEqual((moved/"out/run").read_bytes(),(self.root/"run").read_bytes())
+                    self.assertEqual((moved/"out").stat().st_ino,record["content_inode"])
+                print(json.dumps({"evidence":"external_parent_movement","phase":phase,"moved_into_content":inside_content,"result":record["status"],"pid":process.pid,"reaped":True,"private_stage_modified":False}))
+
     def test_failure_json_and_existing_destination(self):
         self.call("init","--config",self.config,"--fault", "EIO",code=2)
         self.init();rev=self.capture()

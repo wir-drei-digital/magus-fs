@@ -16,7 +16,7 @@ use std::{
         fd::AsRawFd,
         unix::fs::{MetadataExt, PermissionsExt},
     },
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::{Duration, Instant},
 };
 #[derive(Clone, Debug)]
@@ -35,6 +35,8 @@ pub struct MaterializationRecovery {
     pub revision: RevisionId,
     pub destination: PathBuf,
     pub staging: PathBuf,
+    #[serde(default)]
+    pub staging_path_verified: bool,
     pub device: u64,
     pub inode: u64,
     pub content_device: Option<u64>,
@@ -42,6 +44,62 @@ pub struct MaterializationRecovery {
     pub status: String,
     pub error: Option<String>,
     pub native_metadata: Vec<NativeMetadataDisposition>,
+}
+struct PublicationLocation<'a> {
+    destination: &'a Path,
+    parent_path: &'a Path,
+    stage_path: &'a Path,
+    ancestry: Vec<File>,
+    store: &'a ObjectStore,
+}
+fn ancestry(path: &Path) -> Result<Vec<File>, FsError> {
+    let mut dirs = vec![directory(Path::new("/"))?];
+    for part in path.components() {
+        if let Component::Normal(part) = part {
+            let parent = dirs.last().ok_or(FsError::UnsafeStorage)?;
+            dirs.push(open_at(
+                parent.as_raw_fd(),
+                &name(part)?,
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            )?);
+        }
+    }
+    Ok(dirs)
+}
+impl PublicationLocation<'_> {
+    fn verify(
+        &self,
+        core: &crate::engine::Core,
+        published: Option<(u64, u64)>,
+    ) -> Result<(), FsError> {
+        // Retained ancestor descriptors prevent identity recycling during this operation.
+        let current = ancestry(self.parent_path).map_err(|_| FsError::UnsafeStorage)?;
+        if current.len() != self.ancestry.len() {
+            return Err(FsError::UnsafeStorage);
+        }
+        for (before, after) in self.ancestry.iter().zip(&current) {
+            let before = before.metadata()?;
+            let after = after.metadata()?;
+            if before.dev() != after.dev() || before.ino() != after.ino() {
+                return Err(FsError::UnsafeStorage);
+            }
+        }
+        core.journal
+            .check_content_path(self.destination)
+            .map_err(|_| FsError::UnsafeStorage)?;
+        self.store
+            .assert_path(self.stage_path)
+            .map_err(|_| FsError::UnsafeStorage)?;
+        if let Some((device, inode)) = published {
+            let native = directory(self.destination)
+                .map_err(|_| FsError::UnsafeStorage)?
+                .metadata()?;
+            if native.dev() != device || native.ino() != inode {
+                return Err(FsError::UnsafeStorage);
+            }
+        }
+        Ok(())
+    }
 }
 fn mkdir(parent: &File, leaf: &OsStr) -> Result<File, FsError> {
     let n = name(leaf)?;
@@ -204,6 +262,7 @@ impl Replica {
         let a = perm::authority(&core.config, &mapping.actor)?;
         // Historical restoration is authorized by each identity's current path and metadata.
         let live = core.working.as_ref().map(|w| &w.tree).unwrap_or(&rev.tree);
+        let mut output_metadata = BTreeMap::new();
         for e in
             std::iter::once(perm::root_entry(&rev.tree)).chain(rev.tree.entries.iter().cloned())
         {
@@ -226,10 +285,15 @@ impl Replica {
                     4
                 },
             )?;
+            output_metadata.insert(e.id, current);
         }
         let parent_path = destination.parent().ok_or(FsError::InvalidPath)?;
         let leaf = destination.file_name().ok_or(FsError::InvalidPath)?;
-        let parent = directory(parent_path)?;
+        let parent_ancestry = ancestry(parent_path)?;
+        let parent = parent_ancestry
+            .last()
+            .ok_or(FsError::UnsafeStorage)?
+            .try_clone()?;
         if !absent(&parent, leaf)? {
             return Err(FsError::AlreadyExists);
         }
@@ -252,11 +316,20 @@ impl Replica {
         let stage = stage_store.directory().try_clone()?;
         stage.set_permissions(Permissions::from_mode(0o700))?;
         let metadata = stage.metadata()?;
+        let location = PublicationLocation {
+            destination,
+            parent_path,
+            stage_path: &stage_path,
+            ancestry: parent_ancestry,
+            store: &stage_store,
+        };
+        let mut published = false;
         let mut record = MaterializationRecovery {
             id: id.clone(),
             revision: revision.clone(),
             destination: destination.into(),
             staging: stage_path.clone(),
+            staging_path_verified: true,
             device: metadata.dev(),
             inode: metadata.ino(),
             content_device: None,
@@ -269,7 +342,7 @@ impl Replica {
             "INSERT INTO materializations VALUES(?,?)",
             params![id.as_str(), json(&record)?],
         )?;
-        let result = (|| {
+        let mut result = (|| {
             parent.sync_all()?;
             manifest(&stage, &record)?;
             let root = mkdir(&stage, OsStr::new("content"))?;
@@ -357,7 +430,14 @@ impl Replica {
                             }
                         }
                     }
-                    apply(file, &entry.owner, &entry.group, entry.mode, &core.config)?;
+                    let metadata = &output_metadata[&entry.id];
+                    apply(
+                        file,
+                        &metadata.owner,
+                        &metadata.group,
+                        metadata.mode,
+                        &core.config,
+                    )?;
                     verified_bytes += version.size;
                 }
             }
@@ -366,19 +446,21 @@ impl Replica {
                 .rev()
                 .filter(|e| e.content == EntryContent::Directory)
             {
+                let metadata = &output_metadata[&entry.id];
                 apply(
                     &directories[&entry.path],
-                    &entry.owner,
-                    &entry.group,
-                    entry.mode,
+                    &metadata.owner,
+                    &metadata.group,
+                    metadata.mode,
                     &core.config,
                 )?;
             }
+            let root_metadata = &output_metadata[&rev.tree.root.id];
             apply(
                 &directories[""],
-                &rev.tree.root.owner,
-                &rev.tree.root.group,
-                rev.tree.root.mode,
+                &root_metadata.owner,
+                &root_metadata.group,
+                root_metadata.mode,
                 &core.config,
             )?;
             for (path, file) in directories.iter().chain(files.iter()) {
@@ -416,27 +498,76 @@ impl Replica {
             )?;
             crate::faults::capture_barrier("materialize-publish", 1)?;
             crate::faults::hit("materialize-publish")?;
+            location.verify(&core, None)?;
             publish(&stage, &parent, leaf)?;
+            published = true;
+            crate::faults::capture_barrier("materialize-published", 1)?;
+            location.verify(&core, Some((content.dev(), content.ino())))?;
             Ok(MaterializationResult {
                 revision: revision.clone(),
                 destination: destination.into(),
                 verified_bytes,
             })
         })();
-        match &result {
-            Ok(_) => record.status = "ready".into(),
-            Err(e) => {
-                record.status = "failed".into();
-                record.error = Some(e.code().into());
-            }
+        // Persist publication evidence, never ready, before the final ACK check.
+        record.status = if result.is_ok() {
+            "published"
+        } else if published {
+            "unacknowledged"
+        } else {
+            "failed"
         }
-        // Retain the fd-owned manifest even if its visible path was externally replaced.
+        .into();
+        record.error = result.as_ref().err().map(|e| e.code().into());
+        record.staging_path_verified = location.verify(&core, None).is_ok();
         let manifest_result = manifest(&stage, &record);
         core.journal.db.execute(
             "UPDATE materializations SET manifest=? WHERE id=?",
             params![json(&record)?, id.as_str()],
         )?;
-        manifest_result?;
+        if result.is_ok() {
+            let acknowledgement = (|| {
+                manifest_result?;
+                crate::faults::capture_barrier("materialize-ack", 1)?;
+                location.verify(&core, record.content_device.zip(record.content_inode))
+            })();
+            if let Err(error) = acknowledgement {
+                result = Err(error);
+            }
+            record.status = if result.is_ok() {
+                "ready"
+            } else {
+                "unacknowledged"
+            }
+            .into();
+            record.error = result.as_ref().err().map(|e| e.code().into());
+            record.staging_path_verified = location.verify(&core, None).is_ok();
+            let final_manifest = manifest(&stage, &record);
+            core.journal.db.execute(
+                "UPDATE materializations SET manifest=? WHERE id=?",
+                params![json(&record)?, id.as_str()],
+            )?;
+            final_manifest?;
+            // Control synchronization also takes time: validate once more at return/ACK.
+            if result.is_ok() {
+                if let Err(error) =
+                    location.verify(&core, record.content_device.zip(record.content_inode))
+                {
+                    record.status = "unacknowledged".into();
+                    record.error = Some(error.code().into());
+                    record.staging_path_verified = location.verify(&core, None).is_ok();
+                    let recovery_manifest = manifest(&stage, &record);
+                    core.journal.db.execute(
+                        "UPDATE materializations SET manifest=? WHERE id=?",
+                        params![json(&record)?, id.as_str()],
+                    )?;
+                    recovery_manifest?;
+                    result = Err(error);
+                }
+            }
+        } else {
+            manifest_result?;
+        }
         result
     }
 }

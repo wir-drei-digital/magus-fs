@@ -184,3 +184,66 @@ fn actual_native_case_and_normalization_control_aliases_refused() {
     }
     println!("native_aliases_checked={tested}");
 }
+
+#[test]
+fn historical_content_uses_current_root_directory_file_and_group_metadata() {
+    let d = scratch();
+    let mut c = mapped();
+    let inherited = fs::metadata(d.path()).unwrap().gid();
+    let old_gid = c.authorities[0].gid;
+    let new_gid = if inherited != old_gid {
+        inherited
+    } else {
+        old_gid + 10000
+    };
+    let mut other = c.authorities[0].clone();
+    other.uid += 10000;
+    other.principal = principal(2);
+    other.primary_group = group(2);
+    other.gid = new_gid;
+    other.groups = vec![group(2)];
+    c.authorities[0].groups.push(group(2));
+    c.authorities.push(other);
+    let rep = Replica::open(d.path().join("state"), c).unwrap();
+    let mut r = revision();
+    let dir = EntryId::random().unwrap();
+    r.tree.entries.push(Entry {
+        path: "dir".into(),
+        id: dir.clone(),
+        parent: r.tree.root.id.clone(),
+        owner: principal(1),
+        group: group(1),
+        mode: 0o755,
+        content: EntryContent::Directory,
+    });
+    add_file(&mut r, "dir/file", b"historical");
+    r.tree.entries[1].parent = dir;
+    r.tree.entries[1].mode = 0o644;
+    let id = import(&rep, &r, local(d.path(), b"historical"));
+    let w = rep.begin(&id, actor(), false).unwrap();
+    for path in ["", "dir", "dir/file"] {
+        w.chown(path, principal(1), group(2)).unwrap();
+        w.chmod(path, if path == "dir/file" { 0o600 } else { 0o700 })
+            .unwrap();
+    }
+    let handle = w.open("dir/file", OpenMode::Write).unwrap();
+    w.write(&handle, 0, b"current!!!").unwrap();
+    let dest = d.path().join("out");
+    let result = rep.materialize(&id, &dest, MaterializationMapping { actor: actor() });
+    if unsafe { libc::geteuid() } != 0 && inherited == old_gid {
+        err(result, "mapping_blocked");
+        assert!(!dest.exists());
+        return;
+    }
+    assert_eq!(result.unwrap().revision, id);
+    assert_eq!(fs::read(dest.join("dir/file")).unwrap(), b"historical");
+    for path in ["", "dir", "dir/file"] {
+        let metadata = fs::metadata(dest.join(path)).unwrap();
+        assert_eq!(
+            metadata.mode() & 0o777,
+            if path == "dir/file" { 0o600 } else { 0o700 }
+        );
+        assert_eq!(metadata.gid(), new_gid);
+    }
+    assert_eq!(rep.status().unwrap().head, Some(id));
+}
