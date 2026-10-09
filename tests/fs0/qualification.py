@@ -2,6 +2,7 @@
 import time
 import re
 
+DATA_DIGEST = '1977adb6a954de29fb854e5ea942b2ba29bc8c7846e83440d94e37ab61858369'
 CHUNKS = (65536, 262144, 1048576)
 CASES = ('mount', 'range_reads', 'private_writes', 'readonly_view', 'permissions', 'cleanup',
          'enumeration', 'partial_cold', 'partial_warm', 'full_scan', 'subprocess')
@@ -27,8 +28,10 @@ def validate_content_profile(profile):
         scan = profile['full_scan']
         return (counts[0] == counts[1] == 0 and 0 < counts[2] <= 8388608
                 and counts[3] == counts[2] and counts[4] >= 67108864
-                and scan['bytes'] == 67108864 and bool(scan['digest'])
-                and scan['digest'] == scan['independent_digest'])
+                and scan['bytes'] == 67108864 and scan['digest'] == scan['independent_digest'] == DATA_DIGEST
+                and profile['cold_delta'] == counts[2]-counts[0]
+                and profile['warm_delta'] == counts[3]-counts[2]
+                and profile['full_scan_delta'] == counts[4]-counts[3])
     except (KeyError, TypeError, AssertionError):
         return False
 

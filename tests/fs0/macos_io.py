@@ -50,6 +50,8 @@ def run(case, path, manifest, extra):
         return scan(path / 'data.bin',extra['digest'])
     if case in ('ro','private'):
         result = ordinary(path,case,manifest)
+        root = path.stat()
+        result['root_metadata'] = {'state':'passed','detail':{'uid':root.st_uid,'gid':root.st_gid,'mode':stat.S_IMODE(root.st_mode),'scope':'daemon-mapped root; outside manifest digest'}}
         if case == 'private':
             # The shared helper's replacement scenario first attempts unsupported CREATE.
             replacement = result['rename_replacement_old_handle']

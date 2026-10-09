@@ -4,7 +4,7 @@ import fcntl
 from pathlib import Path
 import tempfile
 import unittest
-from qualification import aggregate, wait_until, validate_content_profile
+from qualification import aggregate, wait_until, validate_content_profile, DATA_DIGEST
 from lock_io import contend
 
 
@@ -12,7 +12,8 @@ def transfer():
     baseline = dict(content_body_bytes=0, retry_requests=0, unique_chunks=0, metadata_bytes=100)
     return {'before':baseline, 'enumeration':baseline, 'cold':dict(baseline,content_body_bytes=524288),
             'warm':dict(baseline,content_body_bytes=524288), 'full':dict(baseline,content_body_bytes=67108864),
-            'full_scan':{'bytes':67108864,'digest':'a'*64,'independent_digest':'a'*64}}
+            'cold_delta':524288,'warm_delta':0,'full_scan_delta':66584576,
+            'full_scan':{'bytes':67108864,'digest':DATA_DIGEST,'independent_digest':DATA_DIGEST}}
 
 
 def valid():
@@ -59,7 +60,8 @@ class Qualification(unittest.TestCase):
         baseline = dict(content_body_bytes=0, retry_requests=0, unique_chunks=0, metadata_bytes=100)
         profile = {'before': baseline, 'enumeration': baseline, 'cold': dict(baseline, content_body_bytes=524288),
                    'warm': dict(baseline, content_body_bytes=524288), 'full': dict(baseline, content_body_bytes=67108864),
-                   'full_scan': {'digest': 'abc', 'independent_digest': 'abc', 'bytes': 67108864}}
+                   'cold_delta':524288,'warm_delta':0,'full_scan_delta':66584576,
+                   'full_scan': {'digest': DATA_DIGEST, 'independent_digest': DATA_DIGEST, 'bytes': 67108864}}
         self.assertTrue(validate_content_profile(profile))
         for key, amount in [('before', 1), ('enumeration', 1), ('cold', 8388609), ('warm', 524289)]:
             bad = copy.deepcopy(profile)
@@ -175,3 +177,13 @@ class LockOperation(unittest.TestCase):
         from lock_io import validate_observation
         with self.assertRaises(AssertionError):
             validate_observation(75,{'state':'contended','errno':errno.EAGAIN,'operation':'open'},'')
+
+
+class CompositeCommands(unittest.TestCase):
+    def test_linux_composites_retain_all_contributing_commands(self):
+        from run import summarize_linux
+        names=('root-readonly','root-mode000-readonly','group-permissions','other-permissions','execute-other','execute-denied','nonroot-mode000')
+        native={'commands':[{'stdout':name+'.stdout','command':['synthetic',name]} for name in names]}
+        result=summarize_linux(native,1,262144,'synthetic/result.json')
+        for name in names[:2]:self.assertIn(['synthetic',name],result['cases']['readonly_view']['command'])
+        for name in names[2:]:self.assertIn(['synthetic',name],result['cases']['permissions']['command'])

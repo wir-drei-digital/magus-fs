@@ -6,14 +6,11 @@ import subprocess
 import sys
 
 from inventory import collect
+from macos_report import summarize_macos
 from preflight import check
 from qualification import aggregate, CHUNKS, owned_containers_absent
 from resources import OwnedOutput
 
-MACOS_BLOCKER = ('Native macOS open/read/listdir remains unqualified after prior stalls. '
-                 'Mac execution in this combined runner is disabled pending the controller-reviewed '
-                 'bounded diagnostic and real native profiles. No Mac path/resource access or '
-                 'macos_run invocation is performed here.')
 
 
 def summarize_linux(native, journey, chunk, evidence):
@@ -23,7 +20,7 @@ def summarize_linux(native, journey, chunk, evidence):
         return next((item['command'] for item in commands if item.get('stdout') == name + '.stdout'), [])
     def observation(name, expected, observed, passed):
         return {'state':'passed' if passed else 'failed' if native.get('error') else 'blocked',
-                'expected':expected, 'observed':observed, 'command':command_for(name)}
+                'expected':expected, 'observed':observed, 'command':[command_for(name)] if command_for(name) else []}
     readonly_required = ('mount','metadata_permissions','range_reads','warm_repeat','mmap_read','locks_observation','readonly_unchanged','root_confinement',
                          *('readonly_' + operation for operation in ('write','truncate','chmod','unlink','rename','create','mkdir','rmdir','chown','utime','symlink','hardlink','xattr','mknod')))
     private_required = ('mount','private_writes','rename_classification','create_classification','truncate_classification','chmod_classification',
@@ -64,6 +61,9 @@ def summarize_linux(native, journey, chunk, evidence):
         'full_scan': observation('full-scan','64MiB actual mounted scan equals independent SHA-256; actual transfer counted',transfer.get('full_scan'),bool(cases.get('full-scan'))),
         'subprocess': observation('execute-other','ordinary Python and executable processes against mounted view',cases.get('execute-other'),cases.get('execute-other',{}).get('other_execute_0755',False)),
     }
+    profile_cases['readonly_view']['command']=[command_for(name) for name in ('root-readonly','root-mode000-readonly') if command_for(name)]
+    profile_cases['permissions']['command']=[command_for(name) for name in ('group-permissions','other-permissions','execute-other','execute-denied','nonroot-mode000') if command_for(name)]
+    profile_cases['subprocess']['command']=[command_for(name) for name in ('execute-other','execute-denied') if command_for(name)]
     return {'journey':journey,'chunk_size':chunk,'manifest_digest':native.get('manifest_digest'),
             'additional_fixture_digests':native.get('generation_digests'),'fixture_uid_gid':native.get('fixture_uid_gid'),'fixture_identity':native.get('daemon',{}).get('fixture_identity'),
             'root_metadata':native.get('root_metadata'),'owned_token':native.get('token'),
@@ -77,16 +77,17 @@ def summarize_linux(native, journey, chunk, evidence):
             'source_revision':native.get('revision'),'dirty':native.get('dirty'),'image':native.get('image'),
             'cases':profile_cases,'transfer':transfer,'cleanup_errors':[item for item in cleanup if item.get('error')],
             'remaining_owned_resources':native.get('remaining_owned_containers','').splitlines(),
-            'native_evidence':str(evidence),'error':native.get('error')}
+            'native_evidence':str(evidence),'error':native.get('error'),
+            'guarantees':{'private_hydration':'on-demand','private_durability':'ephemeral; fsync/fdatasync unsupported','namespace_create_rename':'unsupported','live_invalidation':'unsupported','locks':'one Linux kernel; not distributed','root_binding':'outside manifest'}}
 
 
-def run_linux_profile(runner, output, image, journey, chunk, uid, gid):
+def run_native_profile(runner, normalizer, output, runner_args, journey, chunk):
     evidence = output / 'result.json'
     profile = {'journey':journey, 'chunk_size':chunk, 'native_evidence':str(evidence),
                'cases':{}, 'cleanup_errors':[], 'remaining_owned_resources':[]}
     code, runner_error, native = None, None, None
     try:
-        code = runner(output,image,False,chunk,uid,gid)
+        code = runner(output,*runner_args)
     except Exception as error:
         runner_error = {'type':type(error).__name__, 'message':str(error), 'detail':repr(error)}
         if hasattr(error, 'cmd'):
@@ -100,7 +101,7 @@ def run_linux_profile(runner, output, image, journey, chunk, uid, gid):
         native = json.loads(evidence.read_text())
         if not isinstance(native, dict):
             raise ValueError('native report must be a JSON object')
-        profile.update(summarize_linux(native,journey,chunk,evidence))
+        profile.update(normalizer(native,journey,chunk,evidence))
     except Exception as error:
         profile['native_report_error'] = repr(error)
     if runner_error or 'native_report_error' in profile:
@@ -129,12 +130,20 @@ def run_linux_profile(runner, output, image, journey, chunk, uid, gid):
     return profile, state, reason
 
 
+def run_linux_profile(runner, output, image, journey, chunk, uid, gid):
+    return run_native_profile(runner,summarize_linux,output,(image,False,chunk,uid,gid),journey,chunk)
+
+
+def run_macos_profile(runner, output, journey, chunk, uid, gid):
+    return run_native_profile(runner,summarize_macos,output,(False,chunk,uid,gid),journey,chunk)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--preflight',action='store_true')
     parser.add_argument('--platform',choices=('all','linux','macos'),default='all')
     parser.add_argument('--output',type=Path,required=True)
-    parser.add_argument('--image',default='fs0-task4-runtime')
+    parser.add_argument('--image',default='fs0-task2-access-runtime')
     parser.add_argument('--fixture-uid',type=int,default=501)
     parser.add_argument('--fixture-gid',type=int,default=20)
     args = parser.parse_args(argv)
@@ -146,7 +155,7 @@ def main(argv=None):
     root = Path(__file__).resolve().parents[2]
     result = {'schema':'magus-fs-fs0-result-v1','command':[sys.executable,*sys.argv], 'owned_output':str(owned.path),
               'owned_token':owned.token,'platforms':{},'inventory':collect(), 'scope':'synthetic pinned FS0; no production release',
-              'limitations':['private FUSE bytes ephemeral; fsync/fdatasync unsupported', 'private namespace operations classified unsupported',
+              'limitations':['Linux private bytes ephemeral/fsync unsupported; Mac eager private backing supports bounded existing-file fsync/remount', 'namespace create/rename unsupported; metadata mutation is adapter-specific',
                              'root uid/gid is daemon mapped and outside manifest identity', 'no authenticated source, live generation publication or distributed locks',
                              'real editor/external harness journey required before FS2 closure']}
     for name, command in [('source_revision',['git','rev-parse','HEAD']),('dirty',['git','status','--short'])]:
@@ -187,8 +196,25 @@ def main(argv=None):
                 if not stopped:
                     platform['state'] = 'passed'
         if args.platform in ('all','macos'):
-            result['platforms']['macos'] = {'state':'blocked','reason':MACOS_BLOCKER,'profiles':[],
-                'action':'controller-reviewed bounded native diagnostic and complete profiles required; no Mac runner invoked'}
+            platform = result['platforms']['macos'] = {'state':'blocked','profiles':[]}
+            from macos_run import run
+            stopped = False
+            for journey in (1,2):
+                for chunk in CHUNKS:
+                    output = owned.path / f'macos-{journey}-{chunk}'
+                    print(f'Mac fresh journey{journey}, chunk_size{chunk}',flush=True)
+                    profile, state, reason = run_macos_profile(run,output,journey,chunk,args.fixture_uid,args.fixture_gid)
+                    platform['profiles'].append(profile)
+                    if state != 'passed':
+                        platform.update(state=state,reason=reason)
+                        stopped = True
+                    save()
+                    if stopped:
+                        break
+                if stopped:
+                    break
+            if not stopped:
+                platform['state'] = 'passed'
     required = ('linux','macos') if args.platform == 'all' else (args.platform,)
     result.update(aggregate(result['platforms'],required))
     result['cleanup_errors'] = owned.cleanup(remove_output=False)

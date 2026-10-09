@@ -1,0 +1,74 @@
+"""Real coordinator over synthetic native-report writers; no native mount actions."""
+import copy
+import json
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import macos_run
+import run
+from permission_source import project_manifest
+
+FIXTURES=Path(__file__).with_name('fixtures')
+
+
+def native_fixture(output,chunk):
+    raw=(FIXTURES/'macos-report.json').read_text().replace('/synthetic/fs0',str(output))
+    report=json.loads(raw);manifest=json.loads((FIXTURES/'normal-manifests.json').read_text())[str(chunk)]
+    report['chunk_size']=chunk;report['manifest_digest']=manifest['digest']
+    report['owned_token']=output.name
+    report['fixture_identity']['projected_digest']=manifest['digest']
+    report['mounts']['normal-ro']['manifest']=manifest
+    report['generation_digests']={'old':manifest['digest'],'fresh':project_manifest(manifest,file_mode=0o640)['digest']}
+    variants={'group':(None,0o040,12345,20),'other':(None,0o004,12345,12345),'file000':(None,0,501,20),'file644':(None,0o644,501,20),
+              'directory000':(0,None,501,20),'directory400':(0o400,None,501,20),'directory100':(0o100,None,501,20)}
+    for name,mount in report['mounts'].items():
+        mount['manifest_digest']=(project_manifest(manifest,*variants[name])['digest'] if name in variants else
+                                  report['generation_digests']['fresh'] if name=='generation-fresh' else manifest['digest'])
+    t=report['transfer'];cold=2*chunk
+    for key in ('cold','warm'):t[key].update(content_body_bytes=cold,unique_chunks=2)
+    t['full']['unique_chunks']=67108864//chunk
+    t.update(cold_delta=cold,warm_delta=0,full_scan_delta=67108864-cold)
+    return report
+
+
+class MacCoordinator(unittest.TestCase):
+    def execute(self,runner):
+        def prerequisite(args,**kwargs):
+            if args not in (['git','rev-parse','HEAD'],['git','status','--short']):
+                raise AssertionError('unexpected command: '+repr(args))
+            return subprocess.CompletedProcess(args,0,'synthetic revision','')
+        with tempfile.TemporaryDirectory(prefix='fs0-mac-coordinator-') as folder:
+            output=Path(folder)/'combined'
+            with patch.object(run,'collect',return_value={'scope':'synthetic inventory'}),patch.object(run.subprocess,'run',side_effect=prerequisite),patch.object(macos_run,'run',side_effect=runner):
+                code=run.main(['--platform','macos','--output',str(output)])
+            return code,json.loads((output/'result.json').read_text())
+    def test_schedules_two_fresh_three_size_journeys(self):
+        def runner(output,prepare,chunk,uid,gid):
+            self.assertFalse(prepare);self.assertEqual((uid,gid),(501,20))
+            output.mkdir();(output/'result.json').write_text(json.dumps(native_fixture(output,chunk)));return 0
+        code,result=self.execute(runner)
+        self.assertEqual(code,0)
+        self.assertEqual([(p['journey'],p['chunk_size']) for p in result['platforms']['macos']['profiles']],[(j,c) for j in (1,2) for c in (65536,262144,1048576)])
+    def test_existing_mac_failure_and_escaping_cleanup_timeout_preserve_resources(self):
+        def runner(output,prepare,chunk,uid,gid):
+            output.mkdir();report=native_fixture(output,chunk)
+            report.update(passed=False,state='failed',error='synthetic mounted read failure',cleanup_errors=['synthetic cleanup timeout'],remaining_owned_resources=[str(output/'mount-normal-ro')])
+            report['cases']['partial-cold']['state']='failed'
+            (output/'result.json').write_text(json.dumps(report))
+            raise subprocess.TimeoutExpired(['/sbin/umount',str(output/'mount-normal-ro')],5)
+        code,result=self.execute(runner)
+        self.assertEqual(code,1)
+        profile=result['platforms']['macos']['profiles'][0]
+        self.assertEqual(profile['error'],'synthetic mounted read failure')
+        self.assertEqual(len(profile['owned_resources']['pids']),15)
+        self.assertEqual(len(profile['owned_resources']['mountpoints']),13)
+        self.assertEqual(profile['orchestration_error']['type'],'TimeoutExpired')
+        self.assertTrue(profile['native_report_snapshot'])
+        self.assertTrue(profile['remaining_owned_resources'])
+    def test_missing_mac_launcher_is_blocked(self):
+        def runner(*args):raise FileNotFoundError('synthetic missing prerequisite')
+        code,result=self.execute(runner)
+        self.assertEqual(code,2);self.assertEqual(result['state'],'blocked')

@@ -1,0 +1,2423 @@
+{
+  "state": "passed",
+  "passed": true,
+  "chunk_size": 262144,
+  "fixture_uid_gid": [
+    501,
+    20
+  ],
+  "fixture_identity": {
+    "original_digest": "4d48c620a2bbbeedc1ad25ef231b77b082875d34f446b4497ee05a12fa09ca55",
+    "projected_digest": "7da2a6998bc659f298580023bec0aec6655fe2273606dd3995b2d59fcdf319c6",
+    "projection": {
+      "uid": 501,
+      "gid": 20
+    },
+    "scope": "test-only metadata projection; real Rust chunk bodies unchanged"
+  },
+  "manifest_digest": "7da2a6998bc659f298580023bec0aec6655fe2273606dd3995b2d59fcdf319c6",
+  "owned_token": "synthetic-owned-token",
+  "owned_output": "/synthetic/fs0",
+  "owned_pids": [
+    15805,
+    15848,
+    15903,
+    15926,
+    15935,
+    15945,
+    15954,
+    15963,
+    15973,
+    15982,
+    15991,
+    16000,
+    16004,
+    16005,
+    16016
+  ],
+  "revision": "synthetic-revision",
+  "binary_sha256": "45f87f30db98d2546efeb7f8526e75f566022b109040a0474241d7bdbc336601",
+  "environment": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "python": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 21.0.0 (clang-2100.1.1.101)]",
+    "actor_uid_gid": [
+      501,
+      20
+    ]
+  },
+  "mounts": {
+    "normal-ro": {
+      "address": "127.0.0.1",
+      "hydrated_bytes": 0,
+      "manifest_digest": "7da2a6998bc659f298580023bec0aec6655fe2273606dd3995b2d59fcdf319c6",
+      "mode": "ro",
+      "mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,nolocks,vers=3,tcp,rsize=65536,actimeo=0,soft,timeo=10,retrans=2,port=52464,mountport=52464",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-normal-ro"
+      ],
+      "mountpoint": "/synthetic/fs0/mount-normal-ro",
+      "pid": 15848,
+      "port": 52464,
+      "prepare_only": true,
+      "principal_gid": 20,
+      "principal_uid": 501,
+      "server_command": [
+        "/synthetic/fs0/magus-fs-probe",
+        "mount",
+        "--backend",
+        "nfs",
+        "--source",
+        "http://127.0.0.1:52462",
+        "--mode",
+        "ro",
+        "--mountpoint",
+        "/synthetic/fs0/mount-normal-ro",
+        "--expect-digest",
+        "7da2a6998bc659f298580023bec0aec6655fe2273606dd3995b2d59fcdf319c6",
+        "--prepare-only"
+      ],
+      "manifest": {
+        "digest": "7da2a6998bc659f298580023bec0aec6655fe2273606dd3995b2d59fcdf319c6",
+        "chunk_size": 262144,
+        "entries": [
+          {
+            "path": "instructions.md",
+            "size": 42,
+            "mode": 420,
+            "uid": 501,
+            "gid": 20,
+            "directory": false,
+            "chunks": [
+              "0e6d5621351efffa95104dc9c3a9b7d7edcf897f5dc571928f3290d9c1a96e10"
+            ]
+          },
+          {
+            "path": "nested/table.csv",
+            "size": 21,
+            "mode": 420,
+            "uid": 501,
+            "gid": 20,
+            "directory": false,
+            "chunks": [
+              "eadf55b7ac8d6b495ff4ed3d471f4213716d0618bb424645793dee909ccbf604"
+            ]
+          },
+          {
+            "path": "run.sh",
+            "size": 31,
+            "mode": 493,
+            "uid": 501,
+            "gid": 20,
+            "directory": false,
+            "chunks": [
+              "185075e72dd7547045eade9de7802c0a54fadd34e8b2659d83e8b3d5d52c396d"
+            ]
+          },
+          {
+            "path": "empty",
+            "size": 0,
+            "mode": 420,
+            "uid": 501,
+            "gid": 20,
+            "directory": false,
+            "chunks": []
+          },
+          {
+            "path": "data.bin",
+            "size": 67108864,
+            "mode": 420,
+            "uid": 501,
+            "gid": 20,
+            "directory": false,
+            "chunks": [
+              "e987bfd4f0f4b3e1f7b79ff6df487b5da24861bcaa432757281cdbdc489051e9",
+              "4b7794d0c9dd6fa953434c05304c09987ff99d1b70727d185e52c9b255d2b21f",
+              "8bf100a0713509f3d531debdf7d59c5fd1aee5d31e5406f6100d596854ebd33a",
+              "24ce11a22f484902765b5aeee4bf91a4f743ae90069df2dfc63c93a93a6852ee",
+              "704e678d67973a3a617e348dc9a3ccc9beff3bf62eecc209ff44d8b87e48266a",
+              "0c4feeaf20b7aeaf797458724ef8063d7818cc04969aafd9ca6ee9ef8dfe5fa8",
+              "728f37ba7331d0cf891bf20c4cf73d8a38dcefad445a808edbe42cb876871b09",
+              "0ff25b41a35c43b5aae01b8c07fb6c6aa6cbf2d3618a918cd81f89a8b14ad2e4",
+              "b4b8b43bc14a9bb0e880ac12a9c73736ed8fd4c13b8e73ec05a881797daa3511",
+              "fd0dfb39837ec9d36bb5e67c9d883b1330e2f20fbc8df36fe4ed8d78a9c7141a",
+              "269ed69bfe624ea410175e348b97a0231f843f694379396707107f6d3123b57c",
+              "d0080a569d815a5d39fb0b6223d6601df1b7a150bf4e0d77b4b6130eb36a6f5b",
+              "35717d8d4f5fa056a0e833db07ccbe5c56766b0c49dfd85ac5b65fed806f2854",
+              "d83b2c57ba06ab34348bf31563fb2d2702c611e7ad9b820a0e954f2eb501bb27",
+              "f8e0e3c78e48ab64bf1163fb01116208e07553d04be9a90bc52520f8d86ae302",
+              "cf70374b741d10336b1eb2d79c64553d0bf9cc1fd9a677b26e3ad354efb6a170",
+              "794497ec48ac390eb8a7cfa833ee230f8b75e98e6366817c1ec9fcdaabfce290",
+              "390cbf3b7e41a71d2c04e6aa5c7c8d26700b485e661ce538523a8d7c0e978da8",
+              "0e3fb9def8d850e9eb47b6f57804bc89354fac66f10d765661c92b84de59d52e",
+              "20fca6b75f82ccb8535947380215b6c812708ccf58db79f0ed292af9bca8901f",
+              "d7f5ace03e6961afad55234f61ff3d157af298d5564a27938e585eaf9e5eca2a",
+              "f9ddc1ba18d8bd3b82562c94083e026bab3f590799bc31f935daf18ded9475f7",
+              "7d4f8d5d62a64dd16c6de6acf5011081298e98a19444975ed64de53aeafc428b",
+              "54cde6a97cc907c23c903b6f61df62790ef34630cbdec4984b6aa2bf2a0bca4b",
+              "2d38e0e24240090c8b555149f32f4e338d67dd95aa3ce8eddbb7f5aaba1fd388",
+              "6ac546cc47d7ed2423ff15f98fcf7748c3009ee91b1307cd1ce125bc52e51963",
+              "6e2a0f6bcd47d275abf6e104aa9cc8a4265b49aeee4b6e02eb9d7c2dd626330c",
+              "9b84fa111c63f0afdeb36c6fc76a4ba5b5ec6cefc4eff105bb362c52296da2db",
+              "7501d462c036bfa40343130355caf7e07603849b1a02f0547dc6b306bf8cb14f",
+              "06a3cd39455086efee9e6933b52a35007911195a53820fd69e69e3867cc77362",
+              "b0df36fd865b4313a73f354fff7b799b3288108a7f77c51e79ba7aeb620d84ca",
+              "b2d8f81d08db40f1ef4b15b4dffd8d9d5a5121d56c6163a9a544b70edd378139",
+              "a0c41eff1195537b2a2c5e743a39d0b8d86253e522295231fe15c460799584c2",
+              "4c6969bf3f9cfc46abe26361f9de25844a1dba9a7230c956dafaff83ef8ff62b",
+              "cec01d7a46082337bb3f6b5ab678ca77b2a842f8f9184b16dbf456ce1c3ff8a6",
+              "d438c25a3b70a7303836838f048f7b842153cda8882a32fb76de55fbb40cdfba",
+              "6400b81df80240c54d1cd66e575b96af04a4378d689814eec78bd6ec9634de9a",
+              "42ec8554735b397e0c865ef9511281fe1d13f1ae5efc2e76605704b3bf84d72a",
+              "d1ccdb75e5774d806d9c5e68d82e5ba365123b27c595b3274f7f22499144e1cb",
+              "30230796f8e9ec7cbd55d48873ec741ce32dc78daa4c802e5f61bc2f843120ea",
+              "880cd9e782cec6ed14fee6700ac89f10d4c440459c665a735eb6b4c4e89e725c",
+              "4af7e2338857d0bbb2c12a77edd48476658bd2e68562d5b7ff683faca8cbc199",
+              "d7ffd2d1146b9aa1e2e545eadd09ec9aacf9774bb7fafc97d8442f2bd4eb2f0d",
+              "a0491393ea4a150bcf705e7dc1c5084943d52e1b574cde7e48460c41114af239",
+              "0b7a85f42a35ff897f12894cfc9f116bcece500f881d43bd070b0a46e009ce3e",
+              "1d18d511a39ac46afdd2c48b18a5af02b692aedf7602e13b4f535c09ad65c8ed",
+              "dea8aa0be61535965ff3317c8532a6600f4925822048b81fa304ec36308f2408",
+              "90e6cf41a18e4405d795042781b6c0b19b10aed5c1b20f7058684498e919a0c9",
+              "92c17c4fb7529aff9471bc7dcc484f0b044b25166d7722ae38390f75aaac678a",
+              "0adc341a7d765106f340d9d6ab49a102f996a35e0db17c29c97e89454b0cb750",
+              "afcaff46a305141ccce652765236d144c48c40d1895ae950f429a85c7bf0c098",
+              "b3cbe9a3303131e612e60adf6e88a24e7e5f7fa2659486e83a0d31e23ca2f6f0",
+              "b49e224c2630bceb15ff9746342d33a9a34b37566c4265051e4668695dbf8b7e",
+              "f5767297aa30db8a86001d9f1a6be4acac4092712a00121a29d7ca3e8f391a0e",
+              "8ee584607ea253f055b30c20b75ec4f5d2b207210ef0adf4cfe415a3fef5f808",
+              "1e6038281dfb14c21bb50c61eabe85b56282ec274a2b520dde0effe13c278659",
+              "b887c01714ef3f898a3e9470e9b8c0656126b77418cd1b37ad9447b6ca90f019",
+              "7e3ca2fba72787ce169a49cdd8a2abdab3eafc6122311db24df9f81bd4ca8513",
+              "a5e272bc526555182b185d1eefe9a1e14a73935984dc478d84997abd21c01f45",
+              "9f2133893f882cc4325d0fac97fc4873d521f7deb49a1cf41e71f11eaa101fc7",
+              "39903f9939b547b1fbcdb6279ec3b48ef584d2d6d1c971af27db64eb523c8117",
+              "34fbf4fbda1a23963c13f15cf77ccf2c2829a7c622992d43544d8bfb1c35f413",
+              "9e048b38192265398ac12c9bb74a22e4583350c4a3a6ede606d76c794aaf5a33",
+              "03226049d4597fb57ebeaf8b18ec1bf695e82372178dcd31a394bc64ad6dc7e7",
+              "80b0c2472ce476d4be8ad707dd044af3f1e0e32b0dd01fdd032d0509c4281ef3",
+              "36919e751d87cb18a6ae469d391dab375f80bdac1cb4187d9a3d080f848b8380",
+              "71db2e321bae486638b2464daabb33aa5662e8a1a04394d8bd45ccfe7d116a5e",
+              "289e97103dc28d11742d522afefc8e98c3f01ddaa370313af44b6c5b7d48e970",
+              "b807101a222cae2fcc588d70be6470ed55bbfd81a105ca799cbde1725734cef2",
+              "603a486b829d196abb56388c217922ea6e4cbebff894ea6f35f810f591020fce",
+              "8c8a971ba2fdb57e20d1d68d499b2a22460d355bec23a727a55473bb889a85e9",
+              "a92f38495017a20577bc24f541c113d2f76c0810607b6bb93001ad0a4bf107bb",
+              "01b22f1c5f04dc57397d6dd93138bc7daa7a0d544055be0c9ff155f5fdf727dd",
+              "aeb1392edb5966e122b3a884c49ee613b5f3e74b4df4538490bff1741f109746",
+              "5e5a8f11f127dfc08f09d2e9590a0ac5d8f056c568bc8a094700177bd15278cd",
+              "318afe18ce6c016a7f1f40ff4228fca45e44eb48bba75741bc53441ba5ec273e",
+              "74af86506ec9e528f72d7f526b119166cf14919321978156e1ab39fa3c2e5180",
+              "6de9c6514102cc2356775454629b48cd6c91221236e63af25e824fa65fdf26b2",
+              "81cf7502dd882d25764546d2b81ba439c9129dcc26f4a988867af2824f067d1f",
+              "a4bdc905320c2359998bb6024a957a728de3d73e14783af86a99964a2a4fa169",
+              "a5c61a61f840e4f8813078455ce91aeb748450f62783ac697ba7b78368e16b10",
+              "139b452eceab54d6d4d673489f14ae81091eb487f5123547fc7065be06af94bd",
+              "6de5456a23ce52af0dea80e4dced810043f8f30f0a404e277f91238b26114c17",
+              "b9895200507adfa31713d529479022201e7e7fad153067466b50dc62d96a069d",
+              "217f396d8cfcbe6b7b6bc64ffeb85a52ad543328cab501125bdb843644e1d90c",
+              "de51bdff8709f3081a091bd43bf75ba69b48e4744d53e9784fce54ee5ac43f97",
+              "7d0c2d45bf3bd470ae44f96c59f475914201d523b87815c9d5315f4543e222be",
+              "1bb5745db5c9079e7990f5112b8a38a855748a0bbf1aa2f95827604edc3cf8dc",
+              "37619176d80190fc9adaa2e74bc3bad6725b0a2f647967688bf710d954aa7174",
+              "405d31e38007524a648c95a6999db1dfcdae3b8aa386b7a06ce4c283180f8afd",
+              "229a7ba488d551a0d368709c17ca2c0ce6fc689e82ff5aa31ca53e5050b81a6a",
+              "33a33a8ce117cec820cf4453e6a13b65bff9782b6d0c3c635467a4652e1813d5",
+              "45a91227a84f68a1eeb8448f25264b021640ef953cb60f51c11953bebe1cf8a6",
+              "4a119f71c2b894bbf7dfcfb45e7e2b052aa5a34be1a0926879bdef1972c9b34a",
+              "0c404fcb55301658d62695b9313647fc14c50b90b257c2e12f9ca5e0e478c00d",
+              "79be2971583b8f84b771302856ea8970bb496bccf4b2392c98ff4c6d34e8892b",
+              "3f3a269b5dbfcfabbc103a934daa0bedffea1d516c57311600e596e60f0feb96",
+              "600b0fb21a97ca63acf2f716408a28159b6b3de03bf0b5d1d8c20a518abcc4d1",
+              "69494ef0051260f73768529e6522f0babf5282a6652ae6b2b7160f367b31960c",
+              "0293123a3993c6a12af04d3dc281a5f8931ea40c17ed1065b2de80d55f825b94",
+              "61c9e506b0979e5e77902a6bf85ad25bb12f5f11d3de5a575477687fe5ace978",
+              "3361b3a3940fe4402b77e0f6708e0c362ed668cb9f3aaf71f5640ad06d482737",
+              "5fb364b1ff67ac0ec453eaacd770b8282f29203199b7ac100b6fe83fbffbe4ec",
+              "d98723e3b2fe6865a06cf5a8a85a47e19c0ba954526bfac7f36315a55558b9f3",
+              "b26f33dcc18fcbe746516403eaec01b94980f010c5820e4713c32262841b3ef8",
+              "9a044d91134d32b12ccbea088c3f760daba5ad61971d00d484bc93a5a9aa7c9f",
+              "6833efafe0bf007f1018a6ae0d839e44d07ce00408f41dd834a9308a9db8888f",
+              "382d5f04efb7d09788f896b74f3f97286292ee4d4e204ee6879afbd1a7150870",
+              "ecb0fa0937357b45fa17bce37baced9ce4ff4f0196a1cd46a9d62bfdd524f475",
+              "c0ea154dbb02ef5ba843e5e1e3612cbb5d44c95fe54007ee3614d5cf3eb843c5",
+              "87202f9a7e9beb1139b9f8dfe443d11b6cc519977bb4e36701e3840347c820db",
+              "340ea57f78e2641d8b561efcadad0efd7620cfd6e5122e67a09f00e07b0a20c0",
+              "1e9f8e7f6cc40bc8d83851a524bbbbeafb50e0e744e6270f1243cd4fb5b3972f",
+              "9bf99e67395316c42071345d31c80cada4c8ce7e264b8322bf3736bdb9f352ba",
+              "bbf1cabd16af73982a2e3cf7cc2789062e43b715aaaeb3e71e80be4179abbbc0",
+              "29254eeee0e756d21a71d84dfc0f649f43263b60df93db7766c1b9ffd69e3f50",
+              "d83d3f3c24ee7c7df9f8bc5d1a1bff62768d4aec6b5c0cfdaed6e8553109fa7b",
+              "8418df4a94d5757b5a62d2a735643586802d8bd857d8824d3888294719c617d0",
+              "8196747a1d317ec5e94bbf784a5fd5b205adbd465d71ee2205e273b8913271b2",
+              "86a7c1faba3fe07c148a649447189f6ca9735e3b5724f54be531906af69c26c1",
+              "5f0dd08e2a61e807487a9de05d26f36be44d2de2876273584d238d1e3b0c85a8",
+              "8f1f335abcc07fa34ff3cf70c05c1fc19f4506fd47ef8a5c7d1ee4bc98bdad6b",
+              "81de3ee8ef028231961f0a94e9d193ae85e919920220fbe487fd7a3f1e8c2ba6",
+              "b1984b6591df07a11cdfd15a8a38b8a4deb0392081bf98cda7a2520e052888c8",
+              "0a4f9f3fa75684f2f51b33df3484506896daba3a52fe0da5b4c617f1660372e7",
+              "da1c0777bb499f591200b859f7ca58cc4650f80e763e2e95aa11a729dfeec433",
+              "2137402f8c9fd2a6f39f34534f1f08873a82061c3f89953acee11e321d1c553d",
+              "15fa0ca33840e61b19605647f1e13e5d1a1d828df429d27b19123f866aaee4d9",
+              "173e088e54e15417eaf74a654c41c459c6a8b11f833d26915405c0f11e52a483",
+              "01800e8f12dadbfc225d0865b4d2c872d8df0c277c0e45d3a07733c44a7ad09c",
+              "216dd846a966c9e099d21ce18e163e93b350e7be959dd95e97a633aae90328a3",
+              "f73f52c8908c08d4c4d8b2edd9598182aab0dffd676aa33e42ebb56c3afe0749",
+              "a8c0abef289e32ade5f23717c8baf25b3604a7c1d0e06a0e20d9da1addce0397",
+              "bd3d5d45ea6374e15771617064209fa951a4b3bf628eda63309f6f7da91a731c",
+              "d2b5c4e2eb1b155c0dbc66456dfa1ea7e127b9b44d2878c396d688c407c0532d",
+              "58e6bb27a52a84b139433444e117051b045de2f4759b0f7a250f795659b8d470",
+              "49ab2cec197a0823dd67bb8a2fa03a529a2cc157a095604835ab8e3f0c8981cd",
+              "129bafb4c203bb4c276a5ad7b5b31d8f0bc35775b2e95ea7b494d572974cfd53",
+              "9ef7500c0bfbaed4440ad78fa7ec847a35dedfc75f6b90b7ef86bb8edf335017",
+              "c5fc68b2ed6b4dca6f262546edd828f0835db5cb1c5ffccb8674d62a95a4aa08",
+              "d0b591f31bfffbd6c5faa7d1a098f07605ab05752011e906fbf89f408a7f732c",
+              "e1d7142e7eb3300776e3bac948d6f762059634cc99475af5fba1fda290b0d39a",
+              "2cf73ee78f5b7a667002e57fc2dd57453e9d01fb2eb257913b741c4c938b0368",
+              "a2997ce2db57d8b671f49dbba2932d83fadff21eae491458c5a9ac8f2dc868cf",
+              "0bd9c1c1f242fc628a62f708fd26bb5cb2e62e56fe6e78dbb1951950c428c738",
+              "6d60f9624c58b6aaffbd81748a49c4304e0afb620957a2c01faf1d25d436d54c",
+              "e98885a5d969b1ee0119e3752be7b4a7850fb66524e534c5d64240ccb8ccaf64",
+              "0e64fb85023df16cf296cdbfa97c9c028f811d143df3ad6dec53975f03eeef31",
+              "342ffc43b6e4329c66dc27d4e0991472731d39f1bc06de525fff47cc6fce254c",
+              "a87283269bafc5714aaa26bd3a65fdc4d765304d23e2a6242eca9541d41eb226",
+              "d4a34917ea46bb0c2c88d750684729d9b90260ce99cc33cc25c90c45337e56c8",
+              "55319e58062f2aeca34fed2a26e86936ea64320c331f10ee33902efe128c8b7d",
+              "27fa5b9c5aa55355c791f9eadfcf676ca70c6fe9e2d5618f4b72493dcd98776b",
+              "06d15d1c0d9bfef8ddcf6a1582529bbf3206d6a92c27ce532ecbd50aab71bf90",
+              "21cd6644091e002108ee69209501783c3542d6a418b8b590aa9e4f80b450b750",
+              "e04a265eb8f321b661ee093e1e1999c6d7a12a2faa2c0edb36a0ce113c21be7a",
+              "e14edce6cdfba4c7589f7374ab0485d37ee6c31c0f0a86ed7995e313a647e856",
+              "c69acab4c1d2eb6b805b8cc1dc629c4e606b4bb96c328ef0b4436b210a29e3f5",
+              "effee29d05c5de30d6eba4038be45f96bfc865dbc0ad05cc831563820cf835fb",
+              "dd5d30e4dfde83ba5057b6a055d0c9ae34ab7e8185893064a2d705a85ebc0a05",
+              "1f673949e64d346da8fd0e5389298c8e1d28e58a761713cd5442f43a3462119f",
+              "e4a1f6870e03537489ed0c2c4b64ab6a4e606e5761502f287fdfdb4af6f4499a",
+              "348911ab3efc37962c78746a1dd15c8d1ebf9984feb89581b52db2d67572f5ae",
+              "c894f33da3b97ffa616b1da6dc227b06e82bbcc6eaf9928a031ce15bfcdfce39",
+              "200cd8f8379b5bb044b1e31009dabbec916cbbf4817d9fa8140528017774264e",
+              "8e3d2b9de174601aaca2c2c976173970d27d0bd8341399a3907e361c87ce1b00",
+              "8c03b029740f9e7890ed5a605126d8e0ec0959925f492226d7ca973f850e0135",
+              "6313820492c962adf66e7d6f84728bb08b6b5b94bfa3c5886a24f4ff63267dfc",
+              "8f7c5899c493bcd7137d1c490dc62e743f6a783fd0f76db955f4b43492a1457e",
+              "5ef4d156d4001663005aef18d0f7c609defc8596b8ba12bf2f066635ebeb8934",
+              "e77caefd893af8cc96c1bdd64095c50824f63753d35decd9d7c6e2d47b7b0805",
+              "c6825397cb71c516ccc920fdedfc4712543476918525d2fd39969b6c11ba76f5",
+              "c8f4d9efbb81c1f10b1708a6aa4d6135f3515a0417461473d76a84ede06100ec",
+              "f8a5e8765ad8e04e72d764814a310d7331e6c8a5aa10c61d8881ef67b0e219cd",
+              "4d5a5d2b02d17c86ed490ab7d316fd2657927c349bd437f09ed5eecdf6c338e2",
+              "117844577d8a75fde1e88519a0133645e494288f1aa82712952a7db2769df431",
+              "4f49f3af624aaa38a243212a47d6ce30c0dcf5f18ed5d60a3be4624632a77cb5",
+              "8032a74230c2a0a1db0fcb689d26c34afd72f878bb32fdb11096986086eac0bf",
+              "256981c69722861cd6c4923e1fba9cad079fe81c4b51aad94ac0ccc121f769fa",
+              "be7feb37a8561595d1b2e0953797a852f13c62119556ecb694227756dbfcac4f",
+              "e3d7334f1add18b56fd80bd94b419c6df4d07b352ed07b95cb1df4a0f012bea4",
+              "4ebe14fc2089ec4b291adf507c1046c2a68b2d7580d1b2a1f314728e3b8c14fb",
+              "d4b112d6a13f825eb3cef84989b7d9ff85e5b0a75bd982d13d8f8882f55f733b",
+              "92bd5a492e88153f1ee98a95e8499d3553a07238557929695cfe6ceff3d5842d",
+              "4f7430af0ce8f6cb716bfd57e280eac17422ba992c476cf6979bbbe5b15aafdc",
+              "41ea9fa8273815d2071ea6b32de39972676ee9daed74149643c34571c18ea1d2",
+              "0a5a1f4ffdc18529990830e8c2b35d773f47438f64eef3fdc42060bc06bcb9c1",
+              "4f7968a3bbde477ce8616e6de9d4e893bc41dcc67acc5b151e5f60c61adfd6bf",
+              "9084c7dd78cb9cd8b54cef51f1e61f0cbd34fab173f1a0a2d338a0f44b47332c",
+              "a5c421039a61422b263f8b33e86141765f4bb9b55f7e9b7b63b11336d805872f",
+              "279b5ab93cf42c816ab55055dc295e19c8afea40d5cfa8de10e6a07bb44a1776",
+              "7c122dcf6b4d76b19927419971bfa9e9deb7d00710f07e2fabe140d08566118f",
+              "b05cfa8f7359eba01d9c3feb1044867f0bdd971606080d7d23770cdbe5758d25",
+              "1e1ef868ce2004fa1a6ae9772a66033b3195c314e3386c4e00aa29e580058b2e",
+              "6122f3646804264b98d4b3ec88d624558bd3e756e7b7d600c7e60531d82a28bb",
+              "18b1ef65161d89bd260ec16e2c23d48b955bb3fc06632d000b8595cfb389a9c4",
+              "c787d415f138e8e1fd9ebfdc22aba862cbfcb8559f07b739f23669147cd2ebf1",
+              "8d1a612bce52554ead5454b2b4f50a883718aafeaf6bc5f13696764d0214d11d",
+              "1d114dd4c3a757923bdbaac2048357b62114b4c63a1268583ba4b68e68e2f2a1",
+              "d61ad4ecdc07849b30c1cb18351eee3adcff270e68a1bbb210fc43fb42eb5472",
+              "281badc0afea714812b35891a2e4b992a160cdf96dc0d4d2fe17c2ca4b79512b",
+              "a732fac9a41e7c14f8d1ddee3e396d1efb56a2d79657c70040a856b3f4fbeeb7",
+              "1b781f5422c40165b20aed2a5eea7f51049983d7fa55bf8d9cff1cd7c80c765b",
+              "4e129a83f6f67abc20f066b78ce62d49656b14f18f92ff7657c8c83021f7c575",
+              "1660680ee8106420f92bda3b16ad061ae6393603e9b0842d67a478b60a572a97",
+              "00b57e359786225dfaa6959bfc4d9a57a7777769186a346b8d8b5d4fb4bec48c",
+              "8f377a93e2973cf74b5537f2878df0cdbb95962f8ef86ec8c4b5ba666c0abb57",
+              "9637bc94cf63a573d76369730a669588972191d735cb95c2cf27b3f8e1a0a2d9",
+              "0fc8e876b6274f3a7df68dcd7f75c50e301c0cf6c3747c4ca552bcef18965c72",
+              "33a7b9b0139971eab9a72a7541e18bb1fbcebea6eb59fa5e8f07981df9645237",
+              "1da814d3183abe1ae224efad04a56823a9547160ba42e9ab30a9e6982411e5ae",
+              "1964dbb5e450c8113ad7c26b58011ff3a2a7b34c1078020ac298b1c731213cfa",
+              "f306d442aa05a0be0cc6674f6acc219febeb436ac5e6b0c8921112b49f4e4652",
+              "ea3c10c207198aebc15655094a622b9c8eb1bee8bd9429d8c42cb7f6130a3780",
+              "061ff64c00bba702fbde012838f9bc455fa6cb63748ff53723ff98d9a70892b2",
+              "dba61df8368f329229062b5f625faefd20ddb8f468e9947e8c80429a52274809",
+              "46081d6c63f2dfb89a0f8c57b1b26d6d48aa05ec7d5a99e0ab65397fb7ee7f17",
+              "efa57bd612687685b89e086629f9bb9345526d57402e95620589986064bc23f2",
+              "3611c7f49f853440045db2b96002e63c089c8c48bc5bce22cf104efb692409c8",
+              "3529aeaca871ad4f1caef8fb18f106b11c5522bd7243895bc91bb7a4f7073b55",
+              "69c2fdf51aa26b16a4a5ab70e82b96ee8e0ea604f935300ca7dd6aac7c3de1d4",
+              "60ba2dda1ab0f50a1790fe1f16918ca0456992e35c190fa91f0d7a4a8bb1205f",
+              "4d849806815d15221264570e7c9dbedaeac0cf5fce9cb2ab2d35e0acec03ce8f",
+              "8d68b3d13353d65f37b35bef5d74f1d87d34c0135ce18c28342a913f403d5727",
+              "46307cbc43a7ec3df27fe02f98997ebd21b962e648f09f8d2a9d97c0a02a4332",
+              "a9b6cd746ca521db1d60257317356c693fc26f2eeb8789c784b290db708fbf08",
+              "86740c85351ca8884a783b2d5c6335d4e0a6adffeb9c33491c516be008a14a38",
+              "8d3530bdf2c145afe93d1a712e2fec3b198949442e9b2778fd04e7fa0709b18b",
+              "fd181775417375933fc4ff0da3ed6d9d17af33b4055bbb559915752b862fa634",
+              "6861babd984d72b6d0775147119dcf12ae78a2d877774087001deee0ca94ace5",
+              "13b4f7206d5173a63dc8c7a591614fa3ccdc3a4fa0b753c0e9f959c7a741edb9",
+              "7613534edc37ea0c83f7e27d18be7623e75e495043f6b1bdb0a44a63d95dce98",
+              "2389e0fb1ebddf1107333e823d76cf308793169a761fc9a3947af84dac581134",
+              "0cb3969132e5ee3ff74de6f4a69908651d049d96ad5e7d50ced17f3e31bdd888",
+              "51d227254ff94ccfd28c32caba55a952f5fec00f3ea7bcf1b1c25e0f64e45966",
+              "d3b81902d52af8f1cd1385b1c38967a8608e959107568cb3744fcce1ee4f660c",
+              "2809522495e6fa7d6b8e2cfa6442b8215d7c057cec46f496d585ba8ebe3cb02b",
+              "277e645e208d392ed8159ee9b91b62ed80167f1a7ab62a8b18f2d50e1d1ad96e",
+              "81d13489af64d35065661ecca7ab03eca58b391eb1b95a59bb4d0ffdc1e3eb9b",
+              "0b566dee67ce6ff9c7310138877151bc28ace47641b9e5d79b9e229fe0550196",
+              "ea81d937cababd74dfeaebd6bc4035381eb48269fd13945965d2f1ca4e1fb440",
+              "304d7e8b990852d9858857dc445edb04a4940830a4ebf87e0cc8de9e6d684a5c",
+              "d3d92a75dcef52a98a7f301e045c59c0bf06444e2f91c5c48e3e319b83f8564f",
+              "746ec086b5cdd9f7a6273112e9207ffae1902e3d2d713e1c3bf7973ba7090b4f",
+              "21d8770f83ecf0254fc3427170cd144d6180820852ca9773fdd3b7af2890e4dd",
+              "d3f71baffd7cf1b7f82ba277564b94846aaf6b64551e318babbe8366a3edbd5b",
+              "166ce40d4edb18fb19f65e4c4867e7fb4192f009c614b3645daf49fce850b0f8",
+              "8c39b1e38dc390fc53e34b48af0d091e29d45fa5ef0ece1d501da4828605ded5",
+              "7d7cc4ef011db65481a73a2ba35cbae41d54cd97f63d188a042e049c0087f450",
+              "69f348c8d9c989b4abd0beb1514402a9d68505bd5ba50289b21b7cf258019343",
+              "ad59105e967038600b2609171079422cddcac328f12741816dd66a35b1c8f2f5",
+              "cf47e4d8fa53291862c4fbe453466140da80fddf2527721ce1cc8680606e4cda",
+              "6b833382773b6bd053036331a8d3c7d35d5dacb654b2ad3e4a8a5c54ba2bd936",
+              "f31fd34c3aa8825b506531772c08a9fc1bc878e5b69d1a26f66f357b3d2bea89",
+              "5e9311351a8a8b503b46a286722a3b130fb6f6d1b8ff6c08e8a275b804afca36",
+              "fd20396b06623489fdc1901e740da7df977ab794b2d5c60ef27175276cddcfc6"
+            ]
+          },
+          {
+            "path": "nested",
+            "size": 0,
+            "mode": 493,
+            "uid": 501,
+            "gid": 20,
+            "directory": true,
+            "chunks": []
+          }
+        ]
+      },
+      "actual_mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=52464,mountport=52464",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-normal-ro"
+      ],
+      "mount_table_entry": "127.0.0.1:/ on /synthetic/fs0/mount-normal-ro (nfs, nodev, nosuid, read-only, mounted by daniel)",
+      "effective_options": "vers=3,tcp,port=52464,mountport=52464,nomntudp,soft,nointr,noresvport,negnamecache,callumnt,locallocks,quota,rsize=65536,wsize=32768,readahead=16,dsize=32768,rdirplus,nodumbtimer,timeo=10,retrans=2,maxgroups=16,acregmin=1,acregmax=1,acdirmin=1,acdirmax=1,acrootdirmin=1,acrootdirmax=1,deadtimeout=60,nomutejukebox,nonfc,sec=none:sys,accesscache=3"
+    },
+    "normal-private": {
+      "address": "127.0.0.1",
+      "hydrated_bytes": 67108958,
+      "manifest_digest": "7da2a6998bc659f298580023bec0aec6655fe2273606dd3995b2d59fcdf319c6",
+      "mode": "private",
+      "mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "rw,nolocks,vers=3,tcp,rsize=65536,actimeo=0,soft,timeo=10,retrans=2,port=53538,mountport=53538",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-normal-private"
+      ],
+      "mountpoint": "/synthetic/fs0/mount-normal-private",
+      "pid": 15903,
+      "port": 53538,
+      "prepare_only": true,
+      "principal_gid": 20,
+      "principal_uid": 501,
+      "server_command": [
+        "/synthetic/fs0/magus-fs-probe",
+        "mount",
+        "--backend",
+        "nfs",
+        "--source",
+        "http://127.0.0.1:52462",
+        "--mode",
+        "private",
+        "--mountpoint",
+        "/synthetic/fs0/mount-normal-private",
+        "--expect-digest",
+        "7da2a6998bc659f298580023bec0aec6655fe2273606dd3995b2d59fcdf319c6",
+        "--prepare-only",
+        "--backing",
+        "/synthetic/fs0/backing"
+      ],
+      "actual_mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "rw,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53538,mountport=53538",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-normal-private"
+      ],
+      "mount_table_entry": "127.0.0.1:/ on /synthetic/fs0/mount-normal-private (nfs, nodev, nosuid, mounted by daniel)",
+      "effective_options": "vers=3,tcp,port=53538,mountport=53538,nomntudp,soft,nointr,noresvport,negnamecache,callumnt,locallocks,quota,rsize=65536,wsize=32768,readahead=16,dsize=32768,rdirplus,nodumbtimer,timeo=10,retrans=2,maxgroups=16,acregmin=1,acregmax=1,acdirmin=1,acdirmax=1,acrootdirmin=1,acrootdirmax=1,nomutejukebox,nonfc,sec=none:sys,accesscache=3"
+    },
+    "resumed-private": {
+      "address": "127.0.0.1",
+      "hydrated_bytes": 0,
+      "manifest_digest": "7da2a6998bc659f298580023bec0aec6655fe2273606dd3995b2d59fcdf319c6",
+      "mode": "private",
+      "mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "rw,nolocks,vers=3,tcp,rsize=65536,actimeo=0,soft,timeo=10,retrans=2,port=53541,mountport=53541",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-resumed-private"
+      ],
+      "mountpoint": "/synthetic/fs0/mount-resumed-private",
+      "pid": 15926,
+      "port": 53541,
+      "prepare_only": true,
+      "principal_gid": 20,
+      "principal_uid": 501,
+      "server_command": [
+        "/synthetic/fs0/magus-fs-probe",
+        "mount",
+        "--backend",
+        "nfs",
+        "--source",
+        "http://127.0.0.1:52462",
+        "--mode",
+        "private",
+        "--mountpoint",
+        "/synthetic/fs0/mount-resumed-private",
+        "--expect-digest",
+        "7da2a6998bc659f298580023bec0aec6655fe2273606dd3995b2d59fcdf319c6",
+        "--prepare-only",
+        "--backing",
+        "/synthetic/fs0/backing",
+        "--resume-backing"
+      ],
+      "actual_mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "rw,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53541,mountport=53541",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-resumed-private"
+      ],
+      "mount_table_entry": "127.0.0.1:/ on /synthetic/fs0/mount-resumed-private (nfs, nodev, nosuid, mounted by daniel)",
+      "effective_options": "vers=3,tcp,port=53541,mountport=53541,nomntudp,soft,nointr,noresvport,negnamecache,callumnt,locallocks,quota,rsize=65536,wsize=32768,readahead=16,dsize=32768,rdirplus,nodumbtimer,timeo=10,retrans=2,maxgroups=16,acregmin=1,acregmax=1,acdirmin=1,acdirmax=1,acrootdirmin=1,acrootdirmax=1,nomutejukebox,nonfc,sec=none:sys,accesscache=3"
+    },
+    "group": {
+      "address": "127.0.0.1",
+      "hydrated_bytes": 0,
+      "manifest_digest": "fb6bcf94e66e80336aec65c5c063577f0c72ccd3e16f98cde380269db371bf49",
+      "mode": "ro",
+      "mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,nolocks,vers=3,tcp,rsize=65536,actimeo=0,soft,timeo=10,retrans=2,port=53544,mountport=53544",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-group"
+      ],
+      "mountpoint": "/synthetic/fs0/mount-group",
+      "pid": 15935,
+      "port": 53544,
+      "prepare_only": true,
+      "principal_gid": 20,
+      "principal_uid": 501,
+      "server_command": [
+        "/synthetic/fs0/magus-fs-probe",
+        "mount",
+        "--backend",
+        "nfs",
+        "--source",
+        "http://127.0.0.1:52462",
+        "--mode",
+        "ro",
+        "--mountpoint",
+        "/synthetic/fs0/mount-group",
+        "--expect-digest",
+        "fb6bcf94e66e80336aec65c5c063577f0c72ccd3e16f98cde380269db371bf49",
+        "--prepare-only"
+      ],
+      "actual_mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53544,mountport=53544",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-group"
+      ],
+      "mount_table_entry": "127.0.0.1:/ on /synthetic/fs0/mount-group (nfs, nodev, nosuid, read-only, mounted by daniel)",
+      "effective_options": "vers=3,tcp,port=53544,mountport=53544,nomntudp,soft,nointr,noresvport,negnamecache,callumnt,locallocks,quota,rsize=65536,wsize=32768,readahead=16,dsize=32768,rdirplus,nodumbtimer,timeo=10,retrans=2,maxgroups=16,acregmin=1,acregmax=1,acdirmin=1,acdirmax=1,acrootdirmin=1,acrootdirmax=1,deadtimeout=60,nomutejukebox,nonfc,sec=none:sys,accesscache=3"
+    },
+    "other": {
+      "address": "127.0.0.1",
+      "hydrated_bytes": 0,
+      "manifest_digest": "7c331e63f7e2ce0acf8182bd9caafec85f87a0868f0408b8ee96622a79a76539",
+      "mode": "ro",
+      "mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,nolocks,vers=3,tcp,rsize=65536,actimeo=0,soft,timeo=10,retrans=2,port=53549,mountport=53549",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-other"
+      ],
+      "mountpoint": "/synthetic/fs0/mount-other",
+      "pid": 15945,
+      "port": 53549,
+      "prepare_only": true,
+      "principal_gid": 20,
+      "principal_uid": 501,
+      "server_command": [
+        "/synthetic/fs0/magus-fs-probe",
+        "mount",
+        "--backend",
+        "nfs",
+        "--source",
+        "http://127.0.0.1:52462",
+        "--mode",
+        "ro",
+        "--mountpoint",
+        "/synthetic/fs0/mount-other",
+        "--expect-digest",
+        "7c331e63f7e2ce0acf8182bd9caafec85f87a0868f0408b8ee96622a79a76539",
+        "--prepare-only"
+      ],
+      "actual_mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53549,mountport=53549",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-other"
+      ],
+      "mount_table_entry": "127.0.0.1:/ on /synthetic/fs0/mount-other (nfs, nodev, nosuid, read-only, mounted by daniel)",
+      "effective_options": "vers=3,tcp,port=53549,mountport=53549,nomntudp,soft,nointr,noresvport,negnamecache,callumnt,locallocks,quota,rsize=65536,wsize=32768,readahead=16,dsize=32768,rdirplus,nodumbtimer,timeo=10,retrans=2,maxgroups=16,acregmin=1,acregmax=1,acdirmin=1,acdirmax=1,acrootdirmin=1,acrootdirmax=1,deadtimeout=60,nomutejukebox,nonfc,sec=none:sys,accesscache=3"
+    },
+    "file000": {
+      "address": "127.0.0.1",
+      "hydrated_bytes": 0,
+      "manifest_digest": "0a65c2d02b0cbcd1a7942b4743a716fd3821c26fb96e7a8b5bc71be10259a931",
+      "mode": "ro",
+      "mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,nolocks,vers=3,tcp,rsize=65536,actimeo=0,soft,timeo=10,retrans=2,port=53554,mountport=53554",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-file000"
+      ],
+      "mountpoint": "/synthetic/fs0/mount-file000",
+      "pid": 15954,
+      "port": 53554,
+      "prepare_only": true,
+      "principal_gid": 20,
+      "principal_uid": 501,
+      "server_command": [
+        "/synthetic/fs0/magus-fs-probe",
+        "mount",
+        "--backend",
+        "nfs",
+        "--source",
+        "http://127.0.0.1:52462",
+        "--mode",
+        "ro",
+        "--mountpoint",
+        "/synthetic/fs0/mount-file000",
+        "--expect-digest",
+        "0a65c2d02b0cbcd1a7942b4743a716fd3821c26fb96e7a8b5bc71be10259a931",
+        "--prepare-only"
+      ],
+      "actual_mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53554,mountport=53554",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-file000"
+      ],
+      "mount_table_entry": "127.0.0.1:/ on /synthetic/fs0/mount-file000 (nfs, nodev, nosuid, read-only, mounted by daniel)",
+      "effective_options": "vers=3,tcp,port=53554,mountport=53554,nomntudp,soft,nointr,noresvport,negnamecache,callumnt,locallocks,quota,rsize=65536,wsize=32768,readahead=16,dsize=32768,rdirplus,nodumbtimer,timeo=10,retrans=2,maxgroups=16,acregmin=1,acregmax=1,acdirmin=1,acdirmax=1,acrootdirmin=1,acrootdirmax=1,deadtimeout=60,nomutejukebox,nonfc,sec=none:sys,accesscache=3"
+    },
+    "file644": {
+      "address": "127.0.0.1",
+      "hydrated_bytes": 0,
+      "manifest_digest": "97c3a8c8a83a57541e3f703ae25bf7f0ed8abe707550cb80c3a0122969423bd5",
+      "mode": "ro",
+      "mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,nolocks,vers=3,tcp,rsize=65536,actimeo=0,soft,timeo=10,retrans=2,port=53557,mountport=53557",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-file644"
+      ],
+      "mountpoint": "/synthetic/fs0/mount-file644",
+      "pid": 15963,
+      "port": 53557,
+      "prepare_only": true,
+      "principal_gid": 20,
+      "principal_uid": 501,
+      "server_command": [
+        "/synthetic/fs0/magus-fs-probe",
+        "mount",
+        "--backend",
+        "nfs",
+        "--source",
+        "http://127.0.0.1:52462",
+        "--mode",
+        "ro",
+        "--mountpoint",
+        "/synthetic/fs0/mount-file644",
+        "--expect-digest",
+        "97c3a8c8a83a57541e3f703ae25bf7f0ed8abe707550cb80c3a0122969423bd5",
+        "--prepare-only"
+      ],
+      "actual_mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53557,mountport=53557",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-file644"
+      ],
+      "mount_table_entry": "127.0.0.1:/ on /synthetic/fs0/mount-file644 (nfs, nodev, nosuid, read-only, mounted by daniel)",
+      "effective_options": "vers=3,tcp,port=53557,mountport=53557,nomntudp,soft,nointr,noresvport,negnamecache,callumnt,locallocks,quota,rsize=65536,wsize=32768,readahead=16,dsize=32768,rdirplus,nodumbtimer,timeo=10,retrans=2,maxgroups=16,acregmin=1,acregmax=1,acdirmin=1,acdirmax=1,acrootdirmin=1,acrootdirmax=1,deadtimeout=60,nomutejukebox,nonfc,sec=none:sys,accesscache=3"
+    },
+    "directory000": {
+      "address": "127.0.0.1",
+      "hydrated_bytes": 0,
+      "manifest_digest": "073f6ee260fd327ac845cfe94cebf259a1584a362e1e53325a9f42690df79e29",
+      "mode": "ro",
+      "mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,nolocks,vers=3,tcp,rsize=65536,actimeo=0,soft,timeo=10,retrans=2,port=53560,mountport=53560",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-directory000"
+      ],
+      "mountpoint": "/synthetic/fs0/mount-directory000",
+      "pid": 15973,
+      "port": 53560,
+      "prepare_only": true,
+      "principal_gid": 20,
+      "principal_uid": 501,
+      "server_command": [
+        "/synthetic/fs0/magus-fs-probe",
+        "mount",
+        "--backend",
+        "nfs",
+        "--source",
+        "http://127.0.0.1:52462",
+        "--mode",
+        "ro",
+        "--mountpoint",
+        "/synthetic/fs0/mount-directory000",
+        "--expect-digest",
+        "073f6ee260fd327ac845cfe94cebf259a1584a362e1e53325a9f42690df79e29",
+        "--prepare-only"
+      ],
+      "actual_mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53560,mountport=53560",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-directory000"
+      ],
+      "mount_table_entry": "127.0.0.1:/ on /synthetic/fs0/mount-directory000 (nfs, nodev, nosuid, read-only, mounted by daniel)",
+      "effective_options": "vers=3,tcp,port=53560,mountport=53560,nomntudp,soft,nointr,noresvport,negnamecache,callumnt,locallocks,quota,rsize=65536,wsize=32768,readahead=16,dsize=32768,rdirplus,nodumbtimer,timeo=10,retrans=2,maxgroups=16,acregmin=1,acregmax=1,acdirmin=1,acdirmax=1,acrootdirmin=1,acrootdirmax=1,deadtimeout=60,nomutejukebox,nonfc,sec=none:sys,accesscache=3"
+    },
+    "directory400": {
+      "address": "127.0.0.1",
+      "hydrated_bytes": 0,
+      "manifest_digest": "67e853821d70c1e0c8b667a35ec477b5d321293f8e9e39a20aca59ba79065faf",
+      "mode": "ro",
+      "mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,nolocks,vers=3,tcp,rsize=65536,actimeo=0,soft,timeo=10,retrans=2,port=53563,mountport=53563",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-directory400"
+      ],
+      "mountpoint": "/synthetic/fs0/mount-directory400",
+      "pid": 15982,
+      "port": 53563,
+      "prepare_only": true,
+      "principal_gid": 20,
+      "principal_uid": 501,
+      "server_command": [
+        "/synthetic/fs0/magus-fs-probe",
+        "mount",
+        "--backend",
+        "nfs",
+        "--source",
+        "http://127.0.0.1:52462",
+        "--mode",
+        "ro",
+        "--mountpoint",
+        "/synthetic/fs0/mount-directory400",
+        "--expect-digest",
+        "67e853821d70c1e0c8b667a35ec477b5d321293f8e9e39a20aca59ba79065faf",
+        "--prepare-only"
+      ],
+      "actual_mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53563,mountport=53563",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-directory400"
+      ],
+      "mount_table_entry": "127.0.0.1:/ on /synthetic/fs0/mount-directory400 (nfs, nodev, nosuid, read-only, mounted by daniel)",
+      "effective_options": "vers=3,tcp,port=53563,mountport=53563,nomntudp,soft,nointr,noresvport,negnamecache,callumnt,locallocks,quota,rsize=65536,wsize=32768,readahead=16,dsize=32768,rdirplus,nodumbtimer,timeo=10,retrans=2,maxgroups=16,acregmin=1,acregmax=1,acdirmin=1,acdirmax=1,acrootdirmin=1,acrootdirmax=1,deadtimeout=60,nomutejukebox,nonfc,sec=none:sys,accesscache=3"
+    },
+    "directory100": {
+      "address": "127.0.0.1",
+      "hydrated_bytes": 0,
+      "manifest_digest": "d9dc5553776dc8ee8f2e71db5371abf0bde69a11a70194952862bd3e3a64d2f9",
+      "mode": "ro",
+      "mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,nolocks,vers=3,tcp,rsize=65536,actimeo=0,soft,timeo=10,retrans=2,port=53566,mountport=53566",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-directory100"
+      ],
+      "mountpoint": "/synthetic/fs0/mount-directory100",
+      "pid": 15991,
+      "port": 53566,
+      "prepare_only": true,
+      "principal_gid": 20,
+      "principal_uid": 501,
+      "server_command": [
+        "/synthetic/fs0/magus-fs-probe",
+        "mount",
+        "--backend",
+        "nfs",
+        "--source",
+        "http://127.0.0.1:52462",
+        "--mode",
+        "ro",
+        "--mountpoint",
+        "/synthetic/fs0/mount-directory100",
+        "--expect-digest",
+        "d9dc5553776dc8ee8f2e71db5371abf0bde69a11a70194952862bd3e3a64d2f9",
+        "--prepare-only"
+      ],
+      "actual_mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53566,mountport=53566",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-directory100"
+      ],
+      "mount_table_entry": "127.0.0.1:/ on /synthetic/fs0/mount-directory100 (nfs, nodev, nosuid, read-only, mounted by daniel)",
+      "effective_options": "vers=3,tcp,port=53566,mountport=53566,nomntudp,soft,nointr,noresvport,negnamecache,callumnt,locallocks,quota,rsize=65536,wsize=32768,readahead=16,dsize=32768,rdirplus,nodumbtimer,timeo=10,retrans=2,maxgroups=16,acregmin=1,acregmax=1,acdirmin=1,acdirmax=1,acrootdirmin=1,acrootdirmax=1,deadtimeout=60,nomutejukebox,nonfc,sec=none:sys,accesscache=3"
+    },
+    "generation-old": {
+      "address": "127.0.0.1",
+      "hydrated_bytes": 0,
+      "manifest_digest": "7da2a6998bc659f298580023bec0aec6655fe2273606dd3995b2d59fcdf319c6",
+      "mode": "ro",
+      "mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,nolocks,vers=3,tcp,rsize=65536,actimeo=0,soft,timeo=10,retrans=2,port=53577,mountport=53577",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-generation-old"
+      ],
+      "mountpoint": "/synthetic/fs0/mount-generation-old",
+      "pid": 16000,
+      "port": 53577,
+      "prepare_only": true,
+      "principal_gid": 20,
+      "principal_uid": 501,
+      "server_command": [
+        "/synthetic/fs0/magus-fs-probe",
+        "mount",
+        "--backend",
+        "nfs",
+        "--source",
+        "http://127.0.0.1:52462",
+        "--mode",
+        "ro",
+        "--mountpoint",
+        "/synthetic/fs0/mount-generation-old",
+        "--expect-digest",
+        "7da2a6998bc659f298580023bec0aec6655fe2273606dd3995b2d59fcdf319c6",
+        "--prepare-only"
+      ],
+      "actual_mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53577,mountport=53577",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-generation-old"
+      ],
+      "mount_table_entry": "127.0.0.1:/ on /synthetic/fs0/mount-generation-old (nfs, nodev, nosuid, read-only, mounted by daniel)",
+      "effective_options": "vers=3,tcp,port=53577,mountport=53577,nomntudp,soft,nointr,noresvport,negnamecache,callumnt,locallocks,quota,rsize=65536,wsize=32768,readahead=16,dsize=32768,rdirplus,nodumbtimer,timeo=10,retrans=2,maxgroups=16,acregmin=1,acregmax=1,acdirmin=1,acdirmax=1,acrootdirmin=1,acrootdirmax=1,deadtimeout=60,nomutejukebox,nonfc,sec=none:sys,accesscache=3"
+    },
+    "generation-fresh": {
+      "address": "127.0.0.1",
+      "hydrated_bytes": 0,
+      "manifest_digest": "daca3ec22372657dd1aa7eb24d0f6c9639433e9f76bf010da7853c9d948e97ae",
+      "mode": "ro",
+      "mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,nolocks,vers=3,tcp,rsize=65536,actimeo=0,soft,timeo=10,retrans=2,port=53582,mountport=53582",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-generation-fresh"
+      ],
+      "mountpoint": "/synthetic/fs0/mount-generation-fresh",
+      "pid": 16005,
+      "port": 53582,
+      "prepare_only": true,
+      "principal_gid": 20,
+      "principal_uid": 501,
+      "server_command": [
+        "/synthetic/fs0/magus-fs-probe",
+        "mount",
+        "--backend",
+        "nfs",
+        "--source",
+        "http://127.0.0.1:52462",
+        "--mode",
+        "ro",
+        "--mountpoint",
+        "/synthetic/fs0/mount-generation-fresh",
+        "--expect-digest",
+        "daca3ec22372657dd1aa7eb24d0f6c9639433e9f76bf010da7853c9d948e97ae",
+        "--prepare-only"
+      ],
+      "actual_mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53582,mountport=53582",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-generation-fresh"
+      ],
+      "mount_table_entry": "127.0.0.1:/ on /synthetic/fs0/mount-generation-fresh (nfs, nodev, nosuid, read-only, mounted by daniel)",
+      "effective_options": "vers=3,tcp,port=53582,mountport=53582,nomntudp,soft,nointr,noresvport,negnamecache,callumnt,locallocks,quota,rsize=65536,wsize=32768,readahead=16,dsize=32768,rdirplus,nodumbtimer,timeo=10,retrans=2,maxgroups=16,acregmin=1,acregmax=1,acdirmin=1,acdirmax=1,acrootdirmin=1,acrootdirmax=1,deadtimeout=60,nomutejukebox,nonfc,sec=none:sys,accesscache=3"
+    },
+    "source-failure": {
+      "address": "127.0.0.1",
+      "hydrated_bytes": 0,
+      "manifest_digest": "7da2a6998bc659f298580023bec0aec6655fe2273606dd3995b2d59fcdf319c6",
+      "mode": "ro",
+      "mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,nolocks,vers=3,tcp,rsize=65536,actimeo=0,soft,timeo=10,retrans=2,port=53593,mountport=53593",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-source-failure"
+      ],
+      "mountpoint": "/synthetic/fs0/mount-source-failure",
+      "pid": 16016,
+      "port": 53593,
+      "prepare_only": true,
+      "principal_gid": 20,
+      "principal_uid": 501,
+      "server_command": [
+        "/synthetic/fs0/magus-fs-probe",
+        "mount",
+        "--backend",
+        "nfs",
+        "--source",
+        "http://127.0.0.1:52462",
+        "--mode",
+        "ro",
+        "--mountpoint",
+        "/synthetic/fs0/mount-source-failure",
+        "--expect-digest",
+        "7da2a6998bc659f298580023bec0aec6655fe2273606dd3995b2d59fcdf319c6",
+        "--prepare-only"
+      ],
+      "actual_mount_command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53593,mountport=53593",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-source-failure"
+      ],
+      "mount_table_entry": "127.0.0.1:/ on /synthetic/fs0/mount-source-failure (nfs, nodev, nosuid, read-only, mounted by daniel)",
+      "effective_options": "vers=3,tcp,port=53593,mountport=53593,nomntudp,soft,nointr,noresvport,negnamecache,callumnt,locallocks,quota,rsize=65536,wsize=32768,readahead=16,dsize=32768,rdirplus,nodumbtimer,timeo=10,retrans=2,maxgroups=16,acregmin=1,acregmax=1,acdirmin=1,acdirmax=1,acrootdirmin=1,acrootdirmax=1,deadtimeout=60,nomutejukebox,nonfc,sec=none:sys,accesscache=3"
+    }
+  },
+  "commands": [
+    {
+      "command": [
+        "git",
+        "-C",
+        "/Users/daniel/Development/worktrees/magus-iteration-one/magus-fs",
+        "rev-parse",
+        "HEAD"
+      ],
+      "pid": 15804,
+      "returncode": 0,
+      "name": "revision"
+    },
+    {
+      "command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=52464,mountport=52464",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-normal-ro"
+      ],
+      "pid": 15849,
+      "returncode": 0,
+      "name": "normal-ro-mount"
+    },
+    {
+      "command": [
+        "/sbin/mount",
+        "-t",
+        "nfs"
+      ],
+      "pid": 15850,
+      "returncode": 0,
+      "name": "normal-ro-mount-table"
+    },
+    {
+      "command": [
+        "/usr/bin/nfsstat",
+        "-m"
+      ],
+      "pid": 15851,
+      "returncode": 0,
+      "name": "normal-ro-effective-options"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "enumeration"
+      ],
+      "pid": 15852,
+      "returncode": 0,
+      "name": "enumeration"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "partial-cold"
+      ],
+      "pid": 15853,
+      "returncode": 0,
+      "name": "partial-cold"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "partial-warm"
+      ],
+      "pid": 15854,
+      "returncode": 0,
+      "name": "partial-warm"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "full-scan"
+      ],
+      "pid": 15883,
+      "returncode": 0,
+      "name": "full-scan"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "readonly"
+      ],
+      "pid": 15894,
+      "returncode": 0,
+      "name": "readonly"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "subprocess"
+      ],
+      "pid": 15896,
+      "returncode": 0,
+      "name": "subprocess"
+    },
+    {
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-normal-ro"
+      ],
+      "pid": 15900,
+      "returncode": 0,
+      "name": "normal-ro-unmount"
+    },
+    {
+      "command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "rw,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53538,mountport=53538",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-normal-private"
+      ],
+      "pid": 15914,
+      "returncode": 0,
+      "name": "normal-private-mount"
+    },
+    {
+      "command": [
+        "/sbin/mount",
+        "-t",
+        "nfs"
+      ],
+      "pid": 15915,
+      "returncode": 0,
+      "name": "normal-private-mount-table"
+    },
+    {
+      "command": [
+        "/usr/bin/nfsstat",
+        "-m"
+      ],
+      "pid": 15916,
+      "returncode": 0,
+      "name": "normal-private-effective-options"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "private"
+      ],
+      "pid": 15917,
+      "returncode": 0,
+      "name": "private"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "persist"
+      ],
+      "pid": 15921,
+      "returncode": 0,
+      "name": "persist"
+    },
+    {
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-normal-private"
+      ],
+      "pid": 15923,
+      "returncode": 0,
+      "name": "normal-private-unmount"
+    },
+    {
+      "command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "rw,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53541,mountport=53541",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-resumed-private"
+      ],
+      "pid": 15927,
+      "returncode": 0,
+      "name": "resumed-private-mount"
+    },
+    {
+      "command": [
+        "/sbin/mount",
+        "-t",
+        "nfs"
+      ],
+      "pid": 15928,
+      "returncode": 0,
+      "name": "resumed-private-mount-table"
+    },
+    {
+      "command": [
+        "/usr/bin/nfsstat",
+        "-m"
+      ],
+      "pid": 15929,
+      "returncode": 0,
+      "name": "resumed-private-effective-options"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "resumed"
+      ],
+      "pid": 15930,
+      "returncode": 0,
+      "name": "resumed"
+    },
+    {
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-resumed-private"
+      ],
+      "pid": 15932,
+      "returncode": 0,
+      "name": "resumed-private-unmount"
+    },
+    {
+      "command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53544,mountport=53544",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-group"
+      ],
+      "pid": 15936,
+      "returncode": 0,
+      "name": "group-mount"
+    },
+    {
+      "command": [
+        "/sbin/mount",
+        "-t",
+        "nfs"
+      ],
+      "pid": 15937,
+      "returncode": 0,
+      "name": "group-mount-table"
+    },
+    {
+      "command": [
+        "/usr/bin/nfsstat",
+        "-m"
+      ],
+      "pid": 15938,
+      "returncode": 0,
+      "name": "group-effective-options"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "group"
+      ],
+      "pid": 15939,
+      "returncode": 0,
+      "name": "group"
+    },
+    {
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-group"
+      ],
+      "pid": 15942,
+      "returncode": 0,
+      "name": "group-unmount"
+    },
+    {
+      "command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53549,mountport=53549",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-other"
+      ],
+      "pid": 15946,
+      "returncode": 0,
+      "name": "other-mount"
+    },
+    {
+      "command": [
+        "/sbin/mount",
+        "-t",
+        "nfs"
+      ],
+      "pid": 15947,
+      "returncode": 0,
+      "name": "other-mount-table"
+    },
+    {
+      "command": [
+        "/usr/bin/nfsstat",
+        "-m"
+      ],
+      "pid": 15948,
+      "returncode": 0,
+      "name": "other-effective-options"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "other"
+      ],
+      "pid": 15949,
+      "returncode": 0,
+      "name": "other"
+    },
+    {
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-other"
+      ],
+      "pid": 15951,
+      "returncode": 0,
+      "name": "other-unmount"
+    },
+    {
+      "command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53554,mountport=53554",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-file000"
+      ],
+      "pid": 15955,
+      "returncode": 0,
+      "name": "file000-mount"
+    },
+    {
+      "command": [
+        "/sbin/mount",
+        "-t",
+        "nfs"
+      ],
+      "pid": 15956,
+      "returncode": 0,
+      "name": "file000-mount-table"
+    },
+    {
+      "command": [
+        "/usr/bin/nfsstat",
+        "-m"
+      ],
+      "pid": 15957,
+      "returncode": 0,
+      "name": "file000-effective-options"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "file000"
+      ],
+      "pid": 15958,
+      "returncode": 0,
+      "name": "file000"
+    },
+    {
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-file000"
+      ],
+      "pid": 15960,
+      "returncode": 0,
+      "name": "file000-unmount"
+    },
+    {
+      "command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53557,mountport=53557",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-file644"
+      ],
+      "pid": 15964,
+      "returncode": 0,
+      "name": "file644-mount"
+    },
+    {
+      "command": [
+        "/sbin/mount",
+        "-t",
+        "nfs"
+      ],
+      "pid": 15965,
+      "returncode": 0,
+      "name": "file644-mount-table"
+    },
+    {
+      "command": [
+        "/usr/bin/nfsstat",
+        "-m"
+      ],
+      "pid": 15966,
+      "returncode": 0,
+      "name": "file644-effective-options"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "file644"
+      ],
+      "pid": 15967,
+      "returncode": 0,
+      "name": "file644"
+    },
+    {
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-file644"
+      ],
+      "pid": 15970,
+      "returncode": 0,
+      "name": "file644-unmount"
+    },
+    {
+      "command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53560,mountport=53560",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-directory000"
+      ],
+      "pid": 15974,
+      "returncode": 0,
+      "name": "directory000-mount"
+    },
+    {
+      "command": [
+        "/sbin/mount",
+        "-t",
+        "nfs"
+      ],
+      "pid": 15975,
+      "returncode": 0,
+      "name": "directory000-mount-table"
+    },
+    {
+      "command": [
+        "/usr/bin/nfsstat",
+        "-m"
+      ],
+      "pid": 15976,
+      "returncode": 0,
+      "name": "directory000-effective-options"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "directory000"
+      ],
+      "pid": 15977,
+      "returncode": 0,
+      "name": "directory000"
+    },
+    {
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-directory000"
+      ],
+      "pid": 15979,
+      "returncode": 0,
+      "name": "directory000-unmount"
+    },
+    {
+      "command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53563,mountport=53563",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-directory400"
+      ],
+      "pid": 15983,
+      "returncode": 0,
+      "name": "directory400-mount"
+    },
+    {
+      "command": [
+        "/sbin/mount",
+        "-t",
+        "nfs"
+      ],
+      "pid": 15984,
+      "returncode": 0,
+      "name": "directory400-mount-table"
+    },
+    {
+      "command": [
+        "/usr/bin/nfsstat",
+        "-m"
+      ],
+      "pid": 15985,
+      "returncode": 0,
+      "name": "directory400-effective-options"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "directory400"
+      ],
+      "pid": 15986,
+      "returncode": 0,
+      "name": "directory400"
+    },
+    {
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-directory400"
+      ],
+      "pid": 15988,
+      "returncode": 0,
+      "name": "directory400-unmount"
+    },
+    {
+      "command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53566,mountport=53566",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-directory100"
+      ],
+      "pid": 15992,
+      "returncode": 0,
+      "name": "directory100-mount"
+    },
+    {
+      "command": [
+        "/sbin/mount",
+        "-t",
+        "nfs"
+      ],
+      "pid": 15993,
+      "returncode": 0,
+      "name": "directory100-mount-table"
+    },
+    {
+      "command": [
+        "/usr/bin/nfsstat",
+        "-m"
+      ],
+      "pid": 15994,
+      "returncode": 0,
+      "name": "directory100-effective-options"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "directory100"
+      ],
+      "pid": 15995,
+      "returncode": 0,
+      "name": "directory100"
+    },
+    {
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-directory100"
+      ],
+      "pid": 15997,
+      "returncode": 0,
+      "name": "directory100-unmount"
+    },
+    {
+      "command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53577,mountport=53577",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-generation-old"
+      ],
+      "pid": 16001,
+      "returncode": 0,
+      "name": "generation-old-mount"
+    },
+    {
+      "command": [
+        "/sbin/mount",
+        "-t",
+        "nfs"
+      ],
+      "pid": 16002,
+      "returncode": 0,
+      "name": "generation-old-mount-table"
+    },
+    {
+      "command": [
+        "/usr/bin/nfsstat",
+        "-m"
+      ],
+      "pid": 16003,
+      "returncode": 0,
+      "name": "generation-old-effective-options"
+    },
+    {
+      "command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53582,mountport=53582",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-generation-fresh"
+      ],
+      "pid": 16006,
+      "returncode": 0,
+      "name": "generation-fresh-mount"
+    },
+    {
+      "command": [
+        "/sbin/mount",
+        "-t",
+        "nfs"
+      ],
+      "pid": 16007,
+      "returncode": 0,
+      "name": "generation-fresh-mount-table"
+    },
+    {
+      "command": [
+        "/usr/bin/nfsstat",
+        "-m"
+      ],
+      "pid": 16008,
+      "returncode": 0,
+      "name": "generation-fresh-effective-options"
+    },
+    {
+      "name": "generation",
+      "command": [
+        "synthetic-workload",
+        "generation"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-generation-fresh"
+      ],
+      "pid": 16010,
+      "returncode": 0,
+      "name": "generation-fresh-unmount"
+    },
+    {
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-generation-old"
+      ],
+      "pid": 16014,
+      "returncode": 0,
+      "name": "generation-old-unmount"
+    },
+    {
+      "command": [
+        "/sbin/mount_nfs",
+        "-o",
+        "ro,locallocks,vers=3,tcp,rsize=65536,actimeo=1,soft,timeo=10,retrans=2,port=53593,mountport=53593",
+        "127.0.0.1:/",
+        "/synthetic/fs0/mount-source-failure"
+      ],
+      "pid": 16018,
+      "returncode": 0,
+      "name": "source-failure-mount"
+    },
+    {
+      "command": [
+        "/sbin/mount",
+        "-t",
+        "nfs"
+      ],
+      "pid": 16019,
+      "returncode": 0,
+      "name": "source-failure-mount-table"
+    },
+    {
+      "command": [
+        "/usr/bin/nfsstat",
+        "-m"
+      ],
+      "pid": 16020,
+      "returncode": 0,
+      "name": "source-failure-effective-options"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "failure-warm"
+      ],
+      "pid": 16021,
+      "returncode": 0,
+      "name": "failure-warm"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "source-failure"
+      ],
+      "pid": 16022,
+      "returncode": 0,
+      "name": "source-failure"
+    },
+    {
+      "command": [
+        "synthetic-workload",
+        "source-recovery"
+      ],
+      "pid": 16023,
+      "returncode": 0,
+      "name": "source-recovery"
+    },
+    {
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-source-failure"
+      ],
+      "pid": 16025,
+      "returncode": 0,
+      "name": "source-failure-unmount"
+    }
+  ],
+  "cases": {
+    "enumeration": {
+      "state": "passed",
+      "observed": [
+        "data.bin",
+        "empty",
+        "instructions.md",
+        "nested",
+        "run.sh"
+      ],
+      "command": [
+        "synthetic-workload",
+        "enumeration"
+      ]
+    },
+    "partial-cold": {
+      "state": "passed",
+      "observed": {
+        "exact_head_tail": true
+      },
+      "command": [
+        "synthetic-workload",
+        "partial-cold"
+      ]
+    },
+    "partial-warm": {
+      "state": "passed",
+      "observed": {
+        "exact_head_tail": true
+      },
+      "command": [
+        "synthetic-workload",
+        "partial-warm"
+      ]
+    },
+    "full-scan": {
+      "state": "passed",
+      "observed": {
+        "bytes": 67108864,
+        "digest": "1977adb6a954de29fb854e5ea942b2ba29bc8c7846e83440d94e37ab61858369",
+        "independent_digest": "1977adb6a954de29fb854e5ea942b2ba29bc8c7846e83440d94e37ab61858369"
+      },
+      "command": [
+        "synthetic-workload",
+        "full-scan"
+      ]
+    },
+    "readonly": {
+      "state": "passed",
+      "observed": {
+        "mount": {
+          "state": "passed",
+          "device": 436207644
+        },
+        "metadata_permissions": {
+          "state": "passed",
+          "detail": [
+            {
+              "path": "instructions.md",
+              "uid_gid_mode": [
+                501,
+                20,
+                420
+              ]
+            },
+            {
+              "path": "nested/table.csv",
+              "uid_gid_mode": [
+                501,
+                20,
+                420
+              ]
+            },
+            {
+              "path": "run.sh",
+              "uid_gid_mode": [
+                501,
+                20,
+                493
+              ]
+            },
+            {
+              "path": "empty",
+              "uid_gid_mode": [
+                501,
+                20,
+                420
+              ]
+            },
+            {
+              "path": "data.bin",
+              "uid_gid_mode": [
+                501,
+                20,
+                420
+              ]
+            },
+            {
+              "path": "nested",
+              "uid_gid_mode": [
+                501,
+                20,
+                493
+              ]
+            }
+          ]
+        },
+        "range_reads": {
+          "state": "passed",
+          "detail": "pread header, cross-boundary, tail, EOF"
+        },
+        "warm_repeat": {
+          "state": "passed",
+          "detail": "pread header, cross-boundary, tail, EOF"
+        },
+        "mmap_read": {
+          "state": "passed",
+          "detail": "mmap ACCESS_READ header/tail"
+        },
+        "readonly_write": {
+          "state": "passed",
+          "detail": {
+            "errno": 30,
+            "message": "[Errno 30] Read-only file system: '/synthetic/fs0/mount-normal-ro/instructions.md'"
+          }
+        },
+        "readonly_truncate": {
+          "state": "passed",
+          "detail": {
+            "errno": 30,
+            "message": "[Errno 30] Read-only file system: '/synthetic/fs0/mount-normal-ro/instructions.md'"
+          }
+        },
+        "readonly_chmod": {
+          "state": "passed",
+          "detail": {
+            "errno": 30,
+            "message": "[Errno 30] Read-only file system: '/synthetic/fs0/mount-normal-ro/instructions.md'"
+          }
+        },
+        "readonly_unlink": {
+          "state": "passed",
+          "detail": {
+            "errno": 30,
+            "message": "[Errno 30] Read-only file system: '/synthetic/fs0/mount-normal-ro/instructions.md'"
+          }
+        },
+        "readonly_rename": {
+          "state": "passed",
+          "detail": {
+            "errno": 30,
+            "message": "[Errno 30] Read-only file system: '/synthetic/fs0/mount-normal-ro/instructions.md' -> '/synthetic/fs0/mount-normal-ro/renamed'"
+          }
+        },
+        "readonly_create": {
+          "state": "passed",
+          "detail": {
+            "errno": 30,
+            "message": "[Errno 30] Read-only file system: '/synthetic/fs0/mount-normal-ro/new'"
+          }
+        },
+        "locks_observation": {
+          "state": "passed",
+          "detail": {
+            "state": "contended",
+            "operation": "flock",
+            "errno": 35,
+            "contender_returncode": 75,
+            "command": [
+              "/opt/homebrew/opt/python@3.14/bin/python3.14",
+              "-c",
+              "import errno,fcntl,json,sys\ntry:\n    handle = open(sys.argv[1], 'rb')\nexcept OSError as error:\n    print(json.dumps({'state':'failed','operation':'open','errno':error.errno,'error':str(error)}))\n    sys.exit(1)\ntry:\n    with handle:\n        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)\nexcept OSError as error:\n    if error.errno in (errno.EAGAIN, errno.EWOULDBLOCK):\n        print(json.dumps({'state':'contended','operation':'flock','errno':error.errno}))\n        sys.exit(75)\n    print(json.dumps({'state':'failed','operation':'flock','errno':error.errno,'error':str(error)}))\n    sys.exit(1)\nprint(json.dumps({'state':'acquired','operation':'flock'}))\nsys.exit(0)\n",
+              "/synthetic/fs0/mount-normal-ro/instructions.md"
+            ],
+            "scope": "one kernel/client; no distributed lock guarantee"
+          }
+        },
+        "root_metadata": {
+          "state": "passed",
+          "detail": {
+            "uid": 501,
+            "gid": 20,
+            "mode": 493,
+            "scope": "daemon-mapped root; outside manifest digest"
+          }
+        }
+      },
+      "command": [
+        "synthetic-workload",
+        "readonly"
+      ]
+    },
+    "subprocess": {
+      "state": "passed",
+      "observed": {
+        "interpreter_command": [
+          "/bin/sh",
+          "/synthetic/fs0/mount-normal-ro/run.sh"
+        ],
+        "output": "synthetic\n",
+        "direct_execute": {
+          "supported": true,
+          "stdout": "synthetic\n"
+        }
+      },
+      "command": [
+        "synthetic-workload",
+        "subprocess"
+      ]
+    },
+    "private": {
+      "state": "passed",
+      "observed": {
+        "mount": {
+          "state": "passed",
+          "device": 436207645
+        },
+        "metadata_permissions": {
+          "state": "passed",
+          "detail": [
+            {
+              "path": "instructions.md",
+              "uid_gid_mode": [
+                501,
+                20,
+                420
+              ]
+            },
+            {
+              "path": "nested/table.csv",
+              "uid_gid_mode": [
+                501,
+                20,
+                420
+              ]
+            },
+            {
+              "path": "run.sh",
+              "uid_gid_mode": [
+                501,
+                20,
+                493
+              ]
+            },
+            {
+              "path": "empty",
+              "uid_gid_mode": [
+                501,
+                20,
+                420
+              ]
+            },
+            {
+              "path": "data.bin",
+              "uid_gid_mode": [
+                501,
+                20,
+                420
+              ]
+            },
+            {
+              "path": "nested",
+              "uid_gid_mode": [
+                501,
+                20,
+                493
+              ]
+            }
+          ]
+        },
+        "range_reads": {
+          "state": "passed",
+          "detail": "pread header, cross-boundary, tail, EOF"
+        },
+        "warm_repeat": {
+          "state": "passed",
+          "detail": "pread header, cross-boundary, tail, EOF"
+        },
+        "mmap_read": {
+          "state": "passed",
+          "detail": "mmap ACCESS_READ header/tail"
+        },
+        "private_writes": {
+          "state": "passed",
+          "detail": "write, fsync, pread, restore, truncate, fsync"
+        },
+        "rename_replacement_old_handle": {
+          "state": "passed",
+          "detail": "OSError(30, 'Read-only file system')",
+          "errno": 30,
+          "observed_support": "unsupported CREATE; replacement was not performed"
+        },
+        "locks_observation": {
+          "state": "passed",
+          "detail": {
+            "state": "contended",
+            "operation": "flock",
+            "errno": 35,
+            "contender_returncode": 75,
+            "command": [
+              "/opt/homebrew/opt/python@3.14/bin/python3.14",
+              "-c",
+              "import errno,fcntl,json,sys\ntry:\n    handle = open(sys.argv[1], 'rb')\nexcept OSError as error:\n    print(json.dumps({'state':'failed','operation':'open','errno':error.errno,'error':str(error)}))\n    sys.exit(1)\ntry:\n    with handle:\n        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)\nexcept OSError as error:\n    if error.errno in (errno.EAGAIN, errno.EWOULDBLOCK):\n        print(json.dumps({'state':'contended','operation':'flock','errno':error.errno}))\n        sys.exit(75)\n    print(json.dumps({'state':'failed','operation':'flock','errno':error.errno,'error':str(error)}))\n    sys.exit(1)\nprint(json.dumps({'state':'acquired','operation':'flock'}))\nsys.exit(0)\n",
+              "/synthetic/fs0/mount-normal-private/instructions.md"
+            ],
+            "scope": "one kernel/client; no distributed lock guarantee"
+          }
+        },
+        "rename_existing_classification": {
+          "errno": 30,
+          "observed_support": "unsupported; only the denial characterization passed"
+        },
+        "private_execute0644_denied": {
+          "errno": 13
+        },
+        "private_execute0755": {
+          "state": "passed",
+          "stdout": "synthetic\n"
+        },
+        "old_handle_mmap_visibility": {
+          "state": "passed",
+          "detail": "same kernel private byte writes visible; no replacement generation guarantee"
+        },
+        "root_metadata": {
+          "state": "passed",
+          "detail": {
+            "uid": 501,
+            "gid": 20,
+            "mode": 493,
+            "scope": "daemon-mapped root; outside manifest digest"
+          }
+        }
+      },
+      "command": [
+        "synthetic-workload",
+        "private"
+      ]
+    },
+    "persist": {
+      "state": "passed",
+      "observed": {
+        "native_fsync_returned": true,
+        "durable_prefix": "durable",
+        "mode": 292
+      },
+      "command": [
+        "synthetic-workload",
+        "persist"
+      ]
+    },
+    "resumed": {
+      "state": "passed",
+      "observed": {
+        "native_remount_data_and_chmod_preserved": true,
+        "write_open_denied": {
+          "errno": 13
+        },
+        "process_restart_only": "not power-cut proof"
+      },
+      "command": [
+        "synthetic-workload",
+        "resumed"
+      ]
+    },
+    "group": {
+      "state": "passed",
+      "observed": {
+        "read_via_group": true,
+        "uid": 12345,
+        "gid": 20,
+        "mode": 32
+      },
+      "command": [
+        "synthetic-workload",
+        "group"
+      ]
+    },
+    "other": {
+      "state": "passed",
+      "observed": {
+        "read_via_other": true,
+        "uid": 12345,
+        "gid": 12345,
+        "mode": 4
+      },
+      "command": [
+        "synthetic-workload",
+        "other"
+      ]
+    },
+    "file000": {
+      "state": "passed",
+      "observed": {
+        "read_denied": {
+          "errno": 13
+        }
+      },
+      "command": [
+        "synthetic-workload",
+        "file000"
+      ]
+    },
+    "file644": {
+      "state": "passed",
+      "observed": {
+        "direct_execute_denied": {
+          "errno": 13
+        }
+      },
+      "command": [
+        "synthetic-workload",
+        "file644"
+      ]
+    },
+    "directory000": {
+      "state": "passed",
+      "observed": {
+        "listing_denied": {
+          "errno": 13
+        },
+        "child_read_denied": {
+          "errno": 13
+        }
+      },
+      "command": [
+        "synthetic-workload",
+        "directory000"
+      ]
+    },
+    "directory400": {
+      "state": "passed",
+      "observed": {
+        "names_readable_without_search": true,
+        "child_read_denied": {
+          "errno": 13
+        },
+        "child_stat_denied": {
+          "errno": 13
+        }
+      },
+      "command": [
+        "synthetic-workload",
+        "directory400"
+      ]
+    },
+    "directory100": {
+      "state": "passed",
+      "observed": {
+        "listing_denied": {
+          "errno": 13
+        },
+        "search_without_listing": true
+      },
+      "command": [
+        "synthetic-workload",
+        "directory100"
+      ]
+    },
+    "generation": {
+      "state": "passed",
+      "observed": {
+        "old_open_and_mmap_pinned": true,
+        "fresh_generation_mode": 416,
+        "old_mode_after_ttl": 420,
+        "in_place_invalidation": "unsupported: no generation publication API"
+      },
+      "command": [
+        "synthetic-workload",
+        "generation"
+      ]
+    },
+    "failure-warm": {
+      "state": "passed",
+      "observed": {
+        "exact_tiny_file": true
+      },
+      "command": [
+        "synthetic-workload",
+        "failure-warm"
+      ]
+    },
+    "source-failure": {
+      "state": "passed",
+      "observed": {
+        "warmed_file_survives_source_failure": true,
+        "uncached_read": {
+          "errno": 5
+        }
+      },
+      "command": [
+        "synthetic-workload",
+        "source-failure"
+      ]
+    },
+    "source-recovery": {
+      "state": "passed",
+      "observed": {
+        "exact_head_tail": true
+      },
+      "command": [
+        "synthetic-workload",
+        "source-recovery"
+      ]
+    }
+  },
+  "transfer": {
+    "before": {
+      "metadata_bytes": 18003,
+      "content_body_bytes": 0,
+      "unique_chunks": 0,
+      "retry_requests": 0
+    },
+    "enumeration": {
+      "metadata_bytes": 18003,
+      "content_body_bytes": 0,
+      "unique_chunks": 0,
+      "retry_requests": 0
+    },
+    "cold": {
+      "metadata_bytes": 18003,
+      "content_body_bytes": 1310720,
+      "unique_chunks": 5,
+      "retry_requests": 0
+    },
+    "warm": {
+      "metadata_bytes": 18003,
+      "content_body_bytes": 1310720,
+      "unique_chunks": 5,
+      "retry_requests": 0
+    },
+    "full": {
+      "metadata_bytes": 18003,
+      "content_body_bytes": 67108864,
+      "unique_chunks": 256,
+      "retry_requests": 0
+    },
+    "full_scan": {
+      "bytes": 67108864,
+      "digest": "1977adb6a954de29fb854e5ea942b2ba29bc8c7846e83440d94e37ab61858369",
+      "independent_digest": "1977adb6a954de29fb854e5ea942b2ba29bc8c7846e83440d94e37ab61858369"
+    },
+    "cold_delta": 1310720,
+    "warm_delta": 0,
+    "full_scan_delta": 65798144
+  },
+  "private_hydrated_bytes": 67108958,
+  "generation_digests": {
+    "old": "7da2a6998bc659f298580023bec0aec6655fe2273606dd3995b2d59fcdf319c6",
+    "fresh": "daca3ec22372657dd1aa7eb24d0f6c9639433e9f76bf010da7853c9d948e97ae"
+  },
+  "cleanup": [
+    {
+      "name": "normal-ro",
+      "path": "/synthetic/fs0/mount-normal-ro",
+      "was_mounted": true,
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-normal-ro"
+      ],
+      "returncode": 0,
+      "timeout": false,
+      "still_mounted": false
+    },
+    {
+      "name": "normal-private",
+      "path": "/synthetic/fs0/mount-normal-private",
+      "was_mounted": true,
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-normal-private"
+      ],
+      "returncode": 0,
+      "timeout": false,
+      "still_mounted": false
+    },
+    {
+      "name": "resumed-private",
+      "path": "/synthetic/fs0/mount-resumed-private",
+      "was_mounted": true,
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-resumed-private"
+      ],
+      "returncode": 0,
+      "timeout": false,
+      "still_mounted": false
+    },
+    {
+      "name": "group",
+      "path": "/synthetic/fs0/mount-group",
+      "was_mounted": true,
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-group"
+      ],
+      "returncode": 0,
+      "timeout": false,
+      "still_mounted": false
+    },
+    {
+      "name": "other",
+      "path": "/synthetic/fs0/mount-other",
+      "was_mounted": true,
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-other"
+      ],
+      "returncode": 0,
+      "timeout": false,
+      "still_mounted": false
+    },
+    {
+      "name": "file000",
+      "path": "/synthetic/fs0/mount-file000",
+      "was_mounted": true,
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-file000"
+      ],
+      "returncode": 0,
+      "timeout": false,
+      "still_mounted": false
+    },
+    {
+      "name": "file644",
+      "path": "/synthetic/fs0/mount-file644",
+      "was_mounted": true,
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-file644"
+      ],
+      "returncode": 0,
+      "timeout": false,
+      "still_mounted": false
+    },
+    {
+      "name": "directory000",
+      "path": "/synthetic/fs0/mount-directory000",
+      "was_mounted": true,
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-directory000"
+      ],
+      "returncode": 0,
+      "timeout": false,
+      "still_mounted": false
+    },
+    {
+      "name": "directory400",
+      "path": "/synthetic/fs0/mount-directory400",
+      "was_mounted": true,
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-directory400"
+      ],
+      "returncode": 0,
+      "timeout": false,
+      "still_mounted": false
+    },
+    {
+      "name": "directory100",
+      "path": "/synthetic/fs0/mount-directory100",
+      "was_mounted": true,
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-directory100"
+      ],
+      "returncode": 0,
+      "timeout": false,
+      "still_mounted": false
+    },
+    {
+      "name": "generation-fresh",
+      "path": "/synthetic/fs0/mount-generation-fresh",
+      "was_mounted": true,
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-generation-fresh"
+      ],
+      "returncode": 0,
+      "timeout": false,
+      "still_mounted": false
+    },
+    {
+      "name": "generation-old",
+      "path": "/synthetic/fs0/mount-generation-old",
+      "was_mounted": true,
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-generation-old"
+      ],
+      "returncode": 0,
+      "timeout": false,
+      "still_mounted": false
+    },
+    {
+      "name": "source-failure",
+      "path": "/synthetic/fs0/mount-source-failure",
+      "was_mounted": true,
+      "command": [
+        "/sbin/umount",
+        "/synthetic/fs0/mount-source-failure"
+      ],
+      "returncode": 0,
+      "timeout": false,
+      "still_mounted": false
+    }
+  ],
+  "reaped": [
+    {
+      "pid": 15805,
+      "returncode": -15
+    },
+    {
+      "pid": 15848,
+      "returncode": -15
+    },
+    {
+      "pid": 15903,
+      "returncode": -15
+    },
+    {
+      "pid": 15926,
+      "returncode": -15
+    },
+    {
+      "pid": 15935,
+      "returncode": -15
+    },
+    {
+      "pid": 15945,
+      "returncode": -15
+    },
+    {
+      "pid": 15954,
+      "returncode": -15
+    },
+    {
+      "pid": 15963,
+      "returncode": -15
+    },
+    {
+      "pid": 15973,
+      "returncode": -15
+    },
+    {
+      "pid": 15982,
+      "returncode": -15
+    },
+    {
+      "pid": 15991,
+      "returncode": -15
+    },
+    {
+      "pid": 16000,
+      "returncode": -15
+    },
+    {
+      "pid": 16004,
+      "returncode": 0
+    },
+    {
+      "pid": 16005,
+      "returncode": -15
+    },
+    {
+      "pid": 16016,
+      "returncode": -15
+    }
+  ],
+  "cleanup_errors": [],
+  "remaining_owned_resources": [],
+  "fixture_scope": "synthetic normalization input derived from reviewed schema; not native evidence"
+}

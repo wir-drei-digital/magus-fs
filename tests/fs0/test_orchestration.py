@@ -23,7 +23,7 @@ class OrchestrationFailures(unittest.TestCase):
             with patch.object(run,'collect',return_value={'scope':'synthetic test inventory'}), \
                  patch.object(run.subprocess,'run',side_effect=prerequisites), \
                  patch.object(linux_run,'run',side_effect=runner):
-                code = run.main(['--platform','linux','--output',str(output)])
+                code = run.main(['--platform','linux','--image','fs0-task4-runtime','--output',str(output)])
             report = json.loads((output / 'result.json').read_text())
             path = output / 'linux-1-65536/result.json'
             native = json.loads(path.read_text()) if path.exists() else None
