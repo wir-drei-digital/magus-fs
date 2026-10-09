@@ -32,6 +32,6 @@ name = "chunk_layout"
 path = "benches/chunk_layout.rs"
 
 [workspace]
-members = ["crates/magus-fs-core", "crates/magus-fs"]
+members = ["crates/magus-fs-core", "crates/magus-fs", "crates/magus-fs-service"]
 default-members = [".", "crates/magus-fs-core", "crates/magus-fs"]
 resolver = "2"
