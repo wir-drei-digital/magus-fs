@@ -1,5 +1,6 @@
 """Owned macOS NFS qualification. Never treats mount registration as a pass."""
 import argparse
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -111,6 +112,19 @@ def command(args, output, timeout=20, *, owned=None, guard=None, mountpoint=None
             if process is not None:
                 settle(process)
             raise
+
+
+@contextmanager
+def defer_cleanup_interrupts(report):
+    """Ctrl-C records failure; it cannot abandon an in-process source gateway."""
+    def interrupted(signum, frame):
+        report['cleanup_interrupts'] = report.get('cleanup_interrupts', 0) + 1
+        report['passed'] = False
+    previous = signal.signal(signal.SIGINT, interrupted)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 def effective_options(text, path, readonly):
@@ -357,38 +371,46 @@ def run(output, prepare_only=False, chunk_size=262144, uid=501, gid=20):
         report['error']=repr(error)
         report['passed']=False
     finally:
-        # Reap interrupted syscall helpers before touching mounts; serving daemons remain live.
-        for process in guard.attempts:
-            if process.poll() is None: settle(process)
-        for item in reversed(endpoints):
-            if mount_state(item['path']) is not False:
-                try: unmount(item)
-                except Exception as error:
-                    report['cleanup_errors'].append(repr(error))
-        save()
-        if not guard.safe():
-            report['passed']=False
-            report['remaining_owned_resources']=[str(path) for path in guard.paths if mount_state(path) is not False]
-            report['cleanup_errors'].append('servers retained until owned mounts and command children are resolved')
+        with defer_cleanup_interrupts(report):
+            # Reap interrupted syscall helpers before touching mounts; serving daemons remain live.
+            for process in guard.attempts:
+                if process.poll() is None: settle(process)
+            for item in reversed(endpoints):
+                if mount_state(item['path']) is not False:
+                    try: unmount(item)
+                    except (Exception, KeyboardInterrupt) as error:
+                        report['cleanup_errors'].append(repr(error))
+            def pending():
+                report['remaining_owned_resources']=[str(path) for path in guard.paths if mount_state(path) is not False]
+                report['remaining_owned_command_pids']=[p.pid for p in guard.attempts if p.poll() is None]
+            pending()
             save()
-            print('Cleanup pending. Owned report: '+str(report_path),flush=True)
-            for point in report['remaining_owned_resources']:
-                print(shlex.join(['sudo','/sbin/umount','-f',point]),flush=True)
-            while not guard.safe():
-                try: time.sleep(1)
-                except KeyboardInterrupt: continue
-        if gateway is not None:
-            gateway.shutdown()
-            gateway.server_close()
-            gateway_thread.join(timeout=5)
-        guard.cleanup()
-        report['cleanup_errors'].extend(guard.cleanup_errors)
-        report['reaped']=[{'pid':p.pid,'returncode':p.poll()} for p in processes]
-        report['remaining_owned_resources']=[str(path) for path in guard.paths if mount_state(path) is not False]
-        if report['cleanup_errors'] or report['remaining_owned_resources'] or any(p.poll() is None for p in processes):
-            report['passed']=False
-        report['state']='passed' if report['passed'] else 'failed'
-        save()
+            if not guard.safe():
+                report['passed']=False
+                report['state']='cleanup_pending'
+                pending()
+                report['cleanup_errors'].append('servers retained until owned mounts and command children are resolved')
+                save()
+                print('Cleanup pending. Owned report: '+str(report_path),flush=True)
+                for point in report['remaining_owned_resources']:
+                    print(shlex.join(['sudo','/sbin/umount','-f',point]),flush=True)
+                while not guard.safe():
+                    pending()
+                    save()
+                    try: time.sleep(1)
+                    except KeyboardInterrupt: continue
+            if gateway is not None:
+                gateway.shutdown()
+                gateway.server_close()
+                gateway_thread.join(timeout=5)
+            guard.cleanup()
+            report['cleanup_errors'].extend(guard.cleanup_errors)
+            report['reaped']=[{'pid':p.pid,'returncode':p.poll()} for p in processes]
+            pending()
+            if report['cleanup_errors'] or report['remaining_owned_resources'] or any(p.poll() is None for p in processes):
+                report['passed']=False
+            report['state']='passed' if report['passed'] else 'failed'
+            save()
     print(report_path,flush=True)
     return 0 if report['passed'] else 1
 
