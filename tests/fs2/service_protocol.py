@@ -72,6 +72,7 @@ class Journey(StorageJourney):
         seed=self.expect('seed','POST',self.root+'/seed',200,body={'branch':'main','revision':rid,'upload':upload})
         code,worker=self.request('POST',self.root+'/grants',body={'delegate':{'replica':WORKER,'expires':int(time.time())+1800,'actions':['read','write','history','integrate'],'branches':['main'],'prefixes':['reports']}})
         assert code==200;self.tokens['worker']=worker['token'];self.i.private('worker-token',worker['token'])
+        if getattr(self,'review_edge_only',False):self.review_edges();return
         if getattr(self,'ancestry_only',False):self.ancestry_sizes();return
         if getattr(self,'pressure_only',False):self.pressure();return
         self.i.snapshot_volumes();self.i.docker('stop','--time','5',self.i.s3)
@@ -138,6 +139,56 @@ class Journey(StorageJourney):
         logs=self.i.docker('exec',self.i.service,'cat','/tmp/service.log').stdout
         assert not any(token in logs for token in self.tokens.values())
         self.observations.append({'case':'service-log-redaction','credential_matches':0})
+        self.i.write_json('observations.json',self.observations)
+    def review_edges(self):
+        failures=[]
+        for name,case in [('I1',self.hidden_move_recovery),('I2',self.transitive_projection)]:
+            try:case()
+            except Exception as error:
+                failures.append(name+': '+str(error))
+                self.observations.append({'case':'review-edge-failure','issue':name,'error':str(error)})
+                self.i.write_json('observations.json',self.observations)
+        assert not failures,failures
+    def hidden_move_recovery(self):
+        view,r=self.view('worker');reports=next(e for e in r['tree']['entries'] if e['path']=='reports')
+        r['tree']['entries'].append(file_entry('reports/new',reports['id'],b''))
+        request,private=self.candidate(view,r)
+        av,ar=self.view('alice');next(e for e in ar['tree']['entries'] if e['path']=='secret')['path']='renamed-secret'
+        _,ap=self.candidate(av,ar,'alice');shared=self.expect('I1-move-hidden','POST',self.root+'/integrations',200,body=self.integrate_request(ap,av))
+        self.expect('I1-old-view-readable','GET',self.root+'/views/'+view['view']+'/descriptor',200,actor='worker')
+        self.expect('I1-private-lookup','GET',self.op_path(request),200,private,actor='worker')
+        self.expect('I1-private-replay','POST',self.root+'/candidates',200,private,body=request,actor='worker')
+        integration=self.integrate_request(private,view)
+        self.expect('I1-stale-integration','POST',self.root+'/integrations',409,{'code':'stale_head'},body=integration,actor='worker')
+        self.i.restart_service();self.wait()
+        self.expect('I1-stale-get-after-restart','GET',self.op_path(integration),409,{'code':'stale_head'},actor='worker')
+        self.expect('I1-stale-replay','POST',self.root+'/integrations',409,{'code':'stale_head'},body=integration,actor='worker')
+        assert self.i.sql("SELECT count(*) FROM operations WHERE operation='"+integration['operation']+"';")=='1'
+        assert self.i.sql("SELECT head FROM branches WHERE namespace='"+NS+"' AND name='main';")==shared['head']
+        assert self.i.sql("SELECT count(*) FROM changes;")=='2'
+        self.expect('I1-private-after-restart','GET',self.op_path(request),200,private,actor='worker')
+        av,ar=self.view('alice');next(e for e in ar['tree']['entries'] if e['path']=='reports')['mode']=320
+        _,ap=self.candidate(av,ar,'alice');shared=self.expect('I1-remove-parent-write','POST',self.root+'/integrations',200,body=self.integrate_request(ap,av))
+        self.expect('I1-parent-still-readable','GET',self.root+'/views/'+view['view']+'/descriptor',200,actor='worker')
+        self.expect('I1-now-deny-private','GET',self.op_path(request),404,{'code':'not_found'},actor='worker')
+        denied=self.integrate_request(private,view)
+        self.expect('I1-now-deny-integration','POST',self.root+'/integrations',404,{'code':'not_found'},body=denied,actor='worker')
+        assert self.i.sql("SELECT count(*) FROM operations WHERE operation='"+denied['operation']+"';")=='0'
+        assert self.i.sql("SELECT head FROM branches WHERE namespace='"+NS+"' AND name='main';")==shared['head']
+        self.observations.append({'case':'I1-durable-stale-and-current-denial-invariants','stale_operations':1,'denied_operations':0,'head_unchanged':True})
+    def transitive_projection(self):
+        av,ar=self.view('alice')
+        def directory(path,parent):return {'path':path,'id':identity('entry'),'parent':parent,'owner':ALICE,'group':GROUP,'mode':493,'content':{'kind':'directory'}}
+        d=directory('d',self.tree_root['id']);sub=directory('d/sub',d['id'])
+        ar['tree']['entries'].extend([d,sub,file_entry('d/sub/leaf',sub['id'],b''),file_entry('unrelated-readable',self.tree_root['id'],b'')])
+        _,ap=self.candidate(av,ar,'alice');self.expect('I2-create-nested','POST',self.root+'/integrations',200,body=self.integrate_request(ap,av))
+        av,ar=self.view('alice');next(e for e in ar['tree']['entries'] if e['path']=='d')['mode']=73
+        _,ap=self.candidate(av,ar,'alice');self.expect('I2-search-only-ancestor','POST',self.root+'/integrations',200,body=self.integrate_request(ap,av))
+        _,projected=self.view('alice');paths=[e['path'] for e in projected['tree']['entries']]
+        assert not any(path=='d' or path.startswith('d/') for path in paths),paths
+        assert 'unrelated-readable' in paths and 'reports' in paths,paths
+        self.view('worker')
+        self.observations.append({'case':'I2-valid-transitive-projection','paths':paths,'denied_ancestor_disclosed':False})
         self.i.write_json('observations.json',self.observations)
     def websocket(self,actor):
         raw=socket.create_connection(('127.0.0.1',self.i.port),timeout=2)
@@ -337,7 +388,7 @@ class Journey(StorageJourney):
         self.expect('revoked-result','GET',self.op_path(requests[0]),401,actor='worker')
 
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument('--output',required=True);ap.add_argument('--image',default='magus-fs2-task2');ap.add_argument('--skip-build',action='store_true');ap.add_argument('--red',action='store_true');ap.add_argument('--skip-checks',action='store_true');ap.add_argument('--pressure-only',action='store_true');ap.add_argument('--service-checks',action='store_true');ap.add_argument('--ancestry-only',action='store_true');ap.add_argument('--handshake-only',action='store_true');args=ap.parse_args()
+    ap=argparse.ArgumentParser();ap.add_argument('--output',required=True);ap.add_argument('--image',default='magus-fs2-task2');ap.add_argument('--skip-build',action='store_true');ap.add_argument('--red',action='store_true');ap.add_argument('--skip-checks',action='store_true');ap.add_argument('--pressure-only',action='store_true');ap.add_argument('--service-checks',action='store_true');ap.add_argument('--ancestry-only',action='store_true');ap.add_argument('--handshake-only',action='store_true');ap.add_argument('--review-edge-only',action='store_true');args=ap.parse_args()
     infra=OwnedInfra(Path(args.output));status=1
     try:
         infra.preflight();source=capture(infra)
@@ -349,7 +400,7 @@ def main():
         if not args.skip_build:infra.docker('build','-f','tests/fs2/Dockerfile.linux','--build-arg','VERIFY=0' if args.skip_checks else 'VERIFY=service' if args.service_checks else 'VERIFY=1','-t',args.image,'.',timeout=900)
         infra.setup(args.image)
         if not args.red:verify_image(infra,source)
-        started=time.monotonic();journey=Journey(infra);journey.handshake_only=args.handshake_only;journey.pressure_only=args.pressure_only;journey.ancestry_only=args.ancestry_only;journey.run();elapsed=time.monotonic()-started;assert elapsed<600,elapsed;infra.write_json("journey-duration.json",{"seconds":elapsed,"limit":600});status=0
+        started=time.monotonic();journey=Journey(infra);journey.review_edge_only=args.review_edge_only;journey.handshake_only=args.handshake_only;journey.pressure_only=args.pressure_only;journey.ancestry_only=args.ancestry_only;journey.run();elapsed=time.monotonic()-started;assert elapsed<600,elapsed;infra.write_json("journey-duration.json",{"seconds":elapsed,"limit":600});status=0
     except InfrastructureUnavailable as e:infra.write_json('failure.json',{'classification':'blocked','reason':str(e)});status=2
     except Exception as e:
         if hasattr(infra,'service'):infra.docker('exec',infra.service,'cat','/tmp/service.log',check=False)

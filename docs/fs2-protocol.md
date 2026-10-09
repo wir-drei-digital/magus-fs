@@ -49,7 +49,9 @@ relative. Full ancestry stays server-side. Old view access requires current
 history/read scope and current identity/ancestor permissions; absent identity
 recovery is explicitly outside A. Current permission checks are conservative:
 if any formerly visible identity is no longer authorized, the old descriptor is
-denied. A fresh view can expose the remaining authorized subset.
+denied. A fresh view can expose the remaining authorized subset. Projection retains an
+entry only when its entire authorized ancestor chain is retained; denied
+directory metadata is never added merely to repair structural closure.
 
 A submitted candidate parents the projected base, directly or through a bounded
 single-parent chain staged in its owned upload. Every intermediate descriptor
@@ -72,7 +74,10 @@ without rebasing or replacing either candidate.
 Operations are keyed by namespace, replica and operation ID, with credential,
 principal, kind and canonical request digest binding. Exact replays return the
 original receipt/status; changed requests return conflict. Replays reauthorize
-current credentials, scope and tree permissions. Receipt possession alone grants
+current credentials, scope and tree permissions. Current path stability is
+checked for the actual authorized delta and its required ancestor identities;
+an unrelated unchanged hidden sibling move does not invalidate a private receipt
+or prevent a durable stale-head result. Receipt possession alone grants
 no access. Candidate and integration IDs must be distinct operations.
 
 Descriptor decoding/projection/authorization happens between short database

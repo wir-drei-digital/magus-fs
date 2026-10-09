@@ -37,14 +37,18 @@ pub fn project(
         };
         allowed(&e.path) && allowed(&now.path)
     });
-    let visible = result
-        .tree
-        .entries
-        .iter()
-        .map(|e| e.id.clone())
-        .chain([result.tree.root.id.clone()])
-        .collect::<BTreeSet<_>>();
-    result.tree.entries.retain(|e| visible.contains(&e.parent));
+    // Parents sort before descendants in canonical path order. Add an identity
+    // only after its complete structural chain survived authorization; a denied
+    // ancestor must not leave an orphan or be disclosed as scaffolding.
+    result.tree.entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut visible = BTreeSet::from([result.tree.root.id.clone()]);
+    result.tree.entries.retain(|e| {
+        if !visible.contains(&e.parent) {
+            return false;
+        }
+        visible.insert(e.id.clone());
+        true
+    });
     validate_tree(&result.tree).map_err(core_error)?;
     Ok(result)
 }

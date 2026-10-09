@@ -99,3 +99,30 @@ fn delegation_depth_bound_is_checked_before_token_insertion() {
         "delegation_depth"
     );
 }
+
+#[test]
+fn projection_prunes_entire_denied_ancestor_chain_and_keeps_readable_sibling() {
+    let (mut full, a) = fixture();
+    full.tree.entries[0].path = "d".into();
+    full.tree.entries[0].mode = 0o111;
+    let mut sub = full.tree.entries[1].clone();
+    sub.id = EntryId::random().unwrap();
+    sub.path = "d/sub".into();
+    sub.parent = full.tree.entries[0].id.clone();
+    let mut leaf = sub.clone();
+    leaf.id = EntryId::random().unwrap();
+    leaf.path = "d/sub/leaf".into();
+    leaf.parent = sub.id.clone();
+    leaf.content = EntryContent::File {
+        version: FileVersion {
+            size: 0,
+            extents: vec![],
+        },
+    };
+    full.tree.entries.insert(0, leaf);
+    full.tree.entries.push(sub);
+    let projected = views::project(&full, &full.tree, &a, &["".into()]).unwrap();
+    assert_eq!(projected.tree.entries.len(), 1);
+    assert_eq!(projected.tree.entries[0].path, "secret");
+    assert!(revision_id(&projected).is_ok());
+}

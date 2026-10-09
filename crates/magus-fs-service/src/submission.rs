@@ -113,7 +113,7 @@ pub(crate) async fn operation(
 pub(crate) fn authorize_candidate(s: &r::Snapshot, derived: &Revision) -> Result<()> {
     let view = s.validate_view()?;
     let a = s.authority()?;
-    authorize_tree_transition(
+    let delta = authorize_tree_transition(
         &view.full.tree,
         &derived.tree,
         a,
@@ -121,19 +121,43 @@ pub(crate) fn authorize_candidate(s: &r::Snapshot, derived: &Revision) -> Result
         &s.scope(),
     )
     .map_err(core_error)?;
-    // Recheck changed identities against present permissions, including ancestors.
+    // Only the authorized change and its structural ancestors require stable
+    // current paths. Unchanged hidden siblings are not caller mutations.
+    let mut required = std::collections::BTreeSet::from([view.full.tree.root.id.clone()]);
+    for tree in [&view.full.tree, &derived.tree] {
+        let entries = tree
+            .entries
+            .iter()
+            .map(|e| (&e.id, e))
+            .collect::<BTreeMap<_, _>>();
+        for endpoint in delta
+            .operations
+            .iter()
+            .flat_map(|op| op.old.iter().chain(op.new.iter()))
+        {
+            let mut id = endpoint;
+            while let Some(entry) = entries.get(id) {
+                required.insert(entry.id.clone());
+                id = &entry.parent;
+            }
+        }
+    }
+    // Recheck current permissions without treating unrelated path changes as
+    // edits or restoring their old metadata.
     let current = &s.current.as_ref().ok_or(Error::not_found())?.tree;
     let mut now = view.full.tree.clone();
     now.root = current.root.clone();
     for old in &mut now.entries {
         if let Some(present) = current.entries.iter().find(|e| e.id == old.id) {
-            if present.path != old.path {
+            if required.contains(&old.id)
+                && (present.path != old.path || present.parent != old.parent)
+            {
                 return Err(Error::not_found());
             }
             old.owner = present.owner.clone();
             old.group = present.group.clone();
             old.mode = present.mode;
-        } else if derived.tree.entries.iter().find(|e| e.id == old.id) != Some(old) {
+        } else if required.contains(&old.id) {
             return Err(Error::not_found());
         }
     }
@@ -331,4 +355,123 @@ pub(crate) async fn candidate(
   save_operation(&tx,&current,NewOperation{operation:&request.operation,kind:"candidate",request:&serialized,result:&result,status:200,branch:&branch,view:Some(request.original_view.as_str()),receipt:&receipt.receipt,submitted:&request.revision,derived:&derived_id}).await?;
   tx.commit().await?;Ok(([("content-type","application/json")],result).into_response())
  })).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture() -> (r::Snapshot, Revision) {
+        let principal = PrincipalId::parse(format!("principal:{:032x}", 1)).unwrap();
+        let group = GroupId::parse(format!("group:{:032x}", 1)).unwrap();
+        let replica = ReplicaId::random().unwrap();
+        let root = Root {
+            id: EntryId::random().unwrap(),
+            owner: principal.clone(),
+            group: group.clone(),
+            mode: 0o700,
+        };
+        let authority = Authority {
+            principal: principal.clone(),
+            uid: 1001,
+            gid: 1001,
+            primary_group: group.clone(),
+            groups: vec![group.clone()],
+            dac_override: false,
+            ownership_transfer: false,
+        };
+        let entries = ["reports", "secret"]
+            .into_iter()
+            .map(|path| Entry {
+                path: path.into(),
+                id: EntryId::random().unwrap(),
+                parent: root.id.clone(),
+                owner: principal.clone(),
+                group: group.clone(),
+                mode: 0o700,
+                content: EntryContent::Directory,
+            })
+            .collect();
+        let full = Revision {
+            format: FORMAT.into(),
+            hash: HASH.into(),
+            layout: LAYOUT.into(),
+            parents: vec![],
+            operation: OperationId::random().unwrap(),
+            replica: replica.clone(),
+            principal: principal.clone(),
+            captured_at_ns: 0,
+            coverage: vec!["".into()],
+            provenance: "explicit".into(),
+            restoration: None,
+            tree: Tree {
+                root: root.clone(),
+                entries,
+            },
+        };
+        let projected = views::project(&full, &full.tree, &authority, &["reports".into()]).unwrap();
+        let mut derived = full.clone();
+        let mut child = derived.tree.entries[0].clone();
+        child.id = EntryId::random().unwrap();
+        child.path = "reports/new".into();
+        child.parent = derived.tree.entries[0].id.clone();
+        derived.tree.entries.push(child);
+        let context = auth::AuthContext {
+            credential: "fixture".into(),
+            namespace: "fixture".into(),
+            principal: principal.as_str().into(),
+            replica: replica.as_str().into(),
+            generation: 1,
+            token_hash: String::new(),
+            actions: vec![
+                "read".into(),
+                "write".into(),
+                "history".into(),
+                "integrate".into(),
+            ],
+            branches: vec!["main".into()],
+            prefixes: vec!["reports".into()],
+            depth: 0,
+        };
+        (
+            r::Snapshot {
+                context,
+                branch: "main".into(),
+                authorities: vec![authority],
+                root,
+                current: Some(full.clone()),
+                head: Some("new-head".into()),
+                view: Some(r::BoundView {
+                    full,
+                    projected,
+                    head: "original-head".into(),
+                }),
+            },
+            derived,
+        )
+    }
+    #[test]
+    fn unchanged_hidden_move_does_not_invalidate_authorized_candidate() {
+        let (mut s, derived) = fixture();
+        s.current.as_mut().unwrap().tree.entries[1].path = "renamed-secret".into();
+        assert!(s.validate_view().is_ok());
+        assert!(authorize_candidate(&s, &derived).is_ok());
+    }
+    #[test]
+    fn candidate_still_requires_current_parent_write_and_stable_required_path() {
+        let (mut s, derived) = fixture();
+        s.current.as_mut().unwrap().tree.entries[0].mode = 0o500;
+        assert!(s.validate_view().is_ok());
+        assert_eq!(
+            authorize_candidate(&s, &derived).unwrap_err().code,
+            "not_found"
+        );
+        s.current.as_mut().unwrap().tree.entries[0].mode = 0o700;
+        s.current.as_mut().unwrap().tree.entries[0].path = "renamed-reports".into();
+        s.context.prefixes = vec!["".into()];
+        assert!(s.validate_view().is_ok());
+        assert_eq!(
+            authorize_candidate(&s, &derived).unwrap_err().code,
+            "not_found"
+        );
+    }
 }
