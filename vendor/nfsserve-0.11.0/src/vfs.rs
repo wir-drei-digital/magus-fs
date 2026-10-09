@@ -147,6 +147,16 @@ pub trait NFSFileSystem: Sync {
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     async fn mkdir(&self, dirid: fileid3, dirname: &filename3) -> Result<(fileid3, fattr3), nfsstat3>;
 
+    /// Attribute-aware mkdir; default preserves existing implementations.
+    async fn mkdir_with_attrs(&self, dirid: fileid3, dirname: &filename3, _attr: sattr3) -> Result<(fileid3, fattr3), nfsstat3> {
+        self.mkdir(dirid, dirname).await
+    }
+
+    /// Type-aware directory removal; default preserves existing implementations.
+    async fn remove_directory(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
+        self.remove(dirid, filename).await
+    }
+
     /// Removes a file.
     /// If not supported due to readonly file system
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)

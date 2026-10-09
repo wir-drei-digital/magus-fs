@@ -33,6 +33,7 @@ pub(crate) struct Response {
     pub exit: i32,
     pub value: Value,
 }
+#[cfg(target_os = "linux")]
 fn peer(stream: &UnixStream) -> Result<u32, FsError> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
@@ -52,6 +53,15 @@ fn peer(stream: &UnixStream) -> Result<u32, FsError> {
         return Err(FsError::UnsafeStorage);
     }
     Ok(cred.uid)
+}
+#[cfg(target_os = "macos")]
+fn peer(stream: &UnixStream) -> Result<u32, FsError> {
+    let mut uid = 0;
+    let mut gid = 0;
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(uid)
 }
 fn directory(state: &Path) -> Result<(), FsError> {
     if !state.is_absolute() {

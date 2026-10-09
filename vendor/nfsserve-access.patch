@@ -1,24 +1,9 @@
---- a/src/vfs.rs
-+++ b/src/vfs.rs
-@@ -109,6 +109,12 @@
-     /// Returns the attributes of an id.
-     /// This method should be fast as it is used very frequently.
-     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3>;
-+
-+    /// Return only access bits allowed by this filesystem's actor and policy.
-+    /// The default denies access; protocol request bits are not authorization.
-+    async fn access(&self, _id: fileid3, _requested: u32) -> Result<u32, nfsstat3> {
-+        Err(nfsstat3::NFS3ERR_ACCES)
-+    }
- 
-     /// Sets the attributes of an id
-     /// this should return Err(nfsstat3::NFS3ERR_ROFS) if readonly
 --- a/src/nfs_handlers.rs
 +++ b/src/nfs_handlers.rs
-@@ -516,9 +516,18 @@
-         Ok(v) => nfs::post_op_attr::attributes(v),
-         Err(_) => nfs::post_op_attr::Void,
-     };
+@@ -147 +147 @@
+-        NFSProgram::NFSPROC3_RMDIR => nfsproc3_remove(xid, input, output, context).await?,
++        NFSProgram::NFSPROC3_RMDIR => nfsproc3_remove_kind(xid, input, output, context, true).await?,
+@@ -519 +519,10 @@
 -    // TODO better checks here
 +    access = match context.vfs.access(id, access).await {
 +        Ok(allowed) => access & allowed,
@@ -30,16 +15,10 @@
 +        },
 +    };
 +    // Read-only still permits execution; mutation rights remain protocol-masked.
-     if !matches!(context.vfs.capabilities(), VFSCapabilities::ReadWrite) {
+@@ -521 +530 @@
 -        access &= ACCESS3_READ | ACCESS3_LOOKUP;
 +        access &= ACCESS3_READ | ACCESS3_LOOKUP | ACCESS3_EXECUTE;
-     }
-     debug!(" {:?} ---> {:?}", xid, access);
-     make_success_reply(xid).serialize(output)?;
-@@ -887,14 +896,19 @@
-             dir_attr.serialize(&mut counting_output)?;
-             dirversion.serialize(&mut counting_output)?;
-             for entry in result.entries {
+@@ -890,2 +899,7 @@
 -                let obj_attr = entry.attr;
 -                let handle = nfs::post_op_fh3::handle(context.vfs.id_to_fh(entry.fileid));
 +                // Names may be readable without permission to search this directory.
@@ -49,13 +28,44 @@
 +                                 nfs::post_op_fh3::handle(context.vfs.id_to_fh(entry.fileid))),
 +                    Err(_) => (nfs::post_op_attr::Void, nfs::post_op_fh3::Void),
 +                };
- 
-                 let entry = entryplus3 {
-                     fileid: entry.fileid,
-                     name: entry.name,
-                     cookie: entry.fileid,
+@@ -897 +911 @@
 -                    name_attributes: nfs::post_op_attr::attributes(obj_attr),
 +                    name_attributes: obj_attr,
-                     name_handle: handle,
-                 };
-                 // write the entry into a buffer first
+@@ -1562,0 +1577,10 @@
++    nfsproc3_remove_kind(xid, input, output, context, false).await
++}
++
++async fn nfsproc3_remove_kind(
++    xid: u32,
++    input: &mut impl Read,
++    output: &mut impl Write,
++    context: &RPCContext,
++    directory: bool,
++) -> Result<(), anyhow::Error> {
+@@ -1609 +1633,2 @@
+-    let res = context.vfs.remove(dirid, &dirops.name).await;
++    let res = if directory { context.vfs.remove_directory(dirid, &dirops.name).await }
++        else { context.vfs.remove(dirid, &dirops.name).await };
+@@ -1882 +1907 @@
+-    let res = context.vfs.mkdir(dirid, &args.dirops.name).await;
++    let res = context.vfs.mkdir_with_attrs(dirid, &args.dirops.name, args.attributes).await;
+--- a/src/vfs.rs
++++ b/src/vfs.rs
+@@ -112,0 +113,6 @@
++    /// Return only access bits allowed by this filesystem's actor and policy.
++    /// The default denies access; protocol request bits are not authorization.
++    async fn access(&self, _id: fileid3, _requested: u32) -> Result<u32, nfsstat3> {
++        Err(nfsstat3::NFS3ERR_ACCES)
++    }
++
+@@ -142,0 +149,10 @@
++
++    /// Attribute-aware mkdir; default preserves existing implementations.
++    async fn mkdir_with_attrs(&self, dirid: fileid3, dirname: &filename3, _attr: sattr3) -> Result<(fileid3, fattr3), nfsstat3> {
++        self.mkdir(dirid, dirname).await
++    }
++
++    /// Type-aware directory removal; default preserves existing implementations.
++    async fn remove_directory(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
++        self.remove(dirid, filename).await
++    }

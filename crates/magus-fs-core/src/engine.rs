@@ -766,6 +766,73 @@ impl Workspace {
         };
         self.resolve_entry(&core, &tree, path)
     }
+    /// NFS DELETE reports current writable/searchable parent authority, not file write mode.
+    pub fn check_remove_identity(&self, id: &EntryId) -> Result<(), FsError> {
+        perm::mutation(self.read_only)?;
+        let core = lock(&self.core)?;
+        let tree = self.tree(&core)?;
+        let entry = tree
+            .entries
+            .iter()
+            .find(|e| &e.id == id)
+            .ok_or(FsError::NotFound)?;
+        self.resolve_entry(&core, &tree, &entry.path)?;
+        let authority_tree = if self.view.is_some() {
+            core.working.as_ref().map(|w| &w.tree).unwrap_or(&tree)
+        } else {
+            &tree
+        };
+        let current = authority_tree
+            .entries
+            .iter()
+            .find(|e| &e.id == id)
+            .ok_or(FsError::PermissionDenied)?;
+        perm::parent_write(authority_tree, &current.path, self.actor(&core)?)?;
+        Ok(())
+    }
+    /// NFS has no OPEN/CLOSE: retain an authorized identity without granting data rights.
+    /// All handle operations independently recheck current authority and readonly state.
+    pub fn retain_identity(&self, id: &EntryId) -> Result<Handle, FsError> {
+        let mut core = lock(&self.core)?;
+        let tree = self.tree(&core)?;
+        let e = tree
+            .entries
+            .iter()
+            .find(|e| &e.id == id)
+            .ok_or(FsError::NotFound)?;
+        let e = self.resolve_entry(&core, &tree, &e.path)?;
+        if e.content == EntryContent::Directory {
+            return Err(FsError::IsDirectory);
+        }
+        let mode = if self.read_only {
+            OpenMode::Read
+        } else {
+            OpenMode::ReadWrite
+        };
+        self.handle(&mut core, e, mode)
+    }
+    /// Authoritative ACCESS query, including current permissions on historical identities.
+    pub fn check_access_identity(&self, id: &EntryId, bits: u16) -> Result<(), FsError> {
+        if bits & !7 != 0 {
+            return Err(FsError::InvalidPath);
+        }
+        if bits & 2 != 0 {
+            perm::mutation(self.read_only)?;
+        }
+        let core = lock(&self.core)?;
+        let tree = self.tree(&core)?;
+        let e = if &tree.root.id == id {
+            perm::root_entry(&tree)
+        } else {
+            tree.entries
+                .iter()
+                .find(|e| &e.id == id)
+                .cloned()
+                .ok_or(FsError::NotFound)?
+        };
+        let e = self.resolve_entry(&core, &tree, &e.path)?;
+        self.access(&core, &e, bits)
+    }
     /// Attributes through an existing open capability, including unlinked identities.
     pub fn handle_attributes(&self, handle: &Handle) -> Result<Entry, FsError> {
         let core = lock(&self.core)?;

@@ -157,3 +157,59 @@ fn historical_traversal_authorizes_current_renamed_identity_path() {
     err(old.lookup("past/file"), "permission_denied");
     err(old.open("past/file", OpenMode::Read), "permission_denied");
 }
+
+#[test]
+fn retained_nfs_identity_does_not_grant_data_or_mutation_authority() {
+    let (_d, rep, w, base) = setup();
+    w.mkdir("d", 0o700).unwrap();
+    let created = w.create("d/secret", 0).unwrap();
+    let id = created.entry_id().clone();
+    let retained = w.retain_identity(&id).unwrap();
+    err(w.read(&retained, 0, 1), "permission_denied");
+    err(w.write(&retained, 0, b"no"), "permission_denied");
+    err(w.check_access_identity(&id, 4), "permission_denied");
+    w.chmod("d", 0o400).unwrap();
+    err(w.retain_identity(&id), "permission_denied");
+    w.chmod("d", 0o700).unwrap();
+    w.chmod("d/secret", 0o600).unwrap();
+    w.write(&retained, 0, b"allowed").unwrap();
+    w.unlink("d/secret").unwrap();
+    assert_eq!(w.read(&retained, 0, 99).unwrap(), b"allowed");
+    err(w.retain_identity(&id), "not_found");
+    let old = rep.begin(&base, actor(), true).unwrap();
+    err(
+        old.check_access_identity(&old.lookup("").unwrap().id, 2),
+        "read_only",
+    );
+}
+
+#[test]
+fn nfs_queries_follow_current_parent_and_historical_authority() {
+    let (_d, rep, w, _) = setup();
+    w.mkdir("d", 0o700).unwrap();
+    let h = w.create("d/a", 0o600).unwrap();
+    w.write(&h, 0, b"old").unwrap();
+    let id = h.entry_id().clone();
+    let revision = w
+        .checkpoint(
+            &OperationId::random().unwrap(),
+            w.generation().unwrap(),
+            attr(),
+        )
+        .unwrap();
+    let old = rep.begin(&revision, actor(), true).unwrap();
+    let retained = old.retain_identity(&id).unwrap();
+    w.chmod("d/a", 0o400).unwrap();
+    assert!(w.check_remove_identity(&id).is_ok());
+    w.chmod("d", 0o500).unwrap();
+    err(w.check_remove_identity(&id), "permission_denied");
+    w.chmod("d/a", 0).unwrap();
+    err(old.check_access_identity(&id, 4), "permission_denied");
+    err(old.read(&retained, 0, 3), "permission_denied");
+    w.chmod("d/a", 0o400).unwrap();
+    assert_eq!(old.read(&retained, 0, 3).unwrap(), b"old");
+    err(old.write(&retained, 0, b"no"), "read_only");
+    err(old.chmod_handle(&retained, 0o777), "read_only");
+    err(old.check_remove_identity(&id), "read_only");
+    err(w.read(&retained, 0, 3), "stale_handle");
+}

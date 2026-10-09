@@ -17,7 +17,15 @@ pub(crate) type Result<T> = std::result::Result<T, (i32, FsError)>;
 fn args(argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
     let command = argv.first().cloned().ok_or((2, FsError::InvalidPath))?;
     let allowed = match command.as_str() {
-        "mount" => vec!["state", "revision", "mountpoint", "mode", "source"],
+        "mount" => vec![
+            "state",
+            "revision",
+            "mountpoint",
+            "mode",
+            "source",
+            "prepare-only",
+            "nfs-port",
+        ],
         "init" => vec!["state", "config", "revision-manifest", "source"],
         "capture" => vec!["state", "root", "operation-id"],
         "materialize" => vec!["state", "destination", "revision"],
@@ -157,7 +165,7 @@ pub fn run(argv: Vec<String>) -> Result<Value> {
     } else {
         None
     };
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if matches!(command.as_str(), "checkpoint" | "history" | "status") {
         if let Some(response) =
             crate::adapters::control::request(state, &command, &options).map_err(|e| (1, e))?
@@ -235,6 +243,31 @@ pub fn run(argv: Vec<String>) -> Result<Value> {
                     source,
                 )
                 .map_err(|e| (1, e))?;
+            }
+            if let Some(value) = options.get("prepare-only") {
+                if value != "true" {
+                    return Err((2, FsError::InvalidPath));
+                }
+                #[cfg(target_os = "macos")]
+                return crate::adapters::prepare(
+                    rep,
+                    state,
+                    &revision,
+                    mountpoint,
+                    read_only,
+                    options
+                        .get("nfs-port")
+                        .map(|s| s.parse::<u16>().map_err(|_| (2, FsError::InvalidPath)))
+                        .transpose()?
+                        .unwrap_or(0),
+                )
+                .map(|()| json!({"ok":true}))
+                .map_err(|e| (1, e));
+                #[cfg(not(target_os = "macos"))]
+                return Err((2, FsError::UnsupportedMode));
+            }
+            if options.contains_key("nfs-port") {
+                return Err((2, FsError::InvalidPath));
             }
             crate::adapters::mount(rep, state, &revision, mountpoint, read_only)
                 .map_err(|e| (1, e))?;
