@@ -367,3 +367,117 @@ fn shared_live_private_receipt_remains_pending_for_queue_pressure() {
     );
     assert_eq!(rep.sync_status().unwrap().submissions.len(), 128);
 }
+
+#[test]
+fn admitted_staged_descriptor_budget_keeps_separate_base_roots_through_prune_restart() {
+    let d = scratch();
+    let rep = Replica::open(d.path().join("state"), config()).unwrap();
+    let store_path = d.path().join("source");
+    let store = ObjectStore::open(&store_path, ObjectLimits::default()).unwrap();
+    let original_bytes = b"issued base bytes";
+    let candidate_bytes = b"candidate bytes";
+    store.install(original_bytes).unwrap();
+    store.install(candidate_bytes).unwrap();
+    let source = ChunkSource::Local { path: store_path };
+    let prefix = vec!["x".repeat(250); 15].join("/");
+    let mut r = revision();
+    r.coverage = (0..3500)
+        .map(|i| format!("{prefix}/{i:04}{}", "q".repeat(246)))
+        .collect();
+    add_file(&mut r, "base-only", original_bytes);
+    let base_bytes = encode_revision(&r).unwrap().len();
+    let base = import(&rep, &r, source.clone());
+    let w = rep.begin(&base, actor(), false).unwrap();
+    assert_eq!(
+        w.read(&w.open("base-only", OpenMode::Read).unwrap(), 0, 100)
+            .unwrap(),
+        original_bytes
+    );
+    drop(w);
+    let b = binding(base.clone());
+    rep.configure_sync(b.clone()).unwrap();
+    let mut current = base;
+    let mut staged_bytes = 0;
+    for _ in 0..4 {
+        r.parents = vec![current];
+        r.operation = OperationId::random().unwrap();
+        r.tree.entries.clear();
+        add_file(&mut r, "candidate-only", candidate_bytes);
+        let encoded = encode_revision(&r).unwrap();
+        assert!(encoded.len() < MAX_DESCRIPTOR);
+        staged_bytes += encoded.len();
+        current = import(&rep, &r, source.clone());
+    }
+    assert!(staged_bytes <= 64 * 1024 * 1024);
+    assert!(staged_bytes + base_bytes > 64 * 1024 * 1024);
+    eprintln!(
+        "sync descriptor boundary: base={base_bytes}, staged={staged_bytes}, combined={}",
+        staged_bytes + base_bytes
+    );
+    drop(r);
+    assert_eq!(
+        rep.sync_object(
+            &ObjectId::for_bytes(candidate_bytes).unwrap(),
+            candidate_bytes.len() as u64,
+            std::time::Instant::now() + std::time::Duration::from_secs(1)
+        )
+        .unwrap(),
+        candidate_bytes
+    );
+    let extra_bytes = b"reclaim me";
+    store.install(extra_bytes).unwrap();
+    let extra_id = ObjectId::for_bytes(extra_bytes).unwrap();
+    let mut extra = revision();
+    add_file(&mut extra, "unrelated", extra_bytes);
+    import(&rep, &extra, source);
+    rep.sync_object(
+        &extra_id,
+        extra_bytes.len() as u64,
+        std::time::Instant::now() + std::time::Duration::from_secs(1),
+    )
+    .unwrap();
+    rep.enqueue_submission(pending(&rep, &b, current)).unwrap();
+    let protected = (original_bytes.len() + candidate_bytes.len()) as u64;
+    let pending_prune = rep.prune(true).unwrap();
+    assert_eq!(pending_prune.protected_bytes, protected);
+    assert_eq!(pending_prune.evictable, vec![extra_id.clone()]);
+    let mut p = rep.sync_status().unwrap().submissions.remove(0);
+    p.private_receipt = Some(PrivateReceipt {
+        receipt: ReceiptId::random().unwrap(),
+        operation: p.operation.clone(),
+        replica: config().replica,
+        submitted_revision: p.local_revision.clone(),
+        original_view: b.view.view,
+        original_head: b.view.head,
+    });
+    p.state = SubmissionState::PrivateRemote;
+    rep.record_sync_progress(&p.operation, SubmissionState::Queued, p.clone())
+        .unwrap();
+    drop(rep);
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    assert_eq!(rep.sync_status().unwrap().submissions[0], p);
+    let preview = rep.prune(true).unwrap();
+    assert_eq!(preview.protected_bytes, protected);
+    let pruned = rep.apply_prune(&preview.token).unwrap();
+    assert_eq!(pruned.protected_bytes, protected);
+    assert_eq!(pruned.reclaimed, vec![extra_id]);
+    assert_eq!(pruned.reclaimed_bytes, extra_bytes.len() as u64);
+    assert_eq!(
+        rep.sync_object(
+            &ObjectId::for_bytes(original_bytes).unwrap(),
+            original_bytes.len() as u64,
+            std::time::Instant::now() + std::time::Duration::from_secs(1)
+        )
+        .unwrap(),
+        original_bytes
+    );
+    assert_eq!(
+        rep.sync_object(
+            &ObjectId::for_bytes(candidate_bytes).unwrap(),
+            candidate_bytes.len() as u64,
+            std::time::Instant::now() + std::time::Duration::from_secs(1)
+        )
+        .unwrap(),
+        candidate_bytes
+    );
+}

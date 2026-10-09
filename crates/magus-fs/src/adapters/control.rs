@@ -184,6 +184,11 @@ impl Server {
                             if peer(&stream).map_err(|e| (1, e))? != unsafe { libc::geteuid() } {
                                 return Err((1, FsError::PermissionDenied));
                             }
+                            // macOS inherits the listener's nonblocking mode on accept.
+                            // Request fragments must wait within the socket budget instead.
+                            stream
+                                .set_nonblocking(false)
+                                .map_err(|e| (1, FsError::Io(e)))?;
                             timeouts(&stream).map_err(|e| (1, e))?;
                             let mut bytes = vec![];
                             (&mut stream)
@@ -266,5 +271,69 @@ impl Drop for Server {
         if socket_identity(&self.path).ok() == Some(self.identity) {
             let _ = fs::remove_file(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn owner_accepts_delayed_request_fragments() {
+        let path = PathBuf::from(if cfg!(target_os = "macos") {
+            "/private/tmp"
+        } else {
+            "/tmp"
+        })
+        .join(format!(
+            "fs2-control-{}",
+            ReplicaId::random().unwrap().as_str()
+        ));
+        let group = GroupId::random().unwrap();
+        let rep = Replica::open(
+            &path,
+            ReplicaConfig {
+                replica: ReplicaId::random().unwrap(),
+                authorities: vec![Authority {
+                    principal: PrincipalId::random().unwrap(),
+                    uid: unsafe { libc::geteuid() },
+                    gid: unsafe { libc::getegid() },
+                    primary_group: group.clone(),
+                    groups: vec![group],
+                    dac_override: false,
+                    ownership_transfer: false,
+                }],
+                history_administrators: vec![],
+                retained_history_grants: vec![],
+                content_roots: vec![],
+                cache_bytes: 1024,
+            },
+        )
+        .unwrap();
+        let server = Server::start(rep.clone(), &path, false).unwrap();
+        let mut stream = UnixStream::connect(path.join("control.sock")).unwrap();
+        timeouts(&stream).unwrap();
+        let bytes = serde_json::to_vec(&Request {
+            command: "sync-status".into(),
+            options: BTreeMap::new(),
+        })
+        .unwrap();
+        stream.write_all(&bytes[..1]).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let sent = stream.write_all(&bytes[1..]);
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut response = vec![];
+        let read = stream.read_to_end(&mut response);
+        drop(stream);
+        drop(server);
+        drop(rep);
+        fs::remove_dir_all(path).unwrap();
+        assert!(
+            sent.is_ok(),
+            "delayed request failed: {sent:?}; response={response:?}"
+        );
+        read.unwrap();
+        let response: Response = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response.exit, 0, "{}", response.value);
+        assert_eq!(response.value["status"]["submissions"], json!([]));
     }
 }

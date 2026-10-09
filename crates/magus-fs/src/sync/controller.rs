@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak},
     time::{Duration, Instant},
 };
 #[derive(Deserialize)]
@@ -52,18 +52,59 @@ impl UploadStatus {
         Ok(completed)
     }
 }
+/// Process-local publication execution ownership, shared by every controller for a replica.
+/// Incoming view advancement must acquire this gate too. Never hold Core's mutex while waiting.
+pub(crate) struct SyncExecution {
+    active: Mutex<()>,
+}
+impl SyncExecution {
+    pub(crate) fn for_replica(replica: &ReplicaId) -> Result<Arc<Self>, FsError> {
+        static OWNERS: OnceLock<Mutex<BTreeMap<ReplicaId, Weak<SyncExecution>>>> = OnceLock::new();
+        let mut owners = OWNERS
+            .get_or_init(Mutex::default)
+            .lock()
+            .map_err(|_| FsError::ReplicaBusy)?;
+        owners.retain(|_, owner| owner.strong_count() > 0);
+        if let Some(owner) = owners.get(replica).and_then(Weak::upgrade) {
+            return Ok(owner);
+        }
+        let owner = Arc::new(Self {
+            active: Mutex::new(()),
+        });
+        owners.insert(replica.clone(), Arc::downgrade(&owner));
+        Ok(owner)
+    }
+    /// None means local scheduling exhausted the deadline; journal state is untouched.
+    pub(crate) fn acquire(&self, deadline: Instant) -> Result<Option<MutexGuard<'_, ()>>, FsError> {
+        while Instant::now() < deadline {
+            match self.active.try_lock() {
+                Ok(guard) => return Ok(Some(guard)),
+                Err(TryLockError::Poisoned(_)) => return Err(FsError::ReplicaBusy),
+                Err(TryLockError::WouldBlock) => std::thread::sleep(
+                    Duration::from_millis(5)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                ),
+            }
+        }
+        Ok(None)
+    }
+}
 pub struct SyncController {
     rep: Replica,
     transport: Transport,
+    execution: Arc<SyncExecution>,
 }
 impl SyncController {
     pub fn new(rep: &Replica) -> Result<Self, FsError> {
         let binding = rep.sync_status()?.binding.ok_or(FsError::ConfigMismatch)?;
-        let transport = Transport::new(binding, &rep.configuration()?)?;
+        let config = rep.configuration()?;
+        let execution = SyncExecution::for_replica(&config.replica)?;
+        let transport = Transport::new(binding, &config)?;
         rep.set_remote_fetcher(Arc::new(transport.clone()))?;
         Ok(Self {
             rep: rep.clone(),
             transport,
+            execution,
         })
     }
     fn save(&self, p: &SyncProgress, next: SyncProgress) -> Result<SyncProgress, FsError> {
@@ -80,6 +121,11 @@ impl SyncController {
             .ok_or(FsError::NotFound)
     }
     pub fn tick(&self) -> Result<SyncProgress, FsError> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let _execution = self
+            .execution
+            .acquire(deadline)?
+            .ok_or(FsError::Backpressure)?;
         let p = self
             .rep
             .sync_status()?
@@ -96,7 +142,7 @@ impl SyncController {
                     && self.transport.binding.publication == PublicationMode::SharedLive
             })
             .ok_or(FsError::NotFound)?;
-        self.target_tick(p, Instant::now() + Duration::from_secs(60))
+        self.target_tick(p, deadline)
     }
     fn target_tick(&self, mut p: SyncProgress, deadline: Instant) -> Result<SyncProgress, FsError> {
         for attempt in 0..3 {
@@ -115,6 +161,10 @@ impl SyncController {
                 Err(error) => {
                     // Reload: the attempt may have durably crossed the uncertain boundary.
                     p = self.get(&p.local_revision)?;
+                    // A local competing writer is scheduling contention, never remote failure.
+                    if error.code == "generation_mismatch" {
+                        return Ok(p);
+                    }
                     let mut next = p.clone();
                     next.error = Some(error.code.into());
                     next.state = if error.code == "stale_head" && p.integration.is_some() {
@@ -360,8 +410,13 @@ impl SyncController {
         revision: &RevisionId,
         expected_head: HeadToken,
     ) -> Result<SyncProgress, FsError> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let _execution = self
+            .execution
+            .acquire(deadline)?
+            .ok_or(FsError::Backpressure)?;
         let p = self.integration(self.get(revision)?, expected_head)?;
-        self.target_tick(p, Instant::now() + Duration::from_secs(60))
+        self.target_tick(p, deadline)
     }
     pub fn drain(
         &self,
@@ -374,6 +429,13 @@ impl SyncController {
             return Err(FsError::UnsupportedMode);
         }
         let deadline = deadline.min(Instant::now() + Duration::from_secs(60));
+        if p.reached(level) {
+            return Ok(p);
+        }
+        let Some(_execution) = self.execution.acquire(deadline)? else {
+            return self.get(revision);
+        };
+        p = self.get(revision)?;
         while !p.reached(level) && Instant::now() < deadline {
             if matches!(p.state, SubmissionState::Denied | SubmissionState::Failed)
                 || level == DurabilityLevel::Shared
@@ -518,6 +580,34 @@ pub fn attach(
 #[cfg(test)]
 mod upload_tests {
     use super::*;
+    #[test]
+    fn replica_execution_is_shared_and_deadline_does_not_release_another_attempt() {
+        let replica = ReplicaId::random().unwrap();
+        let first = SyncExecution::for_replica(&replica).unwrap();
+        let second = SyncExecution::for_replica(&replica).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let guard = first
+            .acquire(Instant::now() + Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        let started = Instant::now();
+        assert!(second
+            .acquire(started + Duration::from_millis(20))
+            .unwrap()
+            .is_none());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(second.active.try_lock().is_err());
+        let other = SyncExecution::for_replica(&ReplicaId::random().unwrap()).unwrap();
+        assert!(other
+            .acquire(Instant::now() + Duration::from_secs(1))
+            .unwrap()
+            .is_some());
+        drop(guard);
+        assert!(second
+            .acquire(Instant::now() + Duration::from_secs(1))
+            .unwrap()
+            .is_some());
+    }
     #[test]
     fn upload_listing_accepts_4096_bounded_entries_and_rejects_invalid_shapes() {
         let upload = UploadId::random().unwrap();

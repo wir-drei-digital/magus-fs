@@ -155,12 +155,54 @@ impl crate::engine::Core {
             .collect::<Result<Vec<_>, _>>()?;
         bytes.iter().map(|b| from_json(b)).collect()
     }
+    /// The issued base is retained independently and is not charged to staged admission.
+    fn sync_staged_closure(
+        &self,
+        candidate: &RevisionId,
+        base: &RevisionId,
+    ) -> Result<BTreeMap<ObjectId, u64>, FsError> {
+        let mut current = candidate.clone();
+        let mut seen = BTreeSet::new();
+        let mut descriptor_bytes = 0;
+        let mut objects = BTreeMap::new();
+        while current != *base {
+            if !seen.insert(current.clone()) || seen.len() > 128 {
+                return Err(FsError::LimitExceeded);
+            }
+            let revision = self.revision(&current)?;
+            descriptor_bytes += encode_revision(&revision)?.len();
+            if descriptor_bytes > 64 * 1024 * 1024 {
+                return Err(FsError::LimitExceeded);
+            }
+            for (id, size) in crate::cache::closure(&revision.tree) {
+                if objects.insert(id, size).is_some_and(|old| old != size) {
+                    return Err(FsError::CorruptObject);
+                }
+            }
+            if revision.parents.len() != 1 {
+                return Err(FsError::BaseMismatch);
+            }
+            current = revision.parents[0].clone();
+        }
+        if objects.values().sum::<u64>() > 512 * 1024 * 1024 {
+            return Err(FsError::LimitExceeded);
+        }
+        Ok(objects)
+    }
     pub(crate) fn sync_roots(&self) -> Result<BTreeSet<ObjectId>, FsError> {
         let mut roots = BTreeSet::new();
         for record in self.sync_records()? {
-            for id in [record.pending.local_revision, record.binding.view.revision] {
-                roots.extend(self.recovery_closure(&id)?.into_keys());
-            }
+            roots.extend(
+                self.sync_staged_closure(
+                    &record.pending.local_revision,
+                    &record.binding.view.revision,
+                )?
+                .into_keys(),
+            );
+            roots.extend(
+                self.recovery_closure(&record.binding.view.revision)?
+                    .into_keys(),
+            );
         }
         Ok(roots)
     }
@@ -240,32 +282,7 @@ impl Replica {
         if submitted.operation != pending.operation || submitted.replica != core.config.replica {
             return Err(FsError::OperationMismatch);
         }
-        let mut current = pending.local_revision.clone();
-        let mut seen = BTreeSet::new();
-        let mut descriptor_bytes = 0;
-        let mut objects = BTreeMap::new();
-        while current != binding.view.revision {
-            if !seen.insert(current.clone()) || seen.len() > 128 {
-                return Err(FsError::LimitExceeded);
-            }
-            let revision = core.revision(&current)?;
-            descriptor_bytes += encode_revision(&revision)?.len();
-            if descriptor_bytes > 64 * 1024 * 1024 {
-                return Err(FsError::LimitExceeded);
-            }
-            for (id, size) in crate::cache::closure(&revision.tree) {
-                if objects.insert(id, size).is_some_and(|old| old != size) {
-                    return Err(FsError::CorruptObject);
-                }
-            }
-            if revision.parents.len() != 1 {
-                return Err(FsError::BaseMismatch);
-            }
-            current = revision.parents[0].clone();
-        }
-        if objects.values().sum::<u64>() > 512 * 1024 * 1024 {
-            return Err(FsError::LimitExceeded);
-        }
+        core.sync_staged_closure(&pending.local_revision, &binding.view.revision)?;
         let progress = SyncProgress {
             operation: pending.operation.clone(),
             local_revision: pending.local_revision.clone(),
