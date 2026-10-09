@@ -80,6 +80,55 @@ def summarize_linux(native, journey, chunk, evidence):
             'native_evidence':str(evidence),'error':native.get('error')}
 
 
+def run_linux_profile(runner, output, image, journey, chunk, uid, gid):
+    evidence = output / 'result.json'
+    profile = {'journey':journey, 'chunk_size':chunk, 'native_evidence':str(evidence),
+               'cases':{}, 'cleanup_errors':[], 'remaining_owned_resources':[]}
+    code, runner_error, native = None, None, None
+    try:
+        code = runner(output,image,False,chunk,uid,gid)
+    except Exception as error:
+        runner_error = {'type':type(error).__name__, 'message':str(error), 'detail':repr(error)}
+        if hasattr(error, 'cmd'):
+            runner_error['command'] = error.cmd
+        if hasattr(error, 'timeout'):
+            runner_error['timeout'] = error.timeout
+        profile['orchestration_error'] = runner_error
+    profile['native_returncode'] = code
+    profile['profile_started'] = output.is_dir()
+    try:
+        native = json.loads(evidence.read_text())
+        if not isinstance(native, dict):
+            raise ValueError('native report must be a JSON object')
+        profile.update(summarize_linux(native,journey,chunk,evidence))
+    except Exception as error:
+        profile['native_report_error'] = repr(error)
+    if runner_error or 'native_report_error' in profile:
+        if native is not None:
+            profile['native_report_snapshot'] = native
+    if runner_error and (native is not None or profile['profile_started']):
+        profile['cleanup_errors'].append({'phase':'native_runner_exception', **runner_error})
+        cleanup = profile['cases'].setdefault('cleanup', {'expected':'verified owned-resource cleanup', 'command':[]})
+        cleanup.update(state='failed', observed={'native_cleanup':cleanup.get('observed'), 'exception':runner_error})
+        retained = [item['owned_container_retained'] for item in native.get('cleanup', [])
+                    if isinstance(item,dict) and item.get('owned_container_retained')] if isinstance(native,dict) else []
+        profile['remaining_owned_resources'] = list(dict.fromkeys([*profile['remaining_owned_resources'], *retained]))
+        resources = profile.setdefault('owned_resources', {})
+        resources['containers'] = list(dict.fromkeys([*(resources.get('containers') or []), *retained]))
+        profile['cleanup_unconfirmed_resources'] = dict(resources)
+        state, reason = 'failed', runner_error['detail']
+    elif 'native_report_error' in profile:
+        state, reason = 'blocked', profile['native_report_error']
+    elif code or any(case.get('state') == 'failed' for case in profile['cases'].values()):
+        state, reason = 'failed', profile.get('error') or 'native case/cleanup failure'
+    elif any(case.get('state') != 'passed' for case in profile['cases'].values()):
+        state, reason = 'blocked', 'missing native case/proof'
+    else:
+        state, reason = 'passed', None
+    profile['state'] = state
+    return profile, state, reason
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--preflight',action='store_true')
@@ -117,24 +166,26 @@ def main(argv=None):
                 if done.returncode:
                     raise RuntimeError('required local image unavailable: '+done.stderr.strip())
                 from linux_run import run
+            except Exception as error:
+                platform.update(state='blocked',reason=repr(error))
+            else:
+                stopped = False
                 for journey in (1,2):
                     for chunk in CHUNKS:
                         output = owned.path / f'linux-{journey}-{chunk}'
                         print(f'Linux fresh journey{journey}, chunk_size{chunk}',flush=True)
-                        code = run(output,args.image,False,chunk,args.fixture_uid,args.fixture_gid)
-                        evidence = output / 'result.json'
-                        native = json.loads(evidence.read_text())
-                        platform['profiles'].append(summarize_linux(native,journey,chunk,evidence))
+                        profile, state, reason = run_linux_profile(run,output,args.image,journey,chunk,args.fixture_uid,args.fixture_gid)
+                        platform['profiles'].append(profile)
+                        if state != 'passed':
+                            platform.update(state=state,reason=reason)
+                            stopped = True
                         save()
-                        if code:
-                            platform.update(state='failed',reason=native.get('error','native case/cleanup failure'))
+                        if stopped:
                             break
-                    if platform['state'] == 'failed':
+                    if stopped:
                         break
-                if len(platform['profiles']) == 6 and platform['state'] != 'failed':
+                if not stopped:
                     platform['state'] = 'passed'
-            except Exception as error:
-                platform.update(state='blocked',reason=repr(error))
         if args.platform in ('all','macos'):
             result['platforms']['macos'] = {'state':'blocked','reason':MACOS_BLOCKER,'profiles':[],
                 'action':'controller-reviewed bounded native diagnostic and complete profiles required; no Mac runner invoked'}

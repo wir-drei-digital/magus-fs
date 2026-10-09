@@ -78,7 +78,9 @@ def aggregate(platforms, required=('linux', 'macos')):
                         failed.append(label + '/' + name + ': failed')
                     elif case.get('state') != 'passed' or not all(k in case for k in ('expected', 'observed', 'command')) or not case.get('command'):
                         blocked.append(label + '/' + name + ': missing/blocked evidence')
-                if not validate_content_profile(profile.get('transfer', {})):
+                if not profile.get('transfer'):
+                    blocked.append(label + ': missing transfer proof')
+                elif not validate_content_profile(profile['transfer']):
                     failed.append(label + ': invalid transfer profile')
     code = 1 if failed else 2 if blocked else 0
     return {'state': {0: 'passed', 1: 'failed', 2: 'blocked'}[code], 'passed': code == 0,

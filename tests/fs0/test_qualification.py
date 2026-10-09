@@ -69,7 +69,7 @@ class Qualification(unittest.TestCase):
     def test_missing_counters_blocks(self):
         platforms = {'linux':valid(), 'macos':valid()}
         del platforms['linux']['profiles'][0]['transfer']
-        self.assertNotEqual(aggregate(platforms)['exit_code'],0)
+        self.assertEqual(aggregate(platforms)['exit_code'],2)
     def test_reused_cache_token_fails(self):
         platforms = {'linux':valid(), 'macos':valid()}
         platforms['linux']['profiles'][3]['owned_token'] = platforms['linux']['profiles'][0]['owned_token']
