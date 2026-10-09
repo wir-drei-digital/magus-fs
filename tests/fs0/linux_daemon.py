@@ -67,7 +67,7 @@ def focused_setup(report):
             report['mounts'][name] = info
 
 
-def main(focused=False):
+def main(focused=False, chunk_size=262144, uid=501, gid=20):
     ROOT.mkdir(exist_ok=True)
     report = {'sources': {}, 'mounts': {}, 'pids': [], 'cleanup': []}
     try:
@@ -75,12 +75,21 @@ def main(focused=False):
             focused_setup(report)
         else:
             for label, mode, mask in [('normal', None, 0o022), ('permissions', '640', 0o077), ('locked', '000', 0o022)]:
-                args = ['source','--root',str(ROOT / ('fixture-' + label))]
+                args = ['source','--root',str(ROOT / ('fixture-' + label)), '--chunk-size', str(chunk_size)]
                 if mode:
                     args += ['--mode', mode]
                 source = start(args, 'source-' + label, mask)
                 url = ready(source)
+                original = get(url, '/manifest')
+                if label == 'normal':
+                    with (ROOT / 'normal-proxy.stderr').open('w') as error:
+                        proxy = subprocess.Popen(['python3','/opt/fs0/permission_source.py','--source',url,'--uid',str(uid),'--gid',str(gid)], stdout=subprocess.PIPE, stderr=error, text=True)
+                    processes.append(proxy)
+                    url = ready(proxy)
                 manifest = get(url, '/manifest')
+                from permission_source import project_manifest
+                assert manifest == (project_manifest(original, uid=uid, gid=gid) if label == 'normal' else original)
+                report.setdefault('fixture_identity', {})[label] = {'original_digest': original['digest'], 'projected_digest': manifest['digest'], 'projection': {'uid': uid, 'gid': gid} if label == 'normal' else None, 'actor': 'test-only manifest construction; real Rust chunks unchanged'}
                 report['sources'][label] = {'url': url, 'pid': source.pid, 'manifest': manifest}
                 (ROOT / (label + '-manifest.json')).write_text(json.dumps(manifest))
                 for view in (['ro','private'] if label == 'normal' else ['ro'] if label == 'locked' else ['private']):
@@ -140,5 +149,11 @@ def main(focused=False):
 
 
 if __name__ == '__main__':
-    import sys
-    main('--focused-permissions' in sys.argv)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--focused-permissions', action='store_true')
+    parser.add_argument('--chunk-size', type=int, default=262144, choices=(65536,262144,1048576))
+    parser.add_argument('--uid', type=int, default=501)
+    parser.add_argument('--gid', type=int, default=20)
+    args = parser.parse_args()
+    main(args.focused_permissions, args.chunk_size, args.uid, args.gid)

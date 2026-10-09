@@ -9,6 +9,7 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
+from lock_io import contend
 
 
 def expected(offset, length):
@@ -111,11 +112,9 @@ def run(path, mode, manifest):
     def locks():
         with file.open("rb") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            code = "import fcntl,sys; f=open(sys.argv[1],'rb'); fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)"
-            child = subprocess.run([sys.executable, "-c", code, str(file)], capture_output=True, text=True, timeout=5)
+            observation = contend(file)
             fcntl.flock(handle, fcntl.LOCK_UN)
-            return {"contender_returncode": child.returncode, "stderr": child.stderr,
-                    "scope": "same-host client observation with nolocks; no cross-client/server lock guarantee"}
+            return observation
     case("locks_observation", locks)
     return result
 

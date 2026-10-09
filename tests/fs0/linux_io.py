@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 from ordinary_io import run as ordinary, expected
+from lock_io import contend
 
 
 def run(path, mode, manifest):
@@ -64,12 +65,12 @@ def run(path, mode, manifest):
                 assert file.read_bytes() == old
             return {'same_open_and_peer_visible': True, 'durability_explicitly_unsupported': durability}
         case('private_writes', private)
-        case('rename_classification', lambda: denied(lambda: os.rename(file, path / 'renamed'), (errno.EOPNOTSUPP, errno.ENOSYS)))
-        case('create_classification', lambda: denied(lambda: (path / 'new').write_bytes(b'x'), (errno.EOPNOTSUPP, errno.ENOSYS)))
+        case('rename_classification', lambda: denied(lambda: os.rename(path / 'nested/table.csv', path / 'nested/renamed'), (errno.EOPNOTSUPP, errno.ENOSYS)))
+        case('create_classification', lambda: denied(lambda: (path / 'nested/new').write_bytes(b'x'), (errno.EOPNOTSUPP, errno.ENOSYS)))
         case('truncate_classification', lambda: denied(lambda: os.truncate(file, 0), (errno.EOPNOTSUPP, errno.ENOSYS)))
         case('chmod_classification', lambda: denied(lambda: os.chmod(file, 0o777), (errno.EOPNOTSUPP, errno.ENOSYS)))
         for name in ['rename_classification','create_classification','truncate_classification','chmod_classification']:
-            result[name]['observed_support'] = 'unsupported; the denial classification assertion passed'
+            result[name]['observed_support'] = ('unsupported; the denial classification assertion passed' if result[name]['state'] == 'passed' else 'not established; classification failed')
         def mapped():
             import mmap
             with (path / 'data.bin').open('rb') as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as view:
@@ -102,9 +103,7 @@ def run(path, mode, manifest):
             import fcntl
             with file.open('rb') as handle:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                child = subprocess.run([sys.executable, '-c', "import fcntl,sys; f=open(sys.argv[1],'rb'); fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)", str(file)], capture_output=True, text=True, timeout=5)
-                assert child.returncode != 0, 'local lock contender unexpectedly acquired'
-            return {'contender_returncode': child.returncode, 'scope': 'one Linux kernel; no distributed lock guarantee'}
+                return contend(file)
         case('locks_observation', locks)
     return result
 

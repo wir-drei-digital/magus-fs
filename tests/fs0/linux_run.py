@@ -26,13 +26,13 @@ def permission_cases(workload, control, report):
     report['qualification'] = 'focused directory read/search and authorized root private byte-write correction'
 
 
-def run(output, image=IMAGE, focused=False):
-    output = Path(output).absolute()
-    output.mkdir(exist_ok=False)
+def run(output, image=IMAGE, focused=False, chunk_size=262144, uid=501, gid=20):
+    from resources import OwnedOutput
+    output = OwnedOutput(output).path
     token = 'fs0-task3-' + uuid.uuid4().hex[:12]
     daemon = token + '-daemon'
     vm_path = '/tmp/' + token
-    report = {'platform': 'linux', 'token': token, 'owned_vm_path': vm_path, 'owned_containers': [], 'commands': [], 'cases': {}, 'cleanup': [], 'passed': False}
+    report = {'platform': 'linux', 'token': token, 'owned_vm_path': vm_path, 'owned_containers': [], 'commands': [], 'cases': {}, 'cleanup': [], 'passed': False, 'chunk_size': chunk_size, 'fixture_uid_gid': None if focused else [uid,gid]}
     path = output / 'result.json'
     def save():
         path.write_text(json.dumps(report, indent=2) + '\n')
@@ -54,10 +54,12 @@ def run(output, image=IMAGE, focused=False):
         if user == '0:0':
             args += ['--cap-add','DAC_OVERRIDE']
         args += [image,'python3','-c',script]
-        result = cmd(args, name, data=json.dumps(data))
+        result = cmd(args, name, data=json.dumps(data), check=False)
         parsed = json.loads(result.stdout)
         report['cases'][name] = parsed
         save()
+        if result.returncode:
+            raise RuntimeError(name + ' failed: ' + result.stderr + result.stdout)
         return parsed
     started = False
     try:
@@ -67,18 +69,17 @@ def run(output, image=IMAGE, focused=False):
         report['owned_containers'].append(daemon)
         started = True
         cmd(['docker','run','-d','--name',daemon,'--read-only','--cap-drop','ALL','--cap-add','SYS_ADMIN','--security-opt','no-new-privileges',
-             '--device','/dev/fuse','--tmpfs','/private:rw,nosuid,nodev,size=256m','--tmpfs','/tmp:rw,nosuid,nodev,size=4m','-v',vm_path + ':/shared:rshared',image,'python3','/opt/fs0/linux_daemon.py', *(['--focused-permissions'] if focused else [])],'daemon-start')
-        deadline = time.monotonic() + 35
-        while True:
-            logs = cmd(['docker','logs',daemon],'daemon-log',check=False).stdout
-            if logs.strip():
-                readiness = json.loads(logs.splitlines()[0])
-                if not readiness.get('ready'):
-                    raise RuntimeError(str(readiness))
-                break
-            if time.monotonic() >= deadline:
-                raise RuntimeError('daemon ready deadline')
-            time.sleep(0.2)
+             '--device','/dev/fuse','--tmpfs','/private:rw,nosuid,nodev,size=256m','--tmpfs','/tmp:rw,nosuid,nodev,size=4m','-v',vm_path + ':/shared:rshared',image,'python3','/opt/fs0/linux_daemon.py', '--chunk-size',str(chunk_size),'--uid',str(uid),'--gid',str(gid),*(['--focused-permissions'] if focused else [])],'daemon-start')
+        from qualification import wait_until
+        def daemon_ready():
+            logs = cmd(['docker','logs',daemon],'daemon-log',timeout=5,check=False).stdout
+            if not logs.strip():
+                return False
+            readiness = json.loads(logs.splitlines()[0])
+            if not readiness.get('ready'):
+                raise RuntimeError(str(readiness))
+            return readiness
+        wait_until(daemon_ready,seconds=35)
         control = json.loads(cmd(['docker','exec',daemon,'cat','/private/control.json'],'control').stdout)
         report['daemon'] = control
         report['daemon_inspect'] = json.loads(cmd(['docker','inspect',daemon],'daemon-inspect').stdout)[0]
@@ -88,6 +89,9 @@ def run(output, image=IMAGE, focused=False):
         else:
             source = control['sources']['normal']['url']
             manifest = control['sources']['normal']['manifest']
+            assert manifest['chunk_size'] == chunk_size, manifest['chunk_size']
+            assert all(entry['uid'] == uid and entry['gid'] == gid for entry in manifest['entries'])
+            report['manifest_digest'] = manifest['digest']
             def source_stats():
                 return json.loads(cmd(['docker','exec',daemon,'python3','-c',"import json,urllib.request; print(urllib.request.urlopen('" + source + "/stats').read().decode())"], 'stats-' + str(len(report['commands']))).stdout)
             # Do transfer measurements before any ordinary scenario hydrates bytes.
@@ -102,7 +106,17 @@ def run(output, image=IMAGE, focused=False):
             workload('partial-warm','normal-ro',script,{},readonly=True)
             warm = source_stats()
             assert warm['content_body_bytes'] == cold['content_body_bytes'], (cold,warm)
-            report['transfer'] = {'before':before,'enumeration':enumerated,'cold':cold,'warm':warm}
+            from measurement_io import independent_digest
+            digest = independent_digest()
+            scanned = workload('full-scan','normal-ro',"import json,sys; from measurement_io import scan; d=json.load(sys.stdin); print(json.dumps(scan('/view/data.bin',d['digest'])))",{'digest':digest},readonly=True)
+            full = source_stats()
+            report['transfer'] = {'before':before,'enumeration':enumerated,'cold':cold,'warm':warm,'full':full,'full_scan':scanned,
+                                  'cold_delta':cold['content_body_bytes']-before['content_body_bytes'],
+                                  'warm_delta':warm['content_body_bytes']-cold['content_body_bytes'],
+                                  'full_scan_delta':full['content_body_bytes']-warm['content_body_bytes']}
+            from qualification import validate_content_profile
+            assert validate_content_profile(report['transfer']), report['transfer']
+            report['root_metadata'] = workload('root-metadata','normal-ro',"import json,os,stat; s=os.stat('/view'); print(json.dumps({'uid':s.st_uid,'gid':s.st_gid,'mode':stat.S_IMODE(s.st_mode),'scope':'mapped daemon root; outside FS0 manifest digest'}))",{},readonly=True)
             script = "import json,sys; from linux_io import run; from root_confinement import run as confined; d=json.load(sys.stdin); r=run('/view',d['mode'],d['manifest']); r['root_confinement']={'state':'passed','detail':confined(d['source'])}; print(json.dumps(r)); raise SystemExit(0 if all(x['state']=='passed' for x in r.values()) else 2)"
             workload('root-readonly','normal-ro',script,{'mode':'ro','manifest':manifest,'source':source},readonly=True)
             locked = control['sources']['locked']
@@ -110,7 +124,7 @@ def run(output, image=IMAGE, focused=False):
             script = "import errno,json; from pathlib import Path;\ntry:\n Path('/view/instructions.md').read_bytes()\nexcept OSError as e:\n assert e.errno==errno.EACCES\nelse:\n raise AssertionError('nonroot mode000 read allowed')\nprint(json.dumps({'nonroot_mode000_read_denied':True}))"
             workload('nonroot-mode000','locked-ro',script,{},user='1001:1001',readonly=True)
             script = "import json,sys; from linux_io import run; d=json.load(sys.stdin); r=run('/view',d['mode'],d['manifest']); print(json.dumps(r)); raise SystemExit(0 if all(x['state']=='passed' for x in r.values()) else 2)"
-            workload('private','normal-private',script,{'mode':'private','manifest':manifest})
+            workload('private','normal-private',script,{'mode':'private','manifest':manifest},user=f'{uid}:{gid}')
             script = "import errno,json,os; from pathlib import Path; f=Path('/view/instructions.md'); assert f.read_bytes().startswith(b'# Synthetic');\ntry:\n f.open('r+b')\nexcept OSError as e:\n assert e.errno==errno.EACCES\nelse:\n raise AssertionError('group write allowed')\ntry:\n Path('/view/nested/table.csv').read_bytes()\nexcept OSError as e:\n assert e.errno==errno.EACCES\nelse:\n raise AssertionError('parent traversal allowed')\nprint(json.dumps({'group_read':True,'group_write_denied':True,'parent_search_denied':True}))"
             workload('group-permissions','permissions-private',script,{},user='1001:0')
             script = "import errno,json; from pathlib import Path;\ntry:\n Path('/view/instructions.md').read_bytes()\nexcept OSError as e:\n assert e.errno==errno.EACCES\nelse:\n raise AssertionError('other read allowed')\nprint(json.dumps({'other_read_denied':True}))"
@@ -155,6 +169,7 @@ def run(output, image=IMAGE, focused=False):
                 report['cleanup'].append({'daemon':daemon,'unmounts':cleanup['cleanup'],'reaped':cleanup['reaped']})
                 cmd(['docker','rm',daemon],'daemon-remove')
                 # Only the owned VM directory is exposed to this cleanup helper.
+                report['owned_containers'].append(token + '-cleanup')
                 cmd(['docker','run','--rm','--name',token + '-cleanup','--network','none','--cap-drop','ALL','--read-only','-v','/tmp:/vm-tmp',image,'python3','-c',"from pathlib import Path; p=Path('/vm-tmp') / " + repr(token) + "; mountpoints=[line.split()[4] for line in Path('/proc/self/mountinfo').read_text().splitlines()]; assert not any(m.startswith(str(p)+'/') for m in mountpoints),mountpoints; [(x.rmdir() if x.is_dir() and not x.is_symlink() else (_ for _ in ()).throw(AssertionError(str(x)))) for x in p.iterdir()]; p.rmdir(); assert not p.exists()"],'owned-vm-directory-remove')
                 report['cleanup'].append({'owned_vm_path':vm_path,'removed':True})
             except Exception as error:
@@ -163,7 +178,8 @@ def run(output, image=IMAGE, focused=False):
         # Workload --rm must have removed every named workload container.
         remaining = cmd(['docker','ps','-a','--filter','name=' + token,'--format','{{.Names}}'],'owned-container-check',check=False).stdout.strip()
         report['remaining_owned_containers'] = remaining
-        if remaining:
+        from qualification import owned_containers_absent
+        if not owned_containers_absent(report):
             report['passed'] = False
         save()
     print(path)
@@ -175,5 +191,8 @@ if __name__ == '__main__':
     parser.add_argument('--output',required=True)
     parser.add_argument('--image',default=IMAGE)
     parser.add_argument('--focused-permissions',action='store_true')
+    parser.add_argument('--chunk-size',type=int,choices=(65536,262144,1048576),default=262144)
+    parser.add_argument('--uid',type=int,default=501)
+    parser.add_argument('--gid',type=int,default=20)
     args = parser.parse_args()
-    raise SystemExit(run(args.output,args.image,args.focused_permissions))
+    raise SystemExit(run(args.output,args.image,args.focused_permissions,args.chunk_size,args.uid,args.gid))

@@ -6,7 +6,7 @@ The project targets macOS and Linux first. Its core scope includes full local re
 
 ## Current state
 
-The local FS0 development branch contains a verified synthetic fixture/range source, probe CLI, owned test harness and experimental macOS NFS adapter. Raw protocol tests pass, but native macOS ordinary I/O currently stalls and Linux qualification is pending. No filesystem release or complete FS0 gate is claimed. See the [macOS qualification runbook](docs/fs0-macos.md) for actual behavior, limits and build/test commands.
+The local FS0 branch contains the synthetic fixture/range source and experimentally qualified Linux FUSE adapter for pinned read-only and ephemeral private-byte views. Native macOS NFS open/read/listdir stalls, so combined FS0 remains blocked. The [combined qualification runbook](docs/fs0-qualification.md) describes the six fresh Linux profiles, fail-closed report and exact limits; platform details are in the [Linux](docs/fs0-linux.md) and [macOS](docs/fs0-macos.md) runbooks. No filesystem release, completed FS0 or integrated PoC is claimed.
 
 ## Shared specifications and progress
 
