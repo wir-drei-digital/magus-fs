@@ -107,6 +107,12 @@ impl Snapshot {
     pub fn validate_view(&self) -> Result<&BoundView> {
         self.validate(true)
     }
+    /// Reading a recorded result bound to the caller's own issued base (receipt/operation
+    /// replay): current read rights over that base projection, without `history` (R11).
+    /// Writes use `submission::authorize_candidate` instead (R14).
+    pub fn validate_receipt_base(&self) -> Result<&BoundView> {
+        self.validate(false)
+    }
     fn validate(&self, history: bool) -> Result<&BoundView> {
         self.context.action("read")?;
         let view = self.view.as_ref().ok_or(Error::not_found())?;

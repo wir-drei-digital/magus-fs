@@ -199,6 +199,10 @@ pub(crate) async fn replay(
     })?;
     if let Some(derived) = &op.derived {
         if op.view.is_some() {
+            // A replay *reads* a recorded result: the A rule that every formerly visible
+            // identity of its base must still be readable applies (deleted and moved-out or
+            // unreadable alike), in addition to current rights over the delta.
+            s.validate_receipt_base()?;
             authorize_candidate(&s, derived)?;
         }
     }
