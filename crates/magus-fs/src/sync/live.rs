@@ -1,11 +1,8 @@
 //! Authenticated incoming discovery. The execution gate never holds Core across HTTP.
 use super::transport::Transport;
-#[cfg(target_os = "linux")]
 use super::{controller::SyncExecution, transport::Failure};
 use magus_fs_core::{protocol::*, *};
-#[cfg(target_os = "linux")]
 use serde_json::json;
-#[cfg(target_os = "linux")]
 use std::time::Duration;
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 struct Sources(BTreeMap<RemoteSourceId, Transport>);
@@ -35,7 +32,6 @@ pub(super) fn install_sources(rep: &Replica, extra: Option<SyncBinding>) -> Resu
     }
     rep.set_remote_fetcher(Arc::new(Sources(sources)))
 }
-#[cfg(target_os = "linux")]
 pub(crate) struct Incoming {
     rep: Replica,
     execution: Arc<SyncExecution>,
@@ -44,7 +40,6 @@ pub(crate) struct Incoming {
     needs_refresh: bool,
     pending_source: Option<SyncBinding>,
 }
-#[cfg(target_os = "linux")]
 impl Incoming {
     pub fn new(rep: &Replica) -> Result<Self, FsError> {
         Ok(Self {
@@ -56,11 +51,15 @@ impl Incoming {
             pending_source: None,
         })
     }
+    /// A native consumer that cleared readiness must reverify even an unchanged head.
+    pub fn request_refresh(&mut self) {
+        self.needs_refresh = true;
+    }
     /// Poll the durable log even without hints. Refresh metadata also detects grant changes.
-    pub fn poll(
+    pub fn poll<T>(
         &mut self,
-        apply: impl FnOnce(SyncBinding, u64) -> Result<Adoption, FsError>,
-    ) -> Result<Option<Adoption>, FsError> {
+        apply: impl FnOnce(SyncBinding, u64) -> Result<T, FsError>,
+    ) -> Result<Option<T>, FsError> {
         let deadline = Instant::now() + Duration::from_secs(10);
         let Some(_gate) = self
             .execution
@@ -81,7 +80,7 @@ impl Incoming {
         }
         let refreshed = self.needs_refresh;
         let authority_generation = self.rep.live_status()?.authority_generation;
-        let result = (|| -> Result<Option<Adoption>, Failure> {
+        let result = (|| -> Result<Option<T>, Failure> {
             let page: ChangePage = transport.json(
                 "GET",
                 &format!(
@@ -184,7 +183,6 @@ impl Incoming {
     }
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) fn subscribe(
     rep: Replica,
     stop: Arc<std::sync::atomic::AtomicBool>,

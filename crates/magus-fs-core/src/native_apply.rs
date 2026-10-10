@@ -417,11 +417,18 @@ impl Replica {
             let core = lock(&self.core)?;
             let source = match source {
                 Some(source) => ChunkSource::Remote { source },
-                None => from_json(&core.journal.db.query_row(
-                    "SELECT source FROM revision_sources WHERE revision=?",
-                    [revision.as_str()],
-                    |r| r.get::<_, Vec<u8>>(0),
-                )?)?,
+                None => core
+                    .journal
+                    .db
+                    .query_row(
+                        "SELECT source FROM revision_sources WHERE revision=?",
+                        [revision.as_str()],
+                        |r| r.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()?
+                    .map(|bytes| from_json(&bytes))
+                    .transpose()?
+                    .unwrap_or(ChunkSource::Unavailable),
             };
             (
                 crate::cache::closure(&core.revision(revision)?.tree),
@@ -546,6 +553,47 @@ impl Replica {
             }
         }
         self.capture(&n.root, n.policy, operation, actor).map(Some)
+    }
+    /// Persist a safe code from the native owner scheduler; never journal transport details.
+    pub fn record_native_error(&self, error: &FsError) -> Result<(), FsError> {
+        let mut core = lock(&self.core)?;
+        let mut status: NativeStatus = core
+            .journal
+            .db
+            .query_row(
+                "SELECT record FROM native_status WHERE singleton=1",
+                [],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|b| from_json(&b))
+            .transpose()?
+            .unwrap_or(NativeStatus {
+                status: pending("unverified"),
+                incoming_revision: None,
+                displacements: vec![],
+            });
+        status.status = if matches!(error, FsError::UnstableCapture) {
+            NativeApplyStatus::Unstable {
+                reason: error.code().into(),
+            }
+        } else if matches!(
+            error,
+            FsError::Backpressure | FsError::DirtyWorkingState | FsError::GenerationMismatch
+        ) {
+            pending(error.code())
+        } else {
+            blocked(error.code())
+        };
+        if let Some(w) = &core.working {
+            let mut w = w.clone();
+            w.applied = false;
+            core.journal
+                .db
+                .execute("UPDATE working SET value=? WHERE singleton=1", [json(&w)?])?;
+            core.working = Some(w);
+        }
+        status_save(&core, &status)
     }
     pub fn native_status(&self) -> Result<Option<NativeStatus>, FsError> {
         let core = lock(&self.core)?;

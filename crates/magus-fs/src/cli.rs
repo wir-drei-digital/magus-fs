@@ -493,7 +493,9 @@ fn sync_control(rep: &Replica, command: &str, options: &BTreeMap<String, String>
                 .ok_or((2, FsError::NotFound))?;
             Ok(json!({"ok":true,"progress":p}))
         } else {
-            Ok(json!({"ok":true,"status":status,"live":rep.live_status().ok()}))
+            Ok(
+                json!({"ok":true,"status":status,"live":rep.live_status().ok(),"native":rep.native_status().map_err(|e|(1,e))?}),
+            )
         };
     }
     let controller = crate::sync::SyncController::new(rep).map_err(|e| (1, e))?;
@@ -512,6 +514,9 @@ fn sync_control(rep: &Replica, command: &str, options: &BTreeMap<String, String>
                     false,
                 )
                 .map_err(|e| (1, e))?;
+                if rep.native_config().map_err(|e| (1, e))?.is_some() {
+                    crate::sync::watch::serve(rep).map_err(|e| (1, e))?;
+                }
                 loop {
                     let _ = controller.tick();
                     std::thread::sleep(Duration::from_secs(1));

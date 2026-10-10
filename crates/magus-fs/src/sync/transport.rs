@@ -251,7 +251,6 @@ impl Transport {
         }
         Ok((p, ca, token))
     }
-    #[cfg(target_os = "linux")]
     pub(super) fn credential_stamp(&self) -> std::result::Result<ObjectId, FsError> {
         ObjectId::for_bytes(self.credentials()?.2.as_bytes())
     }
@@ -633,7 +632,6 @@ mod dns_tests {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl Transport {
     /// One bounded authenticated WSS connection. Hints carry no content authority.
     /// It owns no SyncExecution/Core lock and shares HTTP's outstanding DNS budget.
