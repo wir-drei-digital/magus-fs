@@ -256,18 +256,34 @@ class Reconciliation(NativeJourney):
         details = {x['id']: self.ok(lep, lc, 'sync', 'conflicts', 'show', '--conflict', x['id'])['conflict'] for x in mine}
         live = [i for i, d in details.items() if any(a['path'] == 'reports/live' for a in d['alternatives'])]
         assert len(live) == 2, details  # the original candidate and the edited one
-        ids = ','.join(details)
+        # R16: another user narrows the winner's new.txt to mode 0 before the owner resolves,
+        # hiding one sibling conflict of the original candidate from the owner.
+        _, before_hide, _ = self.tree();winner_new = before_hide['reports/new.txt']['id']
+        hidden = next(i for i, d in details.items() if d['summary']['reason'] == 'add_add' and any(a['entry'] == winner_new for a in d['alternatives']))
+        cur = next(a['id'] for a in details[hidden]['alternatives'] if a['side'] == 'current');base_alt = next(a['id'] for a in details[hidden]['alternatives'] if a['side'] == 'base')
+        self.set_file('reports/new.txt', plan[wep.platform]['reports/new.txt'], 'hide-entry', mode=0)
+        assert hidden not in [x['id'] for x in self.ok(lep, lc, 'sync', 'conflicts', 'list')['page']['items']]
+        visible = [i for i in details if i != hidden]
+        ids = ','.join(visible + [hidden])
         choices = ','.join(i + ':current' for i in live)
         resolved = self.ok(lep, lc, 'sync', 'resolve', '--conflicts', ids, '--expected-head', advanced['head'], '--select', 'candidate', '--choices', choices, '--replacement', edited['local_revision'])
-        progress = resolved['progress'];assert progress['state'] == 'Shared' and progress['resolution']['conflicts'] == ids.split(','), progress
+        progress = resolved['progress'];assert progress['state'] == 'Shared' and progress['resolution']['conflicts'] == visible, progress
+        assert resolved['hidden'] == [hidden], resolved
+        assert self.sql("SELECT superseded FROM conflict_resolutions WHERE conflict='" + hidden + "';") == 't'
+        assert self.sql("SELECT count(*) FROM conflict_alternatives WHERE conflict='" + hidden + "';") == '3' 
         assert progress['resolves']['source'] == edited['local_revision']
         final = self.head();assert final == progress['shared_receipt']['head']
         view, files, _ = self.tree()
-        expect = {'reports/notes.txt': manual, 'reports/live': plan[wep.platform]['reports/live'], renamed: plan[lep.platform]['reports/new.txt'], 'reports/new.txt': plan[wep.platform]['reports/new.txt']}
+        expect = {'reports/notes.txt': manual, 'reports/live': plan[wep.platform]['reports/live'], renamed: plan[lep.platform]['reports/new.txt']}
         expect.update({'reports/' + p + '-extra.txt': plan[p]['reports/' + p + '-extra.txt'] for p in self.platforms})
         expect.update({'reports/race-one.txt': b'unrelated advance one', 'reports/race-two.txt': b'unrelated advance two'})
         for path, data in expect.items():assert self.body(view, files[path]) == data, path
         assert files['reports/notes.txt']['mode'] == 0o600, files['reports/notes.txt']
+        # The hidden entry stayed at its head value (mode 0, unreadable, so absent from views).
+        assert 'reports/new.txt' not in files
+        hidden_row = json.loads(self.sql("SELECT convert_from(r.descriptor,'UTF8') FROM revisions r JOIN branches b ON b.revision=r.revision AND b.namespace=r.namespace WHERE b.name='main';"))
+        assert [(e['mode'], e['id']) for e in hidden_row['tree']['entries'] if e['path'] == 'reports/new.txt'] == [(0, winner_new)]
+        expect['reports/new.txt'] = None
         after = self.conflicts('loser');assert all(x['state'] == 'resolved' for x in after if x['id'] in details), after
         # The original alternatives remain addressable and exportable after resolution.
         dest = lc['path'] + '/export-after';self.ok(lep, lc, 'sync', 'conflicts', 'export', '--conflict', text['summary']['id'], '--alternative', next(a['id'] for a in text['alternatives'] if a['side'] == 'candidate'), '--destination', dest)
@@ -284,18 +300,12 @@ class Reconciliation(NativeJourney):
         later = self.set_file('reports/after-resolution.txt', b'incoming resumes', 'after-resolution')
         for ep, c in [(lep, lc), (wep, wc)]:self.ready_files(ep, c, {'reports/after-resolution.txt': b'incoming resumes'}, later['head'], 20)
         for ep, c, _ in clients:ep.stop(c)
-        # I6/I7: an entry that is authorized on no side under current metadata hides its
-        # conflict; export of an unauthorized and of an absent alternative fail identically.
-        winner_new = files['reports/new.txt']['id']
-        hidden = next(i for i, d in details.items() if d['summary']['reason'] == 'add_add' and any(a['entry'] == winner_new for a in d['alternatives']))
-        cur = next(a['id'] for a in details[hidden]['alternatives'] if a['side'] == 'current');base_alt = next(a['id'] for a in details[hidden]['alternatives'] if a['side'] == 'base')
-        self.set_file('reports/new.txt', plan[wep.platform]['reports/new.txt'], 'hide-entry', mode=0)
+        # I6/I7: the hidden conflict stays hidden; unauthorized and absent exports are identical.
         shown = self.fail(lep, lc, 'sync', 'conflicts', 'show', '--conflict', hidden)
         unauthorized = self.fail(lep, lc, 'sync', 'conflicts', 'export', '--conflict', hidden, '--alternative', cur, '--destination', lc['path'] + '/export-hidden-current')
         absent_export = self.fail(lep, lc, 'sync', 'conflicts', 'export', '--conflict', hidden, '--alternative', base_alt, '--destination', lc['path'] + '/export-hidden-base')
         assert shown['error'] == unauthorized['error'] == absent_export['error'] == 'denied', (shown, unauthorized, absent_export)
-        assert hidden not in [x['id'] for x in self.ok(lep, lc, 'sync', 'conflicts', 'list')['page']['items']]
-        self.record(lep.platform, 'explicit-and-delayed-resolution', stale_cli=stale, raced=raced, recorded_resolutions=recorded, held_bytes=held_bytes, edited=edited, choices=choices, resolution=progress, final_head=final, conflicts_after=after, resolved_links=linked, observed=observed, modes=modes, incoming_after=later, hidden_conflict={'show': shown, 'unauthorized_export': unauthorized, 'absent_export': absent_export})
+        self.record(lep.platform, 'explicit-and-delayed-resolution', stale_cli=stale, raced=raced, recorded_resolutions=recorded, held_bytes=held_bytes, edited=edited, choices=choices, resolution=progress, final_head=final, conflicts_after=after, resolved_links=linked, observed=observed, modes=modes, incoming_after=later, hidden_conflict={'id': hidden, 'superseded': True, 'show': shown, 'unauthorized_export': unauthorized, 'absent_export': absent_export})
     def notes0_after_merge(self):
         return lines('alpha MAC', 'bravo', 'charlie', 'delta', 'echo LINUX') if 'merge' in self.phases else self.notes0
 
@@ -377,26 +387,91 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         assert conflicted['code'] == 'conflicted' and self.head() == overlap['head']
         reasons = [x['reason'] for x in self.conflicts('nohist') if x['id'] in conflicted['conflicts']]
         assert reasons and set(reasons) <= {'text_overlap', 'content'}, reasons
-        # (b) The worker's private candidate edits an identity that is then moved out of its
-        # scope: integration is denied, the private receipt is retained (re-authorized on read).
-        target = self.set_file('reports/move-me.txt', b'move me v0', 'move-seed');view, r = self.view('worker')
-        e = next(e for e in r['tree']['entries'] if e['path'] == 'reports/move-me.txt');e['content'] = file_entry('x', e['parent'], b'worker edit before move')['content']
-        request, private = self.worker_candidate(copy.deepcopy(view), r, [b'worker edit before move'])
-        def move(t):
-            e = next(e for e in t['entries'] if e['path'] == 'reports/move-me.txt');e['path'] = 'secret/move-me.txt';e['parent'] = next(x['id'] for x in t['entries'] if x['path'] == 'secret')
-        moved = self.publish_tree(move, label='move-out-of-scope')
-        stale = self.stage_request(view, copy.deepcopy(r), [b'worker edit before move'])
-        self.expect('stale-view-submission-denied', 'POST', self.root + '/candidates', 404, {'code': 'not_found'}, body=stale, actor='worker')
-        integration = self.integrate_request(private, {'head': moved['head']})
-        self.expect('moved-out-of-scope-denied', 'POST', self.root + '/integrations', 404, {'code': 'not_found'}, body=integration, actor='worker')
-        assert self.head() == moved['head'] and self.sql("SELECT count(*) FROM conflicts WHERE integration='" + integration['operation'] + "';") == '0'
-        assert self.sql("SELECT count(*) FROM operations WHERE operation='" + integration['operation'] + "';") == '0'
-        self.expect('moved-private-current-rights', 'GET', self.op_path(request), 404, actor='worker')
-        assert self.sql("SELECT count(*) FROM operations WHERE operation='" + request['operation'] + "' AND kind='candidate';") == '1'
-        def back(t):
-            e = next(e for e in t['entries'] if e['path'] == 'secret/move-me.txt');e['path'] = 'reports/move-me.txt';e['parent'] = next(x['id'] for x in t['entries'] if x['path'] == 'reports')
-        self.publish_tree(back, label='move-back-into-scope')
-        self.expect('moved-private-retained', 'GET', self.op_path(request), 200, private, actor='worker')
+        # (b) R14 / spec P7: stale scoped candidates against others' deletes, moves and renames.
+        def setup(paths):
+            heads = [self.set_file(p, (p + ' v0').encode(), 'p7-seed') for p in paths]
+            return heads[-1]
+        def mv(src, dst):
+            def mutate(t):
+                e = next(e for e in t['entries'] if e['path'] == src);e['path'] = dst
+                e['parent'] = next(x['id'] for x in t['entries'] if x['path'] == dst.rsplit('/', 1)[0])
+            return mutate
+        def rm(path):
+            return lambda t: t['entries'].remove(next(e for e in t['entries'] if e['path'] == path))
+        def edit(r, path, body):
+            e = next(e for e in r['tree']['entries'] if e['path'] == path);e['content'] = file_entry('x', e['parent'], body)['content'];return e
+        def shape(conflict, actor='worker'):
+            code, d = self.request('GET', self.root + '/conflicts/' + conflict, actor=actor);assert code == 200, (code, d)
+            return d, sorted((a['side'], a['path'] is None) for a in d['alternatives'])
+        def export(conflict, alternative, actor='worker'):
+            return self.request('GET', self.root + '/conflicts/' + conflict + '/alternatives/' + alternative, actor=actor)
+        sub = {'path': 'reports/sub', 'id': identity('entry'), 'parent': None, 'owner': ALICE, 'group': GROUP, 'mode': 493, 'content': {'kind': 'directory'}}
+        def add_sub(t):
+            sub['parent'] = next(e['id'] for e in t['entries'] if e['path'] == 'reports');t['entries'].append(dict(sub))
+        self.publish_tree(add_sub, label='p7-subdir')
+        setup(['reports/del.txt', 'reports/mv.txt', 'reports/ren.txt', 'reports/sub/child.txt', 'reports/unrelated.txt', 'reports/x2.txt'])
+        view, r = self.view('worker')
+        # Others: delete one, move one out of scope, rename one, rename the ancestor, delete an unrelated file.
+        for label, mutate in [('p7-delete', rm('reports/del.txt')), ('p7-move-out', mv('reports/mv.txt', 'secret/mv.txt')), ('p7-rename', mv('reports/ren.txt', 'reports/ren-alice.txt')),
+                              ('p7-ancestor-rename', mv('reports/sub', 'reports/sub2')), ('p7-unrelated-delete', rm('reports/unrelated.txt'))]:
+            if label == 'p7-ancestor-rename':
+                def mutate(t):
+                    d = next(e for e in t['entries'] if e['path'] == 'reports/sub');d['path'] = 'reports/sub2'
+                    for e in t['entries']:
+                        if e['path'].startswith('reports/sub/'):e['path'] = 'reports/sub2/' + e['path'][len('reports/sub/'):]
+            head = self.publish_tree(mutate, label=label)
+        outcomes = {}
+        for label, change, body in [('edit-vs-delete', lambda r: edit(r, 'reports/del.txt', b'w edit del'), b'w edit del'),
+                                    ('edit-vs-move-out', lambda r: edit(r, 'reports/mv.txt', b'w edit mv'), b'w edit mv'),
+                                    ('rename-edit-vs-rename', lambda r: (edit(r, 'reports/ren.txt', b'w edit ren').update(path='reports/ren-worker.txt')), b'w edit ren'),
+                                    ('child-edit-vs-ancestor-rename', lambda r: edit(r, 'reports/sub/child.txt', b'w edit child'), b'w edit child'),
+                                    ('edit-vs-unrelated-delete', lambda r: edit(r, 'reports/x2.txt', b'w edit x2'), b'w edit x2')]:
+            rr = copy.deepcopy(r);change(rr)
+            _, private = self.worker_candidate(copy.deepcopy(view), rr, [body])  # R14: never denied at submission
+            status, body_ = self.request('POST', self.root + '/integrations', actor='worker', body=self.integrate_request(private, {'head': self.head()}))
+            outcomes[label] = (status, body_)
+        reason = lambda label: [x['reason'] for x in self.conflicts('worker') if x['id'] in outcomes[label][1]['conflicts']]
+        assert outcomes['edit-vs-delete'][0] == 409 and reason('edit-vs-delete') == ['edit_delete'], outcomes
+        assert outcomes['edit-vs-move-out'][0] == 409 and reason('edit-vs-move-out') == ['edit_delete'], outcomes
+        assert outcomes['rename-edit-vs-rename'][0] == 409 and reason('rename-edit-vs-rename') == ['competing_rename'], outcomes
+        assert outcomes['child-edit-vs-ancestor-rename'][0] == 200 and outcomes['edit-vs-unrelated-delete'][0] == 200, outcomes
+        av, files, _ = self.tree()
+        assert self.body(av, files['reports/sub2/child.txt']) == b'w edit child' and self.body(av, files['reports/x2.txt']) == b'w edit x2'
+        assert self.body(av, files['secret/mv.txt']) == b'reports/mv.txt v0', 'never written outside the worker scope'
+        # Deleted and moved-out-of-scope are presented identically (head side absent).
+        deleted, deleted_shape = shape(outcomes['edit-vs-delete'][1]['conflicts'][0])
+        moved, moved_shape = shape(outcomes['edit-vs-move-out'][1]['conflicts'][0])
+        assert deleted_shape == moved_shape == [('base', False), ('candidate', False), ('current', True)], (deleted, moved)
+        cur = lambda d: next(a['id'] for a in d['alternatives'] if a['side'] == 'current')
+        assert export(deleted['summary']['id'], cur(deleted)) == export(moved['summary']['id'], cur(moved)) == (404, {'code': 'not_found'})
+        # I6: an identity moved out of scope AFTER its conflict was recorded is likewise
+        # presented as deleted; for a caller without history both are hidden alike.
+        late = {}
+        for path in ['reports/late-move.txt', 'reports/late-delete.txt']:
+            self.set_file(path, b'late v0', 'late-seed')
+        nv, nr = self.view('nohist')
+        for path in ['reports/late-move.txt', 'reports/late-delete.txt']:
+            self.set_file(path, ('alice ' + path).encode(), 'late-overlap')
+            rr = copy.deepcopy(nr);edit(rr, path, ('nohist ' + path).encode())
+            _, private = self.submit('nohist', nohist_replica, copy.deepcopy(nv), rr, [('nohist ' + path).encode()])
+            code, body_ = self.request('POST', self.root + '/integrations', actor='nohist', body=self.integrate_request(private, {'head': self.head()}))
+            assert code == 409, (code, body_);late[path] = body_['conflicts'][0]
+        listed = [x['id'] for x in self.conflicts('nohist')];assert all(c in listed for c in late.values())
+        self.publish_tree(mv('reports/late-move.txt', 'secret/late-move.txt'), label='late-move-out')
+        self.publish_tree(rm('reports/late-delete.txt'), label='late-delete')
+        after = [x['id'] for x in self.conflicts('nohist')]
+        hidden_late = {p: self.request('GET', self.root + '/conflicts/' + c, actor='nohist') for p, c in late.items()}
+        assert not any(c in after for c in late.values()) and all(v == (404, {'code': 'not_found'}) for v in hidden_late.values()), (after, hidden_late)
+        # I4: a narrowed submitter whose stale candidate would merge-conflict is denied first.
+        self.set_file('reports/n4.txt', b'n4 v0', 'n4-seed');view, r = self.view('worker')
+        edit(r, 'reports/n4.txt', b'worker n4 overlap');_, n4_private = self.worker_candidate(copy.deepcopy(view), r, [b'worker n4 overlap'])
+        # Overlapping edit plus a narrowed (read-only) mode by the owner after the submission.
+        n4 = self.set_file('reports/n4.txt', b'alice n4 overlap', 'n4-overlap-narrow', mode=0o400)
+        attempt = self.integrate_request(n4_private, {'head': n4['head']})
+        self.expect('i4-merge-conflict-narrowed-denied', 'POST', self.root + '/integrations', 404, {'code': 'not_found'}, body=attempt, actor='worker')
+        assert self.sql("SELECT count(*) FROM operations WHERE operation='" + attempt['operation'] + "';") == '0'
+        assert self.sql("SELECT count(*) FROM conflicts WHERE integration='" + attempt['operation'] + "';") == '0'
+        self.record('service', 'p7-r14-i4-i6', outcomes=outcomes, deleted=deleted, moved=moved, late_hidden=hidden_late)
         # (c) A collision with an entry the worker cannot read is denied without disclosure.
         view, r = self.view('worker');reports = next(e['id'] for e in r['tree']['entries'] if e['path'] == 'reports')
         collide = self.set_file('reports/hidden-x', b'unreadable to the worker', 'hidden-collision', mode=0)
