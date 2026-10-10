@@ -553,18 +553,43 @@ pub(crate) async fn resolve(
                 Box::pin(async move {
                     Ok(db
                         .query(
-                            "SELECT id FROM conflicts WHERE namespace=$1 AND integration=ANY($2)",
+                            &format!("{SELECT} WHERE c.namespace=$1 AND c.integration=ANY($2)"),
                             &[&c.namespace, integrations],
                         )
                         .await?
                         .iter()
-                        .map(|r| r.get::<_, String>(0))
-                        .collect::<BTreeSet<_>>())
+                        .map(row)
+                        .collect::<Vec<_>>())
                 })
             })
             .await?;
-        if !siblings.is_subset(&ids.iter().cloned().collect()) {
-            return Err(Error::invalid("incomplete_resolution"));
+        // Ruling R16: named conflicts must be visible to the caller now; an unnamed sibling is
+        // acceptable only when it is hidden from the caller (it is then superseded, provided
+        // the replacement leaves its entry at the current head value).
+        let mut visibility = Visibility::default();
+        for t in &targets {
+            let alternatives = alternatives(&state, &t.id).await?;
+            if visibility
+                .paths(&state, &c, t, &alternatives)
+                .await?
+                .is_none()
+            {
+                return Err(Error::not_found());
+            }
+        }
+        let named: BTreeSet<String> = ids.iter().cloned().collect();
+        let mut hidden = vec![];
+        for sibling in siblings.iter().filter(|x| !named.contains(&x.id)) {
+            let alternatives = alternatives(&state, &sibling.id).await?;
+            if sibling.resolved
+                || visibility
+                    .paths(&state, &c, sibling, &alternatives)
+                    .await?
+                    .is_some()
+            {
+                return Err(Error::invalid("incomplete_resolution"));
+            }
+            hidden.push(sibling);
         }
         let s = r::snapshot(&state.db, &c, &candidate.branch, candidate.view.as_deref()).await?;
         s.context.action("integrate")?;
@@ -593,6 +618,18 @@ pub(crate) async fn resolve(
                 }
             }
         }
+        if !stale {
+            // R16: hidden entries stay exactly at the current head values.
+            let at = |t: &Tree, id: &str| t.entries.iter().find(|e| e.id.as_str() == id).cloned();
+            for h in &hidden {
+                if let Some(entry) = &h.entry {
+                    if at(&resolved.tree, entry) != at(&current.tree, entry) {
+                        return Err(Error::invalid("invalid_resolution"));
+                    }
+                }
+            }
+        }
+        let superseded: Vec<String> = hidden.iter().map(|h| h.id.clone()).collect();
         let resolved_id = r::rid(&resolved)?;
         let derived_id = r::rid(derived)?;
         let required = r::objects(&resolved)?;
@@ -612,20 +649,21 @@ pub(crate) async fn resolve(
         };
         let provenance = r::json(&serde_json::json!({
             "kind":"resolution","operation":req.operation,"conflicts":req.conflicts,
-            "replacement":req.replacement,"submitted":original.revision,
+            "replacement":req.replacement,"submitted":original.revision,"superseded":superseded,
             "current":r::rid(current)?,"candidates":resolved.parents,
         }))?;
         let bytes = r::encode(&resolved)?;
         barrier("resolution").await;
-        let commit = state.db.acquire().await?.run(|db| { let req=&req; let serialized=&serialized; let ids=&ids; let candidate=&candidate; let original=&original; let receipt=&receipt; let result=&result; let paths=&paths; let required=&required; let bytes=&bytes; let resolved_id=&resolved_id; let derived_id=&derived_id; let provenance=&provenance; let s=&s; Box::pin(async move {
+        let commit = state.db.acquire().await?.run(|db| { let req=&req; let serialized=&serialized; let ids=&ids; let candidate=&candidate; let original=&original; let receipt=&receipt; let result=&result; let paths=&paths; let required=&required; let bytes=&bytes; let resolved_id=&resolved_id; let derived_id=&derived_id; let provenance=&provenance; let s=&s; let superseded=&superseded; Box::pin(async move {
             let tx = db.transaction().await?;
             let current = r::recheck(&tx, s, "integrate").await?;
             if tx.query_opt("SELECT operation FROM operations WHERE namespace=$1 AND replica=$2 AND operation=$3",&[&current.namespace,&current.replica,&req.operation.as_str()]).await?.is_some() {
                 return Err(Error::conflict());
             }
             if !stale {
-                let open: i64 = tx.query_one("SELECT count(*) FROM conflicts c WHERE c.namespace=$1 AND c.id=ANY($2) AND NOT EXISTS(SELECT 1 FROM conflict_resolutions x WHERE x.conflict=c.id)",&[&current.namespace,ids]).await?.get(0);
-                if open != ids.len() as i64 {
+                let all: Vec<String> = ids.iter().chain(superseded.iter()).cloned().collect();
+                let open: i64 = tx.query_one("SELECT count(*) FROM conflicts c WHERE c.namespace=$1 AND c.id=ANY($2) AND NOT EXISTS(SELECT 1 FROM conflict_resolutions x WHERE x.conflict=c.id)",&[&current.namespace,&all]).await?.get(0);
+                if open != all.len() as i64 {
                     return Err(Error { status: StatusCode::CONFLICT, code: "already_resolved" });
                 }
                 let generations = r::ready(&tx, &current, required, None, required).await?;
@@ -641,8 +679,8 @@ pub(crate) async fn resolve(
                 derived: if stale { derived_id } else { resolved_id },
             }).await?;
             if !stale {
-                for id in ids {
-                    tx.execute("INSERT INTO conflict_resolutions(conflict,namespace,replica,operation,revision) VALUES($1,$2,$3,$4,$5)",&[id,&current.namespace,&current.replica,&req.operation.as_str(),&resolved_id.as_str()]).await?;
+                for (id, hidden) in ids.iter().map(|i| (i, false)).chain(superseded.iter().map(|i| (i, true))) {
+                    tx.execute("INSERT INTO conflict_resolutions(conflict,namespace,replica,operation,revision,superseded) VALUES($1,$2,$3,$4,$5,$6)",&[id,&current.namespace,&current.replica,&req.operation.as_str(),&resolved_id.as_str(),&hidden]).await?;
                 }
                 tx.execute("INSERT INTO revision_provenance(namespace,revision,kind,operation,payload,digest) VALUES($1,$2,'resolution',$3,$4,$5)",&[&current.namespace,&resolved_id.as_str(),&req.operation.as_str(),provenance,&digest(provenance.as_bytes())]).await?;
             }

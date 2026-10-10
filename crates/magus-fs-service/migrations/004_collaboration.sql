@@ -42,3 +42,6 @@ CREATE TABLE IF NOT EXISTS revision_provenance(
 -- Alternative export views: re-authorized against current rights on every use.
 ALTER TABLE views ADD COLUMN IF NOT EXISTS alternative text REFERENCES conflict_alternatives(id);
 ALTER TABLE views ADD COLUMN IF NOT EXISTS alternative_entry text;
+-- Ruling R16: conflicts hidden from the resolving caller are closed as superseded by the
+-- resolution that left their entries at head values; their alternatives stay immutable.
+ALTER TABLE conflict_resolutions ADD COLUMN IF NOT EXISTS superseded boolean NOT NULL DEFAULT false;

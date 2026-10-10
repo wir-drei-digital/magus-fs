@@ -42,11 +42,18 @@ guessing.
 ## Service integration
 
 `POST /integrations` keeps expected-head CAS. If `expected_head` is not the current
-head the result is the retained `409 stale_head`, as before. Before any retained outcome
-(stale or unknown causality) is recorded, the candidate is re-authorized under current
-rights — credential, grant, current metadata and scope of its delta — without requiring
-unrelated path stability (ruling R12); a revoked or narrowed submitter is denied and no
-409 result or conflict row is written. Otherwise:
+head the result is the retained `409 stale_head`, as before. One current-rights
+authorization precedes **every** outcome (stale, unknown causality, fast-forward, merge,
+retained conflicts) and also private submission and receipt replay (rulings R12, R14,
+R17): the read action and the caller's own issued base; the candidate's delta with current
+metadata for identities the caller can still see at their current location; and its effect
+at the *current locations* of what it touches (current scope and write permission).
+Visible changes by others to untouched entries never deny. Touched identities that others
+deleted, moved out of the caller's scope or made unreadable are presented identically as
+absent on the head side: an edit becomes a retained `edit_delete` conflict (the caller's
+alternative kept, never writable there), a deletion of such an identity is moot and keeps
+the hidden head entry. Competing renames are retained conflicts. A revoked or narrowed
+submitter is denied with no 409 result or conflict row. Otherwise:
 
 1. A candidate whose revision or unpublished ancestry carried
    `native_unknown_causality` (recorded at candidate time in `candidate_causality`;
@@ -101,13 +108,20 @@ operation; unique per integration and entry), `conflict_alternatives`,
 | `POST /resolutions` | `ResolutionRequest {operation, replica, conflicts[1..128], expected_head, replacement}` → `SharedReceipt` |
 
 Alternative views project the side's immutable tree under *current* metadata for
-identities that still exist (a historic mode never reopens access); identities absent
-from the current head need `history`. They are re-authorized on every descriptor/object
+identities that still exist (a historic mode never reopens access). An identity counts as
+present only at a current location inside the caller's scope: one moved out of scope is
+treated exactly like a deleted one (its historic in-scope versions need `history`; its
+current side is never disclosed), so "moved out of scope" and "deleted" are
+indistinguishable. They are re-authorized on every descriptor/object
 read and can never be a candidate base.
 
-A resolution names every conflict retained by the integration(s) it resolves
-(`400 incomplete_resolution` otherwise) and a complete private replacement candidate
-based on `expected_head`, submitted by the same replica that holds the conflicted
+A resolution names every conflict retained by the integration(s) it resolves that is
+visible to the caller (`400 incomplete_resolution` otherwise). Ruling R16: a sibling
+conflict hidden from the caller after narrowing is not named; the replacement must leave
+its entry exactly at the current head value (`400 invalid_resolution` otherwise) and the
+conflict is closed as superseded by the resolution (`conflict_resolutions.superseded`),
+its alternatives retained. The request also needs  a complete private replacement candidate based
+on `expected_head`, submitted by the same replica that holds the conflicted
 candidates' original private receipts (others get `404`; ruling R12). The service rejects a changed head (`409 stale_head`,
 recorded), an already resolved conflict (`409 already_resolved`), an
 unknown-causality replacement (`400 invalid_resolution`) and anything the current
@@ -153,11 +167,12 @@ posted. Once shared, the resolved candidates, their unpublished ancestors and th
 replacement source chain get `resolved_by`, which ends the hold: incoming application
 resumes. `--operation-id` resumes an interrupted resolution with its frozen request.
 
-Limitations: local composition is opaque, so an entry the service could have text-merged
+`sync resolve` skips a named conflict that is now hidden (`404`), reports it under
+`hidden`, and keeps previously shared entries it can no longer see at their head value.
+
+Limitation: local composition is opaque, so an entry the service could have text-merged
 takes its chosen side when the same candidate also has real conflicts (choose or replace
-it explicitly). Stale candidates whose required ancestors were moved or deleted by others
-are denied at private submission by the A path-stability rule rather than reaching the
-merge.
+it explicitly).
 
 ## Gate
 

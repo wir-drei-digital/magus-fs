@@ -235,7 +235,9 @@ pub(crate) fn resolve(
                 .resolves
                 .as_ref()
                 .ok_or(FsError::OperationMismatch)?;
-            if target.conflicts != conflicts || target.expected_head != expected_head {
+            if target.conflicts.iter().any(|c| !conflicts.contains(c))
+                || target.expected_head != expected_head
+            {
                 return Err(FsError::OperationMismatch.into());
             }
             let controller = SyncController::new(rep)?;
@@ -250,13 +252,27 @@ pub(crate) fn resolve(
     let mut receipts = BTreeSet::new();
     let mut entry_choices: BTreeMap<EntryId, Side> = BTreeMap::new();
     let mut whole: Option<Side> = None;
+    // Ruling R16: a conflict hidden from this caller after narrowing (404) is not named;
+    // the service supersedes it if the replacement leaves its entry at the head value.
+    let mut hidden = vec![];
+    let mut visible = vec![];
+    let mut visible_entries = BTreeSet::new();
     for id in &conflicts {
-        let detail: ConflictDetail = t.json(
+        let detail: ConflictDetail = match t.json(
             "GET",
             &format!("/conflicts/{}", id.as_str()),
             (),
             deadline(),
-        )?;
+        ) {
+            Ok(detail) => detail,
+            Err(failure) if failure.code == "denied" => {
+                hidden.push(id.clone());
+                continue;
+            }
+            Err(failure) => return Err(failure),
+        };
+        visible.push(id.clone());
+        visible_entries.extend(detail.alternatives.iter().filter_map(|a| a.entry.clone()));
         if detail.summary.state != ConflictState::Open {
             return Err(Failure {
                 code: "already_resolved",
@@ -294,6 +310,12 @@ pub(crate) fn resolve(
                 whole = Some(side);
             }
         }
+    }
+    if visible.is_empty() {
+        return Err(Failure {
+            code: "denied",
+            retryable: false,
+        });
     }
     let default = match (whole, selection.default) {
         (Some(w), Some(d)) if w != d => return Err(invalid()),
@@ -386,6 +408,43 @@ pub(crate) fn resolve(
         code: "invalid_resolution",
         retryable: false,
     })?;
+    // R16: with hidden conflicts, previously shared entries this caller can no longer see
+    // at the head (and that no visible conflict names) stay at their head value: absent
+    // from the projected replacement, so the service keeps the current hidden entry.
+    let tree = if hidden.is_empty() {
+        tree
+    } else {
+        let now: BTreeSet<&EntryId> = current.tree.entries.iter().map(|e| &e.id).collect();
+        let shared: BTreeSet<&EntryId> = base.tree.entries.iter().map(|e| &e.id).collect();
+        let mut doomed: BTreeSet<EntryId> = tree
+            .entries
+            .iter()
+            .filter(|e| {
+                !now.contains(&e.id) && shared.contains(&e.id) && !visible_entries.contains(&e.id)
+            })
+            .map(|e| e.id.clone())
+            .collect();
+        loop {
+            let more: Vec<EntryId> = tree
+                .entries
+                .iter()
+                .filter(|e| doomed.contains(&e.parent) && !doomed.contains(&e.id))
+                .map(|e| e.id.clone())
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            doomed.extend(more);
+        }
+        Tree {
+            root: tree.root.clone(),
+            entries: tree
+                .entries
+                .into_iter()
+                .filter(|e| !doomed.contains(&e.id))
+                .collect(),
+        }
+    };
     let actor = super::publication_actor(rep, rep.actor_for_uid(unsafe { libc::geteuid() })?)?;
     let operation = match operation {
         Some(op) => op,
@@ -426,7 +485,7 @@ pub(crate) fn resolve(
         },
         next,
         ResolutionTarget {
-            conflicts,
+            conflicts: visible,
             expected_head,
             receipts: receipts.into_iter().collect(),
             source,
@@ -434,7 +493,9 @@ pub(crate) fn resolve(
     )?;
     let controller = SyncController::new(rep)?;
     let progress = controller.run_resolution(&id)?;
-    Ok(outcome(&controller, progress))
+    let mut value = outcome(&controller, progress);
+    value["hidden"] = json!(hidden);
+    Ok(value)
 }
 fn outcome(controller: &SyncController, progress: SyncProgress) -> Value {
     let shared = progress.shared_receipt.is_some();
