@@ -320,16 +320,25 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         r['tree']['entries'].append(file_entry('reports/worker.txt', reports, b'worker output'));_, private = self.worker_candidate(view, r, [b'worker output'])
         merged = self.expect('scoped-stale-merge', 'POST', self.root + '/integrations', 200, body=self.integrate_request(private, {'head': hidden['head']}), actor='worker')
         av, files, _ = self.tree();assert self.body(av, files['secret/plan']) == b'hidden v1 by alice' and self.body(av, files['reports/worker.txt']) == b'worker output'
-        # (b) An identity moved out of scope after the base: denied, private receipt retained.
+        # (b) The worker's private candidate edits an identity that is then moved out of its
+        # scope: integration is denied, the private receipt is retained (re-authorized on read).
         target = self.set_file('reports/move-me.txt', b'move me v0', 'move-seed');view, r = self.view('worker')
+        e = next(e for e in r['tree']['entries'] if e['path'] == 'reports/move-me.txt');e['content'] = file_entry('x', e['parent'], b'worker edit before move')['content']
+        request, private = self.worker_candidate(copy.deepcopy(view), r, [b'worker edit before move'])
         def move(t):
             e = next(e for e in t['entries'] if e['path'] == 'reports/move-me.txt');e['path'] = 'secret/move-me.txt';e['parent'] = next(x['id'] for x in t['entries'] if x['path'] == 'secret')
         moved = self.publish_tree(move, label='move-out-of-scope')
-        e = next(e for e in r['tree']['entries'] if e['path'] == 'reports/move-me.txt');e['content'] = file_entry('x', e['parent'], b'worker edit after move')['content']
-        request, private = self.worker_candidate(view, r, [b'worker edit after move'])
+        stale = self.stage_request(view, copy.deepcopy(r), [b'worker edit before move'])
+        self.expect('stale-view-submission-denied', 'POST', self.root + '/candidates', 404, {'code': 'not_found'}, body=stale, actor='worker')
         integration = self.integrate_request(private, {'head': moved['head']})
         self.expect('moved-out-of-scope-denied', 'POST', self.root + '/integrations', 404, {'code': 'not_found'}, body=integration, actor='worker')
         assert self.head() == moved['head'] and self.sql("SELECT count(*) FROM conflicts WHERE integration='" + integration['operation'] + "';") == '0'
+        assert self.sql("SELECT count(*) FROM operations WHERE operation='" + integration['operation'] + "';") == '0'
+        self.expect('moved-private-current-rights', 'GET', self.op_path(request), 404, actor='worker')
+        assert self.sql("SELECT count(*) FROM operations WHERE operation='" + request['operation'] + "' AND kind='candidate';") == '1'
+        def back(t):
+            e = next(e for e in t['entries'] if e['path'] == 'secret/move-me.txt');e['path'] = 'reports/move-me.txt';e['parent'] = next(x['id'] for x in t['entries'] if x['path'] == 'reports')
+        self.publish_tree(back, label='move-back-into-scope')
         self.expect('moved-private-retained', 'GET', self.op_path(request), 200, private, actor='worker')
         # (c) A collision with an entry the worker cannot read is denied without disclosure.
         view, r = self.view('worker');reports = next(e['id'] for e in r['tree']['entries'] if e['path'] == 'reports')
@@ -406,7 +415,7 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         seconds = time.monotonic() - started
         assert body['code'] == 'conflicted' and 4.5 < seconds < 20, (body, seconds)
         assert [x['reason'] for x in self.conflicts() if x['id'] in body['conflicts']] == ['merge_budget'] and self.head() == advanced['head']
-        workers = int(self.i.docker('exec', self.i.service, 'python3', '-c', "import os\nn=0\nfor p in os.listdir('/proc'):\n try:n+=p.isdigit() and b'merge-worker' in open('/proc/'+p+'/cmdline','rb').read()\n except OSError:pass\nprint(n)").stdout.strip())
+        workers = int(self.i.docker('exec', self.i.service, 'python3', '-c', "import os\nn=0\nfor p in os.listdir('/proc'):\n try:n+=p.isdigit() and b'merge-worker' in open('/proc/'+p+'/cmdline','rb').read().split(b'\\0')\n except OSError:pass\nprint(n)").stdout.strip())
         assert workers == 0, ('killable worker survived its deadline', workers)
         (self.i.control / 'slow-merge-worker').unlink()
         # Atomicity: the service dies after the merge decision and generated-object install,
