@@ -1741,3 +1741,29 @@ pub(crate) fn applied_paths(core: &Core) -> Result<Vec<(String, Observation)>, F
         })
         .collect()
 }
+
+#[cfg(test)]
+mod hydration_tests {
+    use super::*;
+    #[test]
+    fn baseline_can_continue_after_30_seconds_without_relaxing_object_or_incoming_bounds() {
+        let started = Instant::now();
+        let now = started + Duration::from_secs(31);
+        assert_eq!(
+            NativeHydration::Baseline.fetch_deadline(started, now),
+            now + Duration::from_millis(4500)
+        );
+        assert_eq!(
+            NativeHydration::Incoming.fetch_deadline(started, now),
+            started + Duration::from_secs(30)
+        );
+        assert_eq!(
+            NativeHydration::Baseline.fetch_deadline(started, started + Duration::from_secs(59)),
+            started + Duration::from_secs(60)
+        );
+        assert_eq!(
+            NativeHydration::Incoming.fetch_deadline(started, started),
+            started + Duration::from_millis(4500)
+        );
+    }
+}
