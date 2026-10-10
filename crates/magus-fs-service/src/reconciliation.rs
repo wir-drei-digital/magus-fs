@@ -374,6 +374,7 @@ pub(crate) fn present(
     };
     let (b, c, r) = (index(base), index(current), index(derived));
     let mut hidden_edits = BTreeSet::new();
+    let mut hidden_ancestors = BTreeSet::new();
     let mut restore = vec![];
     for id in b.keys().chain(r.keys()).collect::<BTreeSet<_>>() {
         let touched = match (b.get(id), r.get(id)) {
@@ -381,7 +382,25 @@ pub(crate) fn present(
             (None, None) => false,
             _ => true,
         };
-        if !touched || !c.contains_key(id) || visible.contains(id) {
+        if !touched {
+            continue;
+        }
+        // R19-B: an untouched ancestor of a touched (or created) entry that others deleted or
+        // moved out of scope is likewise absent on the head side, so creating beneath a
+        // moved-out folder behaves exactly like creating beneath a deleted one.
+        let mut parent = r.get(id).or(b.get(id)).map(|e| e.parent.clone());
+        let mut steps = 0;
+        while let Some(p) = parent {
+            if steps > MAX_ENTRIES || (!b.contains_key(&p) && !r.contains_key(&p)) {
+                break;
+            }
+            if c.contains_key(&p) && !visible.contains(&p) {
+                hidden_ancestors.insert(p.clone());
+            }
+            parent = r.get(&p).or(b.get(&p)).map(|e| e.parent.clone());
+            steps += 1;
+        }
+        if !c.contains_key(id) || visible.contains(id) {
             continue;
         }
         match (b.get(id), r.get(id)) {
@@ -395,8 +414,9 @@ pub(crate) fn present(
     let mut right = derived.clone();
     right.entries.extend(restore);
     right.entries.sort_by(|x, y| x.path.cmp(&y.path));
+    let absent = hidden_edits.union(&hidden_ancestors).cloned().collect();
     Presented {
-        left: without(current, &hidden_edits),
+        left: without(current, &absent),
         right,
         hidden_edits,
     }
@@ -415,6 +435,7 @@ impl MergeContent for NoContent {
 /// identities excluded): the tree a merge preferring the candidate would produce. `None`
 /// when that composition is structurally unresolvable (integration retains conflicts).
 pub(crate) fn effect(base: &Tree, presented: &Presented) -> Option<Tree> {
+    // Callers fail closed on None (ruling R19): no current-location check is ever skipped.
     let tree = resolve_trees(
         base,
         &presented.left,

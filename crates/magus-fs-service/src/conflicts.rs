@@ -872,6 +872,17 @@ mod tests {
             Ok(2),
             "retained history at the in-scope historic path"
         );
+        // R19-C: others also make the moved-out identity unreadable: still exactly like
+        // a deleted one (its out-of-scope current permissions never apply).
+        let mut unreadable = moved.clone();
+        unreadable.entries[2].mode = 0;
+        for history in [false, true] {
+            assert_eq!(
+                check(&unreadable, history),
+                check(&deleted, history),
+                "unreadable history={history}"
+            );
+        }
         // The current side at the out-of-scope location is never disclosed.
         let mut current_side = side.clone();
         current_side.tree = moved.clone();

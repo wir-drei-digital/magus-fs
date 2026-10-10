@@ -89,7 +89,9 @@ pub fn alternative(
         .entries
         .retain(|e| history || now.get(&e.id).is_some_and(|p| in_scope(p)));
     for e in &mut authority.entries {
-        if let Some(present) = now.get(&e.id) {
+        // Current permissions apply only where the identity currently lies in scope; one
+        // moved out of scope keeps its historic metadata exactly like a deleted one (R19-C).
+        if let Some(present) = now.get(&e.id).filter(|p| in_scope(p)) {
             e.owner = present.owner.clone();
             e.group = present.group.clone();
             e.mode = present.mode;

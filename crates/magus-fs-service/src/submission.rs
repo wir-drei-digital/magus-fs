@@ -175,10 +175,11 @@ pub(crate) fn authorize_candidate(s: &r::Snapshot, derived: &Revision) -> Result
     authorize_tree_transition(&now, &checked, a, &s.authorities, &s.scope()).map_err(core_error)?;
     let presented =
         crate::reconciliation::present(&view.full.tree, &current.tree, &derived.tree, &visible);
-    if let Some(effect) = crate::reconciliation::effect(&view.full.tree, &presented) {
-        authorize_tree_transition(&presented.left, &effect, a, &s.authorities, &s.scope())
-            .map_err(core_error)?;
-    }
+    // R19: an effect that cannot be composed at current locations is denied, never skipped.
+    let effect =
+        crate::reconciliation::effect(&view.full.tree, &presented).ok_or(Error::not_found())?;
+    authorize_tree_transition(&presented.left, &effect, a, &s.authorities, &s.scope())
+        .map_err(core_error)?;
     Ok(())
 }
 /// Rulings R12/R17: the same current-location authorization before a retained outcome.
@@ -496,14 +497,15 @@ mod tests {
             authorize_retained(&s, &derived).unwrap_err().code,
             "not_found"
         );
-        // The parent moved out of the caller's scope by others: creating beneath its current
-        // location would escape the scope, so it is denied (stable identity is no escape).
+        // R19-B: the parent moved out of the caller's scope by others is presented as absent
+        // (exactly like a deleted parent): the private submission is accepted and nothing is
+        // ever placed at the out-of-scope location (integration retains a conflict).
         let (mut s, derived) = fixture();
         s.current.as_mut().unwrap().tree.entries[0].path = "outside".into();
-        assert_eq!(
-            authorize_candidate(&s, &derived).unwrap_err().code,
-            "not_found"
-        );
+        assert!(authorize_candidate(&s, &derived).is_ok());
+        let (mut s, derived2) = fixture();
+        s.current.as_mut().unwrap().tree.entries.remove(0);
+        assert!(authorize_candidate(&s, &derived2).is_ok());
     }
     #[test]
     fn untouched_visible_changes_and_in_scope_ancestor_moves_never_deny() {
@@ -517,6 +519,51 @@ mod tests {
         s.context.prefixes = vec!["".into()];
         s.current.as_mut().unwrap().tree.entries.remove(1);
         assert!(authorize_candidate(&s, &derived).is_ok());
+    }
+    #[test]
+    fn creation_under_moved_out_or_deleted_folder_is_presented_identically() {
+        // R19-B: base has dir `secret`; the candidate creates `secret/new`; others either
+        // deleted `secret` or moved it out of the caller's scope (invisible).
+        let (s, _) = fixture();
+        let base = s.view.as_ref().unwrap().full.tree.clone();
+        let folder = base.entries[1].clone();
+        let mut derived = base.clone();
+        let mut child = folder.clone();
+        child.id = EntryId::random().unwrap();
+        child.path = "secret/new".into();
+        child.parent = folder.id.clone();
+        derived.entries.push(child);
+        let visible = BTreeSet::from([base.root.id.clone(), base.entries[0].id.clone()]);
+        let mut moved = base.clone();
+        moved.entries[1].path = "elsewhere".into();
+        let mut deleted = base.clone();
+        deleted.entries.remove(1);
+        let a = crate::reconciliation::present(&base, &moved, &derived, &visible);
+        let b = crate::reconciliation::present(&base, &deleted, &derived, &visible);
+        assert_eq!(a.left, b.left);
+        assert_eq!(a.right, b.right);
+        assert_eq!(
+            crate::reconciliation::effect(&base, &a),
+            crate::reconciliation::effect(&base, &b)
+        );
+    }
+    #[test]
+    fn uncomposable_effect_fails_closed() {
+        // R19: the current head turned the touched parent identity into a file; the
+        // candidate's child cannot be placed, so authorization denies instead of skipping.
+        let (mut s, derived) = fixture();
+        s.context.prefixes = vec!["".into()];
+        let current = s.current.as_mut().unwrap();
+        current.tree.entries[0].content = EntryContent::File {
+            version: FileVersion {
+                size: 0,
+                extents: vec![],
+            },
+        };
+        assert_eq!(
+            authorize_candidate(&s, &derived).unwrap_err().code,
+            "not_found"
+        );
     }
     #[test]
     fn hidden_touched_identities_are_presented_as_absent() {
