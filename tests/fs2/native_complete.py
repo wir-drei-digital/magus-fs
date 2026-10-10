@@ -520,10 +520,12 @@ def main():
     except InfrastructureUnavailable as e:i.write_json('failure.json', {'classification': 'blocked', 'reason': str(e)});code = 2
     except Exception as e:i.write_json('failure.json', {'classification': 'failed', 'reason': str(e), 'trace': traceback.format_exc()});traceback.print_exc()
     finally:
-        try:
-            if j:j.cleanup()
-            i.cleanup()
-        except Exception as e:i.write_json('cleanup-failure.json', {'reason': str(e), 'trace': traceback.format_exc()});code = 1
+        # Infrastructure cleanup always runs, even when a native mount must be retained.
+        errors = []
+        for step in ([j.cleanup] if j else []) + [i.cleanup]:
+            try:step()
+            except Exception as e:errors.append({'reason': str(e), 'trace': traceback.format_exc()})
+        if errors:i.write_json('cleanup-failure.json', errors);code = 1
         i.write_json('result.json', {'passed': code == 0, 'exit': code, 'scope': 'FS2-B Task 1 native completion', 'platform': a.platform, 'cases': cases, 'evidence_records': len(evidence), 'complete_gate': a.platform == 'all' and not a.case})
     return code
 if __name__ == '__main__':sys.exit(main())
