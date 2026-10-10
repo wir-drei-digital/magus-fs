@@ -6,7 +6,7 @@ The project targets macOS and Linux first. Its core scope includes full local re
 
 ## Current state
 
-The unmerged `codex/fs-poc` branch contains the qualified FS0 mount checkpoint and FS1's durable local engine, lazy Linux FUSE/macOS NFS adapters, private revisions and independent recovery archives. The [FS1 combined qualification runbook](docs/fs1-qualification.md) defines two fresh V1–V12 journeys per OS, source/binary/image provenance and fail-closed cleanup. FS1 task, whole-range and scoped correction reviews are complete at code `b9e3fe1`; see the runbook for the distinct original-matrix and correction evidence. No filesystem release, shared synchronization or integrated PoC is claimed.
+FS0 mounts, FS1 durable replicas and FS2-A connected synchronization are qualified locally on macOS/Linux. FS2-A runtime `e03ddad` closes all six task reviews, whole-slice review and its correction review. The [FS2-A runbook](docs/fs2-qualification.md) distinguishes the two real connected journeys from subsequent harness/service corrections. FS2-B reconciliation/recovery is planned but unimplemented; full FS2, the integrated PoC and a filesystem release remain outstanding.
 
 Run the complete FS1 gate on the qualified macOS host with Rancher Desktop running:
 
@@ -24,7 +24,7 @@ Set `MAGUS_ICM_ROOT` to the active ICM checkout when using a nonstandard layout.
 
 ## Development and distribution
 
-Repository: [wir-drei-digital/magus-fs](https://github.com/wir-drei-digital/magus-fs). Initial documentation is published on `main`; FS1 development continues locally on `codex/fs-poc`. No runtime release exists. License and redistributable dependencies will be selected before external distribution; no license is granted by this planning README. Build/test commands are documented in the qualification runbook; no packaged installation exists.
+Repository: [wir-drei-digital/magus-fs](https://github.com/wir-drei-digital/magus-fs). Remote `main` contains the initial documentation; completed development is merged into local `main` only. No runtime release exists. License and redistributable dependencies will be selected before external distribution; no license is granted by this planning README. Build/test commands are documented in the qualification runbook; no packaged installation exists.
 
 The FS2-A connected gate is documented in [FS2-A qualification](docs/fs2-qualification.md). It exercises a full native Mac folder, lazy Linux mount, isolated Python worker, explicit integration, real restart/hint/response-loss recovery and twenty serialized saves in each of two fresh journeys. The source, receipt, content-transfer and normal-unmount evidence qualifies this slice only; FS2-B implementation and full FS2/PoC qualification remain outstanding.
 
