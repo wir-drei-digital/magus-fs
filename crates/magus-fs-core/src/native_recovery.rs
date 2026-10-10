@@ -364,3 +364,32 @@ impl Replica {
         Ok(())
     }
 }
+/// Bound on the unpublished ancestry walked for unknown causality; deeper chains fail closed.
+const MAX_UNPUBLISHED_ANCESTRY: usize = 4096;
+impl Replica {
+    /// Whether `revision` or any ancestor after the bound view `published` (exclusive) carries
+    /// `native_unknown_causality`. Publishing a descendant would publish that ancestor too.
+    pub fn unknown_causality_since(
+        &self,
+        revision: &RevisionId,
+        published: &RevisionId,
+    ) -> Result<bool, FsError> {
+        let core = lock(&self.core)?;
+        let mut pending = vec![revision.clone()];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if &id == published || !seen.insert(id.clone()) {
+                continue;
+            }
+            if seen.len() > MAX_UNPUBLISHED_ANCESTRY {
+                return Ok(true);
+            }
+            let r = core.revision(&id)?;
+            if r.provenance == UNKNOWN_CAUSALITY_PROVENANCE {
+                return Ok(true);
+            }
+            pending.extend(r.parents);
+        }
+        Ok(false)
+    }
+}

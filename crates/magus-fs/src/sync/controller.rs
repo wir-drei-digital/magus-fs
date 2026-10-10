@@ -237,9 +237,11 @@ impl SyncController {
             }
             if p.integration.is_none() {
                 // Ruling R6: native content of unknown causal base never integrates
-                // automatically, not even as a fast-forward; it stays private.
-                if self.rep.revision(&p.local_revision)?.provenance
-                    == magus_fs_core::UNKNOWN_CAUSALITY_PROVENANCE
+                // automatically, not even as a fast-forward, nor through a descendant whose
+                // unpublished ancestry (after its bound view) contains it; it stays private.
+                if self
+                    .rep
+                    .unknown_causality_since(&p.local_revision, &binding.view.revision)?
                 {
                     if p.error.as_deref() != Some(UNKNOWN_CAUSALITY) {
                         let mut next = p.clone();

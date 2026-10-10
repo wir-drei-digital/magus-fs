@@ -250,7 +250,15 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         assert self.view()[0]['head'] == head_before, 'unknown-causality candidate reached the shared branch'
         drained = self.cli_raw(ep, c, 'sync', 'drain', '--revision', progress['local_revision'], '--level', 'shared', '--deadline-ms', '3000')
         assert json.loads(drained['out'])['error'] == 'unknown_causality', drained
-        self.record(ep.platform, 'stale-ram-save-unknown-causality', unrelated=unrelated, progress=held, provenance=stale['provenance'], parents=stale['parents'], ram_sha256=sha(self.base_body), shared_head_unchanged=head_before, drain=json.loads(drained['out'])['error'])
+        # A later unrelated save descends from the held revision; publishing it would publish
+        # the stale revert, so it is held too and the shared head does not advance.
+        known = {p['operation'] for p in ep.status(c)['status']['submissions']}
+        ep.write(c, b'later unrelated save after the hold', path='reports/after-hold')
+        descendant = self.until(lambda: next((p for p in ep.status(c)['status']['submissions'] if p['operation'] not in known and p['private_receipt'] and p['error'] == 'unknown_causality'), None), 15)
+        time.sleep(3);descendant = next(p for p in ep.status(c)['status']['submissions'] if p['operation'] == descendant['operation'])
+        assert descendant['state'] == 'PrivateRemote' and descendant['shared_receipt'] is None, descendant
+        assert self.view()[0]['head'] == head_before, 'a descendant published the held unknown-causality revision'
+        self.record(ep.platform, 'stale-ram-save-unknown-causality', unrelated=unrelated, progress=held, provenance=stale['provenance'], parents=stale['parents'], ram_sha256=sha(self.base_body), shared_head_unchanged=head_before, drain=json.loads(drained['out'])['error'], held_descendant=descendant)
         ep.stop(c)
         # The root's own parent becomes readonly; the private profile directory stays 0700.
         c = ep.create('readonly-parent', nest=True);ep.start(c);self.until(lambda: ep.ready(c));before = self.native(ep, c, ['reports/live'])

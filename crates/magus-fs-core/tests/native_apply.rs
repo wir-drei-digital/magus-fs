@@ -2169,3 +2169,36 @@ fn recorded_retained_versions_are_not_rehashed_every_scan() {
     );
     assert_eq!(rep.list_native_recovery(actor()).unwrap().len(), 1);
 }
+
+#[test]
+fn unknown_causality_is_inherited_by_unpublished_descendants() {
+    let (d, rep, n, base) = fixture();
+    let mut r = next_of(&rep, &base);
+    entry_mut(&mut r, "a").content = content(b"incoming");
+    let view = import(&rep, &sorted(r), sources(d.path(), &[b"incoming"]));
+    assert!(ready(&apply(&rep, &view)));
+    fs::write(n.root.join(".a.swp"), b"before").unwrap();
+    fs::rename(n.root.join(".a.swp"), n.root.join("a")).unwrap();
+    let stale = rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .unwrap()
+        .unwrap();
+    fs::write(n.root.join("b"), b"unrelated later save").unwrap();
+    let later = rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .unwrap()
+        .unwrap();
+    assert_eq!(rep.revision(&later).unwrap().parents, vec![stale.clone()]);
+    assert_eq!(
+        rep.revision(&later).unwrap().provenance,
+        "native_scan_delete_create"
+    );
+    assert!(rep.unknown_causality_since(&stale, &view).unwrap());
+    assert!(
+        rep.unknown_causality_since(&later, &view).unwrap(),
+        "a descendant would publish the stale ancestor"
+    );
+    assert!(!rep.unknown_causality_since(&view, &view).unwrap());
+    // Ancestry before the bound view is already published and does not count.
+    assert!(!rep.unknown_causality_since(&later, &later).unwrap());
+}
