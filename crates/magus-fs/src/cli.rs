@@ -592,7 +592,8 @@ fn sync_control(rep: &Replica, command: &str, options: &BTreeMap<String, String>
                 let error = if matches!(
                     progress.state,
                     SubmissionState::Denied | SubmissionState::Failed
-                ) {
+                ) || crate::sync::held(&progress)
+                {
                     progress.error.as_deref().unwrap_or("durability_unmet")
                 } else if level == DurabilityLevel::Shared
                     && progress.private_receipt.is_some()

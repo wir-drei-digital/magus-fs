@@ -953,18 +953,20 @@ impl Replica {
             )?;
             crate::native_apply::authorize_native_capture(&core, &actor, &tree)?;
             // Identify engine-applied paths by operation record, never by name or time.
-            let unknown_causality = prior.as_ref().is_some_and(|p| {
-                crate::native_apply::applied_paths(&core)
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|path| {
-                        p.observations.get(path).is_some_and(|before| {
-                            observations.get(path).is_none_or(|after| {
-                                !crate::native_apply::same_generation(before, after)
-                            })
+            let changed_applied: Vec<String> = if prior.is_some() {
+                crate::native_apply::applied_paths(&core)?
+                    .into_iter()
+                    .filter(|(path, applied)| {
+                        observations.get(path).is_none_or(|after| {
+                            !crate::native_apply::same_generation(applied, after)
                         })
                     })
-            });
+                    .map(|(path, _)| path)
+                    .collect()
+            } else {
+                vec![]
+            };
+            let unknown_causality = !changed_applied.is_empty();
             let digest =
                 RevisionId::digest(&json(&(root, &policy, &actor, &tree, &observations))?)?;
             let existing = core
@@ -1087,6 +1089,9 @@ impl Replica {
                     "UPDATE operations SET state='committed',result=?,error=NULL WHERE operation=?",
                     params![id.as_str(), operation.as_str()],
                 )?;
+                for path in &changed_applied {
+                    tx.execute("DELETE FROM native_applied WHERE path=?", [path])?;
+                }
                 crate::faults::hit("db-commit")?;
                 tx.commit()?;
                 core.working = Some(next);

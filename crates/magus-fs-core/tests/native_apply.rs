@@ -1640,3 +1640,47 @@ fn structural_racing_write_after_exchange_retains_both_roots() {
     structural_interrupted("native-root-exchanged", Some("held-write"));
     structural_interrupted("native-root-exchanged", Some("installed-write"));
 }
+
+#[test]
+fn unrelated_capture_after_application_keeps_stale_save_unknown() {
+    let (d, rep, n, _) = fixture();
+    fs::write(n.root.join("b"), b"b0").unwrap();
+    let base = rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .unwrap()
+        .unwrap();
+    let mut r = next_of(&rep, &base);
+    entry_mut(&mut r, "a").content = content(b"incoming");
+    let next = import(&rep, &sorted(r), sources(d.path(), &[b"incoming"]));
+    assert!(ready(&apply(&rep, &next)));
+    // An unrelated save is captured first; it must not clear the applied path's status.
+    fs::write(n.root.join("b"), b"b1").unwrap();
+    let unrelated = rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rep.revision(&unrelated).unwrap().provenance,
+        "native_scan_delete_create"
+    );
+    fs::write(n.root.join(".a.swp"), b"before").unwrap();
+    fs::rename(n.root.join(".a.swp"), n.root.join("a")).unwrap();
+    let stale = rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rep.revision(&stale).unwrap().provenance,
+        UNKNOWN_CAUSALITY_PROVENANCE
+    );
+    // Once that native change is captured, later edits of the path have a local base.
+    fs::write(n.root.join("a"), b"edited after the captured stale save").unwrap();
+    let later = rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rep.revision(&later).unwrap().provenance,
+        "native_scan_delete_create"
+    );
+}

@@ -152,6 +152,7 @@ impl Journal {
   CREATE TABLE IF NOT EXISTS revision_sources (revision TEXT PRIMARY KEY, source BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS sync_queue (operation TEXT PRIMARY KEY, record BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS native_recovery (id TEXT PRIMARY KEY, operation TEXT NOT NULL, record BLOB NOT NULL, retained TEXT NOT NULL, UNIQUE(operation, retained));
+  CREATE TABLE IF NOT EXISTS native_applied (path TEXT PRIMARY KEY, observation BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS native_recovery_captures (operation TEXT PRIMARY KEY, id TEXT NOT NULL REFERENCES native_recovery(id), digest TEXT NOT NULL, revision TEXT NOT NULL REFERENCES revisions(id));
   PRAGMA user_version=2;")?;
         let encoded = serde_json::to_vec(&config).map_err(|_| FsError::InvalidDescriptor)?;

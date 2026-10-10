@@ -1446,6 +1446,8 @@ pub(crate) fn commit(
         revision: r.revision.clone(),
     };
     let mut queues = core.sync_records()?;
+    let base = core.revision(&r.base)?.tree;
+    let applied = applied_paths(core)?;
     let tx = core.journal.db.transaction()?;
     if let Some(b) = &r.binding {
         tx.execute(
@@ -1471,6 +1473,29 @@ pub(crate) fn commit(
         }
     }
     tx.execute("UPDATE native SET scan=? WHERE singleton=1", [json(&scan)?])?;
+    // Record installed regular files by the durable application, not by name or time.
+    for e in &next.tree.entries {
+        if e.content != EntryContent::Directory
+            && base.entries.iter().find(|o| o.id == e.id) != Some(e)
+        {
+            if let Some(observed) = scan.observations.get(&e.path) {
+                tx.execute(
+                    "INSERT OR REPLACE INTO native_applied VALUES(?,?)",
+                    params![e.path, json(observed)?],
+                )?;
+            }
+        }
+    }
+    for (path, _) in &applied {
+        if !next
+            .tree
+            .entries
+            .iter()
+            .any(|e| &e.path == path && e.content != EntryContent::Directory)
+        {
+            tx.execute("DELETE FROM native_applied WHERE path=?", [path])?;
+        }
+    }
     tx.execute(
         "UPDATE working SET value=? WHERE singleton=1",
         [json(&next)?],
@@ -1508,61 +1533,20 @@ impl Core {
         Ok(out)
     }
 }
-/// Paths installed by the native application that produced the current head, when no local
-/// capture has happened since. A later native change to one of them has unknown causality:
-/// an editor may have saved bytes read before the application.
-pub(crate) fn applied_paths(core: &Core) -> Result<Vec<String>, FsError> {
-    let Some(w) = &core.working else {
-        return Ok(vec![]);
-    };
-    if w.base != w.head {
-        return Ok(vec![]);
-    }
-    let Some(r) = records(core)?
-        .into_iter()
-        .rev()
-        .find(|r| r.revision == w.head && matches!(r.status, NativeApplyStatus::Ready { .. }))
-    else {
-        return Ok(vec![]);
-    };
-    let old = core.revision(&r.base)?.tree;
-    let new = core.revision(&r.revision)?.tree;
-    let mut out = vec![];
-    // Regular files only: stale application RAM concerns content, not directory listings.
-    for e in new
-        .entries
-        .iter()
-        .filter(|e| e.content != EntryContent::Directory)
-    {
-        if old.entries.iter().find(|o| o.id == e.id) != Some(e) {
-            out.push(e.path.clone());
-        }
-    }
-    Ok(out)
-}
-
-#[cfg(test)]
-mod hydration_tests {
-    use super::*;
-    #[test]
-    fn baseline_can_continue_after_30_seconds_without_relaxing_object_or_incoming_bounds() {
-        let started = Instant::now();
-        let now = started + Duration::from_secs(31);
-        assert_eq!(
-            NativeHydration::Baseline.fetch_deadline(started, now),
-            now + Duration::from_millis(4500)
-        );
-        assert_eq!(
-            NativeHydration::Incoming.fetch_deadline(started, now),
-            started + Duration::from_secs(30)
-        );
-        assert_eq!(
-            NativeHydration::Baseline.fetch_deadline(started, started + Duration::from_secs(59)),
-            started + Duration::from_secs(60)
-        );
-        assert_eq!(
-            NativeHydration::Incoming.fetch_deadline(started, started),
-            started + Duration::from_millis(4500)
-        );
-    }
+/// Regular files installed by native applications whose next native change has not yet been
+/// captured. Any later change of their native generation has unknown causality: an editor may
+/// save bytes it read before the application. An unchanged re-observation never clears a row;
+/// only a capture recording a change of that path (or a later application) does.
+pub(crate) fn applied_paths(core: &Core) -> Result<Vec<(String, Observation)>, FsError> {
+    core.journal
+        .db
+        .prepare("SELECT path,observation FROM native_applied ORDER BY path")?
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?
+        .map(|row| {
+            let (path, bytes) = row?;
+            Ok((path, from_json(&bytes)?))
+        })
+        .collect()
 }

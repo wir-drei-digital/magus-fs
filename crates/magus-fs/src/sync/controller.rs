@@ -140,6 +140,7 @@ impl SyncController {
                         | SubmissionState::Uncertain
                 ) || p.state == SubmissionState::PrivateRemote
                     && self.transport.binding.publication == PublicationMode::SharedLive
+                    && !held(p)
             })
             .ok_or(FsError::NotFound)?;
         self.target_tick(p, deadline)
@@ -235,6 +236,18 @@ impl SyncController {
                 return Ok(p);
             }
             if p.integration.is_none() {
+                // Ruling R6: native content of unknown causal base never integrates
+                // automatically, not even as a fast-forward; it stays private.
+                if self.rep.revision(&p.local_revision)?.provenance
+                    == magus_fs_core::UNKNOWN_CAUSALITY_PROVENANCE
+                {
+                    if p.error.as_deref() != Some(UNKNOWN_CAUSALITY) {
+                        let mut next = p.clone();
+                        next.error = Some(UNKNOWN_CAUSALITY.into());
+                        p = self.save(&p, next)?;
+                    }
+                    return Ok(p);
+                }
                 p = self.integration(p, binding.view.head.clone())?;
             }
             let mut next = p.clone();
@@ -462,6 +475,7 @@ impl SyncController {
         p = self.get(revision)?;
         while !p.reached(level) && Instant::now() < deadline {
             if matches!(p.state, SubmissionState::Denied | SubmissionState::Failed)
+                || level == DurabilityLevel::Shared && held(&p)
                 || level == DurabilityLevel::Shared
                     && p.private_receipt.is_some()
                     && p.integration.is_none()
@@ -500,6 +514,14 @@ fn objects(r: &Revision) -> BTreeMap<ObjectId, u64> {
         }
     }
     result
+}
+/// Error code for a private candidate held because its native causal base is unknown.
+pub(crate) const UNKNOWN_CAUSALITY: &str = "unknown_causality";
+/// Held private by Ruling R6 until explicit integration or recovery.
+pub(crate) fn held(p: &SyncProgress) -> bool {
+    p.state == SubmissionState::PrivateRemote
+        && p.integration.is_none()
+        && p.error.as_deref() == Some(UNKNOWN_CAUSALITY)
 }
 #[cfg(not(feature = "test-faults"))]
 fn fault(_: &str) -> Result<(), FsError> {

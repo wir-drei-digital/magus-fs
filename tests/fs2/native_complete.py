@@ -224,13 +224,25 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         pid = ep.run("p=subprocess.Popen(['python3','-c',s['code'],json.dumps(s['args'])],stdout=open(s['tag']+'-log','w'),stderr=subprocess.STDOUT);print(json.dumps(p.pid))", {'code': code, 'args': {'file': c['root'] + '/reports/live', 'tag': tag}, 'tag': tag})
         ep.children[-1] = {'pid': pid, 'tag': tag};ep.save();self.until(lambda: ep.exists(tag + '-ready'))
         incoming = (ep.platform + ' accepted while editor held old RAM').encode();shared = self.publish(incoming);self.until(lambda: ep.ready(c, shared['head']), 15)
+        # An unrelated save is captured and published first; it must not clear the applied path.
+        seen = {p['operation'] for p in ep.status(c)['status']['submissions']}
+        ep.write(c, b'unrelated save before the stale editor save', path='reports/unrelated')
+        unrelated = self.until(lambda: next((p for p in ep.status(c)['status']['submissions'] if p['operation'] not in seen and p['shared_receipt']), None), 15)
+        self.until(lambda: ep.ready(c, unrelated['shared_receipt']['head']), 15)
+        head_before = self.view()[0]['head']
         prior = {p['operation'] for p in ep.status(c)['status']['submissions']}
         ep.run("open(s+'-go','w').close();print('{}')", tag);self.until(lambda: ep.exists(tag + '-done'));ep.children[-1]['stopped'] = True;ep.save()
         progress = self.until(lambda: next((p for p in ep.status(c)['status']['submissions'] if p['operation'] not in prior), None), 15)
         revisions = {r['revision']: r['descriptor'] for r in ep.cli(c, 'history')['revisions']}
         stale = revisions[progress['local_revision']]
         assert stale['provenance'] == UNKNOWN, stale['provenance']
-        self.record(ep.platform, 'stale-ram-save-unknown-causality', progress=progress, provenance=stale['provenance'], parents=stale['parents'], ram_sha256=sha(self.base_body))
+        held = self.until(lambda: next((p for p in ep.status(c)['status']['submissions'] if p['operation'] == progress['operation'] and p['private_receipt'] and p['error'] == 'unknown_causality'), None), 15)
+        time.sleep(3);held = next(p for p in ep.status(c)['status']['submissions'] if p['operation'] == progress['operation'])
+        assert held['state'] == 'PrivateRemote' and held['shared_receipt'] is None and held['integration'] is None, held
+        assert self.view()[0]['head'] == head_before, 'unknown-causality candidate reached the shared branch'
+        drained = self.cli_raw(ep, c, 'sync', 'drain', '--revision', progress['local_revision'], '--level', 'shared', '--deadline-ms', '3000')
+        assert json.loads(drained['out'])['error'] == 'unknown_causality', drained
+        self.record(ep.platform, 'stale-ram-save-unknown-causality', unrelated=unrelated, progress=held, provenance=stale['provenance'], parents=stale['parents'], ram_sha256=sha(self.base_body), shared_head_unchanged=head_before, drain=json.loads(drained['out'])['error'])
         ep.stop(c)
         # The root's own parent becomes readonly; the private profile directory stays 0700.
         c = ep.create('readonly-parent', nest=True);ep.start(c);self.until(lambda: ep.ready(c));before = self.native(ep, c, ['reports/live'])
