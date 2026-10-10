@@ -247,6 +247,34 @@ pub(crate) fn authorize_native_capture(
     }
     crate::capture::authorize_capture(&core.config, actor, Some(&old), new)
 }
+/// A historical tree with every entry's mode/owner/group replaced by current authority (the
+/// authenticated remote projection, else the current working tree). An identity once known
+/// remotely but absent now is denied; revoked authority is denied. Old metadata never authorizes.
+pub(crate) fn current_authority_overlay(core: &Core, historical: &Tree) -> Result<Tree, FsError> {
+    let authority = authority_revision(core)?
+        .map(|id| core.revision(&id))
+        .transpose()?;
+    let working = &core.working()?.tree;
+    let mut tree = historical.clone();
+    tree.root = authority
+        .as_ref()
+        .map(|a| a.tree.root.clone())
+        .unwrap_or_else(|| working.root.clone());
+    for e in &mut tree.entries {
+        let current = authority
+            .as_ref()
+            .and_then(|a| a.tree.entries.iter().find(|c| c.id == e.id))
+            .or_else(|| working.entries.iter().find(|c| c.id == e.id));
+        if let Some(current) = current {
+            e.mode = current.mode;
+            e.owner = current.owner.clone();
+            e.group = current.group.clone();
+        } else if core.remote_entries.contains(&e.id) {
+            return Err(FsError::PermissionDenied);
+        }
+    }
+    Ok(tree)
+}
 pub(crate) fn configuration(core: &Core) -> Result<NativeConfig, FsError> {
     from_json(&core.journal.db.query_row(
         "SELECT configuration FROM native WHERE singleton=1",

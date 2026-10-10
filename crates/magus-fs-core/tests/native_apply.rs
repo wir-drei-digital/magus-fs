@@ -1872,3 +1872,48 @@ fn local_only_late_writes_are_reported_separately_and_never_managed() {
         "invalid_path",
     );
 }
+
+#[test]
+fn recovery_capture_uses_current_authority_not_historical_metadata() {
+    let (d, rep, n, base) = fixture();
+    let mut held = fs::OpenOptions::new()
+        .write(true)
+        .open(n.root.join("a"))
+        .unwrap();
+    let next = incoming(d.path(), &rep, &base, false);
+    assert!(ready(&apply(&rep, &next)));
+    held.write_all(b"late!!").unwrap();
+    held.sync_all().unwrap();
+    rep.scan_native_status().unwrap();
+    let record = rep.list_native_recovery(actor()).unwrap().remove(0);
+    // Current authority narrows the path after the application.
+    let mut narrowed = next_of(&rep, &next);
+    entry_mut(&mut narrowed, "a").mode = 0o000;
+    let narrowed = import(&rep, &sorted(narrowed), ChunkSource::Unavailable);
+    rep.observe_remote_authority(
+        Some(&narrowed),
+        rep.live_status().unwrap().authority_generation,
+    )
+    .unwrap();
+    err(
+        rep.capture_native_recovery(
+            record.id.clone(),
+            record.observed_digest.clone(),
+            OperationId::random().unwrap(),
+            actor(),
+        ),
+        "permission_denied",
+    );
+    // Revocation also denies; export of the owner's own retained bytes is unaffected.
+    rep.observe_remote_authority(None, rep.live_status().unwrap().authority_generation)
+        .unwrap();
+    err(
+        rep.capture_native_recovery(
+            record.id.clone(),
+            record.observed_digest.clone(),
+            OperationId::random().unwrap(),
+            actor(),
+        ),
+        "permission_denied",
+    );
+}

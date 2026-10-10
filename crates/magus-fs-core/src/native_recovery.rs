@@ -203,7 +203,9 @@ impl Replica {
         }
         let bytes = retained_bytes(&retained, &record.observed_digest)?;
         let base = core.revision(&record.original_base)?;
-        let mut tree = base.tree.clone();
+        // Current authority, never the historical metadata of the original base.
+        let current = crate::native_apply::current_authority_overlay(&core, &base.tree)?;
+        let mut tree = current.clone();
         let mut extents = vec![];
         let mut objects = BTreeMap::new();
         for chunk in bytes.chunks(262144) {
@@ -251,7 +253,7 @@ impl Replica {
             }
         }
         validate_tree(&tree)?;
-        crate::capture::authorize_capture(&core.config, &actor, Some(&base.tree), &tree)?;
+        crate::capture::authorize_capture(&core.config, &actor, Some(&current), &tree)?;
         let revision = Revision {
             format: FORMAT.into(),
             hash: HASH.into(),
