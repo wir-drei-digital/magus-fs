@@ -75,9 +75,19 @@ pub fn alternative(
     if side.tree.root.id != current.root.id {
         return Err(Error::not_found());
     }
+    // An identity counts as currently present only at a current location inside the
+    // caller's scope. One moved out of scope after the alternative was recorded is treated
+    // exactly like a deleted one (retained history only): stable identity is never a scope
+    // escape, and the caller cannot tell "moved out of scope" from "deleted".
+    let in_scope = |e: &Entry| {
+        prefixes.iter().any(|p| {
+            crate::auth::within(&e.path, p)
+                || (e.content == EntryContent::Directory && crate::auth::within(p, &e.path))
+        })
+    };
     authority
         .entries
-        .retain(|e| history || now.contains_key(&e.id));
+        .retain(|e| history || now.get(&e.id).is_some_and(|p| in_scope(p)));
     for e in &mut authority.entries {
         if let Some(present) = now.get(&e.id) {
             e.owner = present.owner.clone();

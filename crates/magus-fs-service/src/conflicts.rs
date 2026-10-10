@@ -354,6 +354,10 @@ pub(crate) async fn list(
             items.push(summary(row)?);
         }
     }
+    // R17: the same final current-credential recheck as detail before anything is returned.
+    for s in visibility.snapshots.values() {
+        r::final_read(&state.db, s).await?;
+    }
     Ok(Json(ConflictPage {
         items,
         next: if more {
@@ -743,6 +747,99 @@ mod tests {
         assert_eq!(check(&absent, &unauthorized).unwrap_err(), denied);
         assert_eq!(denied, (StatusCode::NOT_FOUND, "not_found"));
         assert!(check(&readable, &readable).is_ok());
+    }
+    #[test]
+    fn identity_moved_out_of_scope_is_indistinguishable_from_deleted() {
+        let principal = PrincipalId::parse(format!("principal:{:032x}", 1)).unwrap();
+        let group = GroupId::parse(format!("group:{:032x}", 1)).unwrap();
+        let authority = Authority {
+            principal: principal.clone(),
+            uid: 1001,
+            gid: 1001,
+            primary_group: group.clone(),
+            groups: vec![group.clone()],
+            dac_override: false,
+            ownership_transfer: false,
+        };
+        let root = Root {
+            id: EntryId::random().unwrap(),
+            owner: principal.clone(),
+            group: group.clone(),
+            mode: 0o755,
+        };
+        let dir = |path: &str, n: u32| Entry {
+            path: path.into(),
+            id: EntryId::parse(format!("entry:{n:032x}")).unwrap(),
+            parent: root.id.clone(),
+            owner: principal.clone(),
+            group: group.clone(),
+            mode: 0o755,
+            content: EntryContent::Directory,
+        };
+        let file = |path: &str, parent: &Entry| Entry {
+            path: path.into(),
+            id: EntryId::parse(format!("entry:{:032x}", 9)).unwrap(),
+            parent: parent.id.clone(),
+            owner: principal.clone(),
+            group: group.clone(),
+            mode: 0o755,
+            content: EntryContent::Directory,
+        };
+        let (reports, secret) = (dir("reports", 1), dir("secret", 2));
+        let tree = |entries| Tree {
+            root: root.clone(),
+            entries,
+        };
+        let side = Revision {
+            format: FORMAT.into(),
+            hash: HASH.into(),
+            layout: LAYOUT.into(),
+            parents: vec![],
+            operation: OperationId::random().unwrap(),
+            replica: ReplicaId::random().unwrap(),
+            principal: principal.clone(),
+            captured_at_ns: 0,
+            coverage: vec!["".into()],
+            provenance: "explicit".into(),
+            restoration: None,
+            tree: tree(vec![
+                reports.clone(),
+                secret.clone(),
+                file("reports/f", &reports),
+            ]),
+        };
+        let moved = tree(vec![
+            reports.clone(),
+            secret.clone(),
+            file("secret/f", &secret),
+        ]);
+        let deleted = tree(vec![reports.clone(), secret.clone()]);
+        let id = file("x", &reports).id;
+        let scope = ["reports".to_string()];
+        let check = |current: &Tree, history: bool| {
+            views::alternative(&side, current, &authority, &scope, history, Some(&id))
+                .map(|r| r.tree.entries.len())
+                .map_err(|e| e.code)
+        };
+        for history in [false, true] {
+            assert_eq!(
+                check(&moved, history),
+                check(&deleted, history),
+                "history={history}"
+            );
+        }
+        assert_eq!(check(&moved, false), Err("not_found"));
+        assert_eq!(
+            check(&moved, true),
+            Ok(2),
+            "retained history at the in-scope historic path"
+        );
+        // The current side at the out-of-scope location is never disclosed.
+        let mut current_side = side.clone();
+        current_side.tree = moved.clone();
+        assert!(
+            views::alternative(&current_side, &moved, &authority, &scope, true, Some(&id)).is_err()
+        );
     }
     #[test]
     fn continuation_tokens_are_namespace_principal_and_query_bound() {
