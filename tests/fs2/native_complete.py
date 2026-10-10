@@ -438,17 +438,34 @@ open(s['tag']+'-result','w').write(json.dumps(row))"""
         def add(t):
             reports = next(e for e in t['entries'] if e['path'] == 'reports');t['entries'].append(file_entry('reports/narrowed', reports['id'], body))
         self.publish_tree(add, [body]);self.until(lambda: readable('reports/narrowed') == 0, 15)
-        def narrow(t):next(e for e in t['entries'] if e['path'] == 'reports/narrowed')['mode'] = 0
-        self.publish_tree(narrow);seen = [];narrowed_at = time.monotonic()
-        def denied():
-            try:st = os.stat(Path(mnt, 'reports/narrowed'));stat = {'ino': st.st_ino, 'mode': oct(st.st_mode)}
-            except OSError as e:stat = {'stat_errno': e.errno}
-            code = readable('reports/narrowed')
-            seen.append({'t': round(time.monotonic() - narrowed_at, 3), 'errno': code, **stat})
-            # A shared-live adoption of an authorized projection omits an unreadable entry
-            # (ENOENT); authority narrowing without a new view denies with EACCES.
-            return code in (errno.EACCES, errno.ENOENT)
-        try:self.until(denied, 15)
+        def writable(path):
+            try:os.close(os.open(Path(mnt, path), os.O_WRONLY));return 0
+            except OSError as e:return e.errno
+        def narrow(mode):
+            def change(t):next(e for e in t['entries'] if e['path'] == 'reports/narrowed')['mode'] = mode
+            return change
+        # Ruling R8, case 1: the entry stays in the authorized projection (owner read-only),
+        # so it remains visible and readable while a write open is denied with EACCES.
+        # A write open that succeeds would itself create a client sidecar (dirty work), so the
+        # probe runs only once the narrowed view is adopted and acknowledged.
+        shared = self.publish_tree(narrow(0o400));narrowed_at = time.monotonic()
+        self.until(lambda: self.mstatus(ep, m)['live']['applied'] and self.mstatus(ep, m)['status']['binding']['view']['head'] == shared['head'], 15)
+        seen = []
+        def visible_denied():
+            row = {'t': round(time.monotonic() - narrowed_at, 3), 'access_w': os.access(Path(mnt, 'reports/narrowed'), os.W_OK), 'read': readable('reports/narrowed')}
+            if not row['access_w']:row['write'] = writable('reports/narrowed')
+            seen.append(row);return row['read'] == 0 and row.get('write') == errno.EACCES
+        try:self.until(visible_denied, 15)
+        finally:self.i.write_json('nfs-mode-visible-denied.json', seen[::max(1, len(seen) // 12)] + seen[-3:])
+        assert self.mcli(ep, m, 'status')['uncaptured'] != True, 'a denied write open must not create local dirty work'
+        write_denied = writable('reports/narrowed');visible = sorted(os.listdir(Path(mnt, 'reports')))
+        assert write_denied == errno.EACCES and 'narrowed' in visible
+        # Case 2: mode 0 removes the entry from the authorized projection; a fresh lookup is ENOENT.
+        self.publish_tree(narrow(0));seen = [];narrowed_at = time.monotonic()
+        def removed():
+            row = {'t': round(time.monotonic() - narrowed_at, 3), 'read': readable('reports/narrowed')}
+            seen.append(row);return row['read'] == errno.ENOENT
+        try:self.until(removed, 15)
         finally:self.i.write_json('nfs-mode-narrowing.json', seen[::max(1, len(seen) // 12)] + seen[-3:])
         narrowed = readable('reports/narrowed');assert readable('reports/renamed-live') == 0
         isolated = self.mount(ep, 'nfsiso', 'isolated');cached = Path(isolated['mount'], 'reports/renamed-live').read_bytes()
@@ -461,10 +478,12 @@ open(s['tag']+'-result','w').write(json.dumps(row))"""
         self.until(lambda: Path(mnt, 'reports/renamed-live').read_bytes() == update, 15)
         code, _ = self.request('POST', self.root + '/grants', body={'revoke': isolated['credential']});assert code == 200
         self.until(lambda: readable_in(isolated['mount'], 'reports/renamed-live') == errno.EACCES, 15);revoked = readable_in(isolated['mount'], 'reports/renamed-live')
+        assert revoked == errno.EACCES
         code, renewed = self.request('POST', self.root + '/grants', body={'delegate': {'replica': isolated['replica'], 'expires': int(time.time()) + 1800, 'actions': ['read', 'write', 'history', 'integrate'], 'branches': ['main'], 'prefixes': ['']}});assert code == 200
         Path(isolated['token_file']).write_text(renewed['token']);isolated['credential'] = renewed['credential'];self.save_mounts()
         self.until(lambda: readable_in(isolated['mount'], 'reports/renamed-live') == 0, 15)
-        self.record('macos', 'nfs-authority-refresh', mode_narrowed_errno=narrowed, isolated_before=before, isolated_after=after, isolated_cached_sha256=sha(cached), revoked_errno=revoked, renewed=True)
+        assert narrowed == errno.ENOENT
+        self.record('macos', 'nfs-authority-refresh', write_denied_visible_errno=write_denied, mode_removed_errno=narrowed, isolated_before=before, isolated_after=after, isolated_cached_sha256=sha(cached), revoked_errno=revoked, renewed=True)
         self.unmount(ep, isolated)
     def unmount(self, ep, m):
         p = subprocess.run(['/sbin/umount', m['mount']], capture_output=True, text=True, timeout=10)
