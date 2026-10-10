@@ -11,7 +11,7 @@ use nfsserve::{
     vfs::*,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     io::Write,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -21,6 +21,8 @@ use std::{
 /// Retained epoch bound: NFS clients never close handles, so every issued epoch stays rooted
 /// for the daemon lifetime. Adoption beyond this bound is deferred and reported.
 const MAX_RETAINED_EPOCHS: usize = 128;
+/// Issued fileids are never reused within a daemon lifetime; adoption defers beyond this bound.
+const MAX_ISSUED_FILEIDS: usize = 1 << 20;
 type Result<T> = std::result::Result<T, FsError>;
 fn error(e: FsError) -> nfsstat3 {
     match e {
@@ -55,13 +57,65 @@ fn now() -> nfstime3 {
         nseconds: t.subsec_nanos(),
     }
 }
+/// NFS fileids: regular files are issued per (EntryId, epoch), directories once per EntryId.
+/// Lookups are O(1); fileids are allocated only when a client operation names an entry.
+struct FileIds {
+    /// fileid - 1 -> (identity, issuing epoch).
+    slots: Vec<(EntryId, u64)>,
+    files: HashMap<(EntryId, u64), u64>,
+    directories: HashMap<EntryId, u64>,
+    epoch: u64,
+}
+impl FileIds {
+    fn new(root: EntryId, epoch: u64) -> Self {
+        Self {
+            slots: vec![(root.clone(), epoch)],
+            files: HashMap::new(),
+            directories: HashMap::from([(root, 1)]),
+            epoch,
+        }
+    }
+    fn identity(&self, id: u64) -> Result<&EntryId> {
+        id.checked_sub(1)
+            .and_then(|n| self.slots.get(n as usize))
+            .map(|v| &v.0)
+            .ok_or(FsError::StaleHandle)
+    }
+    /// A file handle issued in an earlier adopted epoch.
+    fn stale(&self, id: u64) -> Result<bool> {
+        let identity = self.identity(id)?;
+        Ok(!self.directories.contains_key(identity)
+            && self.slots[(id - 1) as usize].1 != self.epoch)
+    }
+    /// The fileid already issued for this identity in the current epoch, without allocating.
+    fn issued(&self, identity: &EntryId, directory: bool) -> Option<u64> {
+        match self.directories.get(identity) {
+            Some(id) => Some(*id),
+            None if directory => None,
+            None => self.files.get(&(identity.clone(), self.epoch)).copied(),
+        }
+    }
+    fn issue(&mut self, identity: &EntryId, directory: bool) -> u64 {
+        if let Some(id) = self.issued(identity, directory) {
+            return id;
+        }
+        self.slots.push((identity.clone(), self.epoch));
+        let id = self.slots.len() as u64;
+        if directory {
+            self.directories.insert(identity.clone(), id);
+        } else {
+            self.files.insert((identity.clone(), self.epoch), id);
+        }
+        id
+    }
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+}
 struct State {
     ws: Workspace,
     config: ReplicaConfig,
-    /// fileid - 1 -> (identity, issuing epoch). Directory identities are epoch-stable.
-    ids: Vec<(EntryId, u64)>,
-    directories: BTreeSet<EntryId>,
-    epoch: u64,
+    ids: FileIds,
     held: BTreeMap<u64, Handle>,
     times: BTreeMap<u64, Times>,
     started: Times,
@@ -87,32 +141,13 @@ impl State {
     }
 
     fn identity(&self, id: u64) -> Result<&EntryId> {
-        id.checked_sub(1)
-            .and_then(|n| self.ids.get(n as usize))
-            .map(|v| &v.0)
-            .ok_or(FsError::StaleHandle)
+        self.ids.identity(id)
     }
-    /// A file handle issued in an earlier adopted epoch.
     fn stale(&self, id: u64) -> Result<bool> {
-        let identity = self.identity(id)?;
-        Ok(!self.directories.contains(identity) && self.ids[(id - 1) as usize].1 != self.epoch)
+        self.ids.stale(id)
     }
     fn id(&mut self, identity: &EntryId, directory: bool) -> u64 {
-        if directory {
-            self.directories.insert(identity.clone());
-        }
-        let epoch = self.epoch;
-        let stable = self.directories.contains(identity);
-        if let Some(i) = self
-            .ids
-            .iter()
-            .position(|v| &v.0 == identity && (stable || v.1 == epoch))
-        {
-            i as u64 + 1
-        } else {
-            self.ids.push((identity.clone(), epoch));
-            self.ids.len() as u64
-        }
+        self.ids.issue(identity, directory)
     }
     fn issue(&mut self, entry: &Entry) -> Result<u64> {
         let id = self.id(&entry.id, entry.content == EntryContent::Directory);
@@ -155,14 +190,8 @@ impl State {
     }
     /// Advance every directory's change time so client name caches revalidate.
     fn adopted(&mut self, epoch: u64) {
-        self.epoch = epoch;
-        let directories: Vec<u64> = self
-            .ids
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| self.directories.contains(&v.0))
-            .map(|(i, _)| i as u64 + 1)
-            .collect();
+        self.ids.epoch = epoch;
+        let directories: Vec<u64> = self.ids.directories.values().copied().collect();
         for id in directories {
             self.changed(id, true);
         }
@@ -654,9 +683,7 @@ fn serve(
         state: Arc::new(Mutex::new(State {
             ws,
             config,
-            directories: BTreeSet::from([root.clone()]),
-            ids: vec![(root, epoch)],
-            epoch,
+            ids: FileIds::new(root, epoch),
             held: BTreeMap::new(),
             times: BTreeMap::new(),
             started: Times {
@@ -723,7 +750,7 @@ fn verify(
     }
     let current = rep.revision(&adoption.revision)?;
     let expected = {
-        let mut s = state.lock().map_err(|_| FsError::ReplicaBusy)?;
+        let s = state.lock().map_err(|_| FsError::ReplicaBusy)?;
         let mut rows = vec![];
         for e in &current.tree.entries {
             // The fixed actor cannot observe names it may not traverse; skip, never guess.
@@ -735,13 +762,19 @@ fn verify(
                 EntryContent::File { version } => version.size,
                 EntryContent::Directory => 0,
             };
-            rows.push((e.path.clone(), directory, size, s.id(&e.id, directory)));
+            rows.push((e.path.clone(), directory, size, e.id.clone()));
         }
         rows
     };
-    for (path, directory, size, fileid) in &expected {
+    for (path, directory, size, identity) in &expected {
+        // The kernel client's own LOOKUP issues the fileid; verification never allocates one.
         let m = std::fs::symlink_metadata(mountpoint.join(path))?;
-        if m.ino() != *fileid || m.is_dir() != *directory || (!directory && m.len() != *size) {
+        let issued = state
+            .lock()
+            .map_err(|_| FsError::ReplicaBusy)?
+            .ids
+            .issued(identity, *directory);
+        if issued != Some(m.ino()) || m.is_dir() != *directory || (!directory && m.len() != *size) {
             return Err(FsError::StaleHandle);
         }
     }
@@ -777,11 +810,12 @@ fn live(rep: Replica, state: Arc<Mutex<State>>, mountpoint: PathBuf, actor: Acto
         let result = incoming.poll(|binding, generation| {
             let mut s = state.lock().map_err(|_| FsError::ReplicaBusy)?;
             let retained = s.retained_epochs();
-            if retained >= MAX_RETAINED_EPOCHS {
+            let issued = s.ids.len();
+            if retained >= MAX_RETAINED_EPOCHS || issued >= MAX_ISSUED_FILEIDS {
                 if !pressure {
                     eprintln!(
                         "{}",
-                        serde_json::json!({"live_pressure":{"retained_epochs":retained,"limit":MAX_RETAINED_EPOCHS,"adoption":"deferred"}})
+                        serde_json::json!({"live_pressure":{"retained_epochs":retained,"epoch_limit":MAX_RETAINED_EPOCHS,"issued_fileids":issued,"fileid_limit":MAX_ISSUED_FILEIDS,"adoption":"deferred"}})
                     );
                 }
                 pressure = true;
@@ -803,15 +837,66 @@ fn live(rep: Replica, state: Arc<Mutex<State>>, mountpoint: PathBuf, actor: Acto
                     .acknowledge_adoption(&adoption.revision, adoption.epoch)
                     .is_ok()
             {
+                let (epochs, issued) = state
+                    .lock()
+                    .map(|s| (s.retained_epochs(), s.ids.len()))
+                    .unwrap_or_default();
                 eprintln!(
-                    "live_applied epoch={} revision={} client_verification_us={}",
+                    "live_applied epoch={} revision={} client_verification_us={} retained_epochs={} issued_fileids={}",
                     adoption.epoch,
                     adoption.revision.as_str(),
-                    started.elapsed().as_micros()
+                    started.elapsed().as_micros(),
+                    epochs,
+                    issued
                 );
                 pending = None;
             }
         }
         std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn file_ids_are_epoch_qualified_directories_stable_and_lookup_never_allocates() {
+        let root = EntryId::random().unwrap();
+        let file = EntryId::random().unwrap();
+        let dir = EntryId::random().unwrap();
+        let mut ids = FileIds::new(root.clone(), 3);
+        assert_eq!(ids.issued(&root, true), Some(1));
+        assert_eq!(
+            ids.issued(&file, false),
+            None,
+            "lookup without a client name"
+        );
+        assert_eq!(ids.len(), 1);
+        let old = ids.issue(&file, false);
+        let d = ids.issue(&dir, true);
+        assert_eq!(ids.issue(&file, false), old);
+        assert!(!ids.stale(old).unwrap());
+        ids.epoch = 4;
+        assert!(
+            ids.stale(old).unwrap(),
+            "old-epoch file handle is stale for mutation"
+        );
+        assert!(!ids.stale(d).unwrap() && !ids.stale(1).unwrap());
+        assert_eq!(ids.issued(&file, false), None);
+        let new = ids.issue(&file, false);
+        assert_ne!(new, old);
+        assert_eq!(
+            ids.issue(&dir, true),
+            d,
+            "directory fileids are stable across epochs"
+        );
+        assert_eq!(ids.identity(old).unwrap(), &file);
+        assert!(matches!(ids.identity(999), Err(FsError::StaleHandle)));
+        assert_eq!(ids.len(), 4);
+        // Repeated lookups across many entries stay O(1) per lookup and allocate nothing.
+        for _ in 0..10_000 {
+            assert_eq!(ids.issued(&file, false), Some(new));
+        }
+        assert_eq!(ids.len(), 4);
     }
 }
