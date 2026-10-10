@@ -78,6 +78,9 @@ pub(crate) struct Intent {
     /// Structural application by verified root exchange (journal schema 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) root: Option<RootIntent>,
+    /// Retained displaced data was explicitly released by the operator.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) released: bool,
 }
 impl Intent {
     /// The intent holds an applied or possibly applied native mutation.
@@ -88,7 +91,7 @@ impl Intent {
                 .as_ref()
                 .is_some_and(|r| r.phase != RootPhase::Abandoned)
     }
-    fn ambiguous(&self) -> bool {
+    pub(crate) fn ambiguous(&self) -> bool {
         self.files.iter().any(|f| f.ambiguous) || self.root.as_ref().is_some_and(|r| r.ambiguous)
     }
 }
@@ -127,6 +130,46 @@ fn mark_root_replaced(core: &Core) -> Result<(), FsError> {
         });
     status.status = blocked("bound_root_changed");
     status_save(core, &status)
+}
+/// Displaced file generations (stage leaf, size) still exactly their verified observation and
+/// digest; any later change refuses release.
+pub(crate) fn verified_generations(r: &Intent) -> Result<Vec<(String, u64)>, FsError> {
+    let mut out = vec![];
+    if r.files.iter().all(|f| f.expected.is_none() || !f.exchanged) {
+        return Ok(out);
+    }
+    let stage = stage_open(r)?;
+    for f in r
+        .files
+        .iter()
+        .filter(|f| f.expected.is_some() && f.exchanged)
+    {
+        let mut file = open_file(&stage, &f.stage)?;
+        let observed = observation(&file)?;
+        if f.last_displaced.as_ref() != Some(&observed)
+            || f.last_displaced_hash.as_ref() != Some(&native_hash(&mut file)?)
+        {
+            return Err(FsError::DirtyWorkingState);
+        }
+        out.push((f.stage.clone(), observed.size));
+    }
+    Ok(out)
+}
+/// Rebuild the persisted enumeration after an explicit retention change.
+pub(crate) fn refresh_status(core: &Core) -> Result<(), FsError> {
+    if let Some(bytes) = core
+        .journal
+        .db
+        .query_row(
+            "SELECT record FROM native_status WHERE singleton=1",
+            [],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+    {
+        status_save(core, &from_json(&bytes)?)?;
+    }
+    Ok(())
 }
 /// Immutable records for every journaled retained version, created only after the version
 /// itself is durable in the intent. Idempotent, so an interruption between the two repairs.
@@ -187,6 +230,9 @@ fn clear_applied(core: &mut Core) -> Result<(), FsError> {
 }
 /// Retained bytes and generations charged by one intent (A file generations plus any root).
 pub(crate) fn usage(r: &Intent) -> (u64, usize) {
+    if r.released {
+        return (0, 0);
+    }
     let mut bytes = 0u64;
     let mut generations = 0usize;
     for f in &r.files {
@@ -310,6 +356,7 @@ pub(crate) fn save(core: &Core, r: &Intent) -> Result<(), FsError> {
 }
 fn displacements(rows: &[Intent]) -> Vec<NativeDisplacement> {
     rows.iter()
+        .filter(|r| !r.released)
         .flat_map(|r| {
             r.files
                 .iter()
@@ -877,8 +924,11 @@ impl Replica {
                 status.status = blocked("displacement_backpressure");
                 continue;
             }
+            if r.released {
+                continue;
+            }
             if r.root.as_ref().is_some_and(RootIntent::exchanged) {
-                match crate::native_root::rescan(&core, &n.policy, r)? {
+                match crate::native_root::rescan(&core, &n.policy, r, false)? {
                     crate::native_root::Rescan::Unchanged => {}
                     crate::native_root::Rescan::Changed => {
                         if !matches!(status.status, NativeApplyStatus::ApplyBlocked { .. }) {
@@ -1102,7 +1152,7 @@ impl Replica {
             }
             // A preparation/copy interrupted before its record was committed is retained too.
             // Unknown files are never omitted from quota by trusting only the saved file list.
-            for retained in &all {
+            for retained in all.iter().filter(|r| !r.released) {
                 if retained.stage_identity.is_none() {
                     match std::fs::symlink_metadata(&retained.stage) {
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1291,6 +1341,7 @@ impl Replica {
             files: vec![],
             status: pending("staging"),
             root: None,
+            released: false,
         };
         let result = (|| -> Result<NativeApplyStatus, FsError> {
             let retained = all

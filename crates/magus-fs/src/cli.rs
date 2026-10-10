@@ -39,6 +39,7 @@ fn args(mut argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
         "sync-recovery-list" => vec!["state"],
         "sync-recovery-capture" => vec!["state", "id", "digest", "operation-id"],
         "sync-recovery-export" => vec!["state", "id", "digest", "destination"],
+        "sync-recovery-release" => vec!["state", "operation-id"],
         "mount" => vec![
             "state",
             "revision",
@@ -654,6 +655,12 @@ fn recovery_control(
             rep.export_native_recovery(id()?, digest()?, destination, actor)
                 .map_err(|e| (1, e))?;
             Ok(json!({"ok":true,"destination":destination}))
+        }
+        "release" => {
+            let freed = rep
+                .release_native_retention(operation(options)?, actor)
+                .map_err(|e| (1, e))?;
+            Ok(json!({"ok":true,"released_bytes":freed}))
         }
         _ => Err((2, FsError::InvalidPath)),
     }

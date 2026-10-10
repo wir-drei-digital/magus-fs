@@ -1917,3 +1917,111 @@ fn recovery_capture_uses_current_authority_not_historical_metadata() {
         "permission_denied",
     );
 }
+
+#[test]
+fn explicit_release_frees_unambiguous_retention_and_refuses_ambiguity() {
+    let (d, rep, n, base) = fixture();
+    let mut r = next_of(&rep, &base);
+    put_dir(&mut r, "d", 0o755);
+    let first = import(&rep, &sorted(r), ChunkSource::Unavailable);
+    let op = OperationId::random().unwrap();
+    let s = rep
+        .apply_native_revision(
+            &first,
+            rep.status().unwrap().generation,
+            op.clone(),
+            actor(),
+        )
+        .unwrap();
+    assert!(ready(&s), "{s:?}");
+    let retained = rep.scan_native_status().unwrap().displacements[0]
+        .retained_path
+        .clone();
+    assert!(retained.exists());
+    let freed = rep.release_native_retention(op.clone(), actor()).unwrap();
+    assert!(freed >= b"before".len() as u64);
+    assert!(!retained.exists(), "released displaced root is removed");
+    assert!(rep.scan_native_status().unwrap().displacements.is_empty());
+    assert!(ready(&rep.scan_native_status().unwrap().status));
+    assert_eq!(fs::read(n.root.join("a")).unwrap(), b"before");
+    // Releasing twice is a no-op; never automatic.
+    assert_eq!(rep.release_native_retention(op, actor()).unwrap(), 0);
+    // Unresolved ambiguity is never released.
+    let mut held = fs::OpenOptions::new()
+        .write(true)
+        .open(n.root.join("a"))
+        .unwrap();
+    let mut r = next_of(&rep, &first);
+    put_dir(&mut r, "e", 0o755);
+    let second = import(&rep, &sorted(r), ChunkSource::Unavailable);
+    let op = OperationId::random().unwrap();
+    assert!(ready(
+        &rep.apply_native_revision(
+            &second,
+            rep.status().unwrap().generation,
+            op.clone(),
+            actor()
+        )
+        .unwrap()
+    ));
+    held.write_all(b"late!!").unwrap();
+    held.sync_all().unwrap();
+    rep.scan_native_status().unwrap();
+    err(
+        rep.release_native_retention(op, actor()),
+        "dirty_working_state",
+    );
+    let _ = d;
+}
+
+#[test]
+fn retained_root_rescans_are_stat_gated() {
+    let (d, rep, n, base) = fixture();
+    let mut held = fs::OpenOptions::new()
+        .write(true)
+        .open(n.root.join("a"))
+        .unwrap();
+    let mut r = next_of(&rep, &base);
+    put_dir(&mut r, "d", 0o755);
+    let next = import(&rep, &sorted(r), ChunkSource::Unavailable);
+    assert!(ready(&apply(&rep, &next)));
+    rep.scan_native_status().unwrap();
+    let before = retained_hash_bytes_this_thread();
+    for _ in 0..3 {
+        assert!(ready(&rep.scan_native_status().unwrap().status));
+    }
+    assert_eq!(
+        retained_hash_bytes_this_thread(),
+        before,
+        "unchanged retained roots are not re-hashed every scan"
+    );
+    held.write_all(b"late size-changing write").unwrap();
+    held.sync_all().unwrap();
+    let status = rep.scan_native_status().unwrap();
+    assert!(!ready(&status.status), "{status:?}");
+    assert!(retained_hash_bytes_this_thread() > before);
+    let _ = (d, n);
+}
+
+#[test]
+fn explicit_release_frees_a_verified_displaced_file_generation() {
+    let (d, rep, _n, base) = fixture();
+    let next = incoming(d.path(), &rep, &base, false);
+    let op = OperationId::random().unwrap();
+    assert!(ready(
+        &rep.apply_native_revision(&next, rep.status().unwrap().generation, op.clone(), actor())
+            .unwrap()
+    ));
+    let retained = rep.scan_native_status().unwrap().displacements[0]
+        .retained_path
+        .clone();
+    assert_eq!(fs::read(&retained).unwrap(), b"before");
+    assert_eq!(rep.release_native_retention(op, actor()).unwrap(), 6);
+    assert!(!retained.exists());
+    assert!(rep.scan_native_status().unwrap().displacements.is_empty());
+    // A later application is admitted normally after release.
+    let mut r = next_of(&rep, &next);
+    entry_mut(&mut r, "a").content = content(b"third!!!");
+    let third = import(&rep, &sorted(r), sources(d.path(), &[b"third!!!"]));
+    assert!(ready(&apply(&rep, &third)));
+}

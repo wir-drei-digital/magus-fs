@@ -72,6 +72,9 @@ pub(crate) struct RootIntent {
     /// Changed capture-excluded paths in the displaced root (bounded, sorted).
     #[serde(default)]
     pub(crate) local_changes: Vec<String>,
+    /// Wall time of the last full (ungated) rehash of the displaced root.
+    #[serde(default)]
+    pub(crate) full_hash_ns: u64,
 }
 impl RootIntent {
     pub(crate) fn exchanged(&self) -> bool {
@@ -207,15 +210,21 @@ fn mkdir(parent: &File, leaf: &str) -> Result<(), FsError> {
 struct Inventory {
     root_dev: u64,
     strict: bool,
+    /// Previous snapshot: an unchanged stat generation reuses its digest instead of re-reading.
+    prior: Option<BTreeMap<String, Snapshot>>,
     deadline: Instant,
     entries: BTreeMap<String, Snapshot>,
     unsupported: Vec<String>,
 }
 impl Inventory {
     fn take(root: File, strict: bool) -> Step<Self> {
+        Self::gated(root, strict, None)
+    }
+    fn gated(root: File, strict: bool, prior: Option<BTreeMap<String, Snapshot>>) -> Step<Self> {
         let mut inv = Self {
             root_dev: root.metadata().map_err(FsError::from)?.dev(),
             strict,
+            prior,
             deadline: Instant::now() + Duration::from_secs(30),
             entries: BTreeMap::new(),
             unsupported: vec![],
@@ -291,7 +300,21 @@ impl Inventory {
             if info.nlink > 1 {
                 self.unsupported(path.into())?;
             }
-            Some(na::native_hash(&mut file)?)
+            let reused = self.prior.as_ref().and_then(|p| p.get(path)).and_then(|p| {
+                let o = &p.observation;
+                (na::same_generation(o, &info)
+                    && o.ctime == info.ctime
+                    && o.ctime_ns == info.ctime_ns)
+                    .then(|| p.digest.clone())
+                    .flatten()
+            });
+            match reused {
+                Some(digest) => Some(digest),
+                None => {
+                    HASHED.with(|h| h.set(h.get().saturating_add(info.size)));
+                    Some(na::native_hash(&mut file)?)
+                }
+            }
         } else {
             self.unsupported(path.into())?;
             None
@@ -540,6 +563,7 @@ fn stage(
         ambiguous: false,
         staged_bytes,
         local_changes: vec![],
+        full_hash_ns: 0,
     });
     na::save(core, r)?;
     match mkdir(&parent, &stage_leaf) {
@@ -750,7 +774,7 @@ pub(crate) fn finish(
         }
     }
     // The displaced root must still be exactly the verified original.
-    match rescan(core, &n.policy, r)? {
+    match rescan(core, &n.policy, r, true)? {
         Rescan::Unchanged => {}
         Rescan::Missing => return ambiguous(core, r, "retained_generation_missing"),
         Rescan::Backpressure => return ambiguous(core, r, "displacement_backpressure"),
@@ -877,6 +901,7 @@ pub(crate) fn rescan(
     core: &Core,
     policy: &CapturePolicy,
     r: &mut Intent,
+    full: bool,
 ) -> Result<Rescan, FsError> {
     let Some(ri) = r.root.clone() else {
         return Ok(Rescan::Unchanged);
@@ -895,7 +920,15 @@ pub(crate) fn rescan(
         _ => return Ok(Rescan::Missing),
     };
     let held = open_dir(&displaced, ".")?;
-    let inventory = match Inventory::take(displaced, false) {
+    // Stat-gated: unchanged generations reuse digests; a full rehash still runs at least every
+    // 60s (filesystem timestamp granularity can hide a same-size write) and when verifying.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let full = full || now_ns.saturating_sub(ri.full_hash_ns) > 60_000_000_000;
+    let inventory = match Inventory::gated(displaced, false, (!full).then(|| ri.displaced.clone()))
+    {
         Ok(i) => i,
         Err(Halt::Fs(FsError::Backpressure)) => return Ok(Rescan::Backpressure),
         Err(Halt::Fs(FsError::UnstableCapture)) => return Ok(Rescan::Unstable),
@@ -904,6 +937,9 @@ pub(crate) fn rescan(
     };
     let local = |p: &str| !p.is_empty() && !policy.selected(p);
     let mut next = ri.clone();
+    if full {
+        next.full_hash_ns = now_ns;
+    }
     let mut changed = false;
     for path in &inventory.unsupported {
         if local(path) {
@@ -1013,6 +1049,67 @@ pub(crate) fn rescan(
         Rescan::Unchanged
     })
 }
+/// Remove a retained tree only if every entry is exactly a recorded identity (two passes:
+/// verify everything, then unlink deepest first). Returns removed regular-file bytes.
+fn remove_tree(
+    parent: &File,
+    leaf_name: &str,
+    expected: &BTreeMap<String, Observation>,
+) -> Result<u64, FsError> {
+    let root = open_dir(parent, leaf_name)?;
+    let mut found: Vec<(String, bool, u64)> = vec![];
+    fn walk(
+        dir: &File,
+        path: &str,
+        expected: &BTreeMap<String, Observation>,
+        found: &mut Vec<(String, bool, u64)>,
+    ) -> Result<(), FsError> {
+        let o = Observation::metadata(&dir.metadata()?);
+        if !expected.get(path).is_some_and(|e| e.same_identity(&o)) {
+            return Err(FsError::DirtyWorkingState);
+        }
+        for raw in names(dir)? {
+            let part = String::from_utf8(raw).map_err(|_| FsError::DirtyWorkingState)?;
+            let next = child(path, &part);
+            let id = identity_at(dir, &part)?.ok_or(FsError::DirtyWorkingState)?;
+            if !expected.get(&next).is_some_and(|e| e.same_identity(&id)) {
+                return Err(FsError::DirtyWorkingState);
+            }
+            if id.kind == libc::S_IFDIR as u32 {
+                walk(&open_dir(dir, &part)?, &next, expected, found)?;
+            } else {
+                found.push((next, false, id.size));
+            }
+        }
+        found.push((path.to_string(), true, 0));
+        Ok(())
+    }
+    walk(&root, "", expected, &mut found)?;
+    let mut freed = 0;
+    for (path, is_dir, size) in found {
+        let (dir, leaf_now) = if path.is_empty() {
+            (open_dir(parent, ".")?, leaf_name.to_string())
+        } else {
+            (
+                open_rel(&root, crate::permissions::parent(&path))?,
+                leaf(&path).to_string(),
+            )
+        };
+        let id = identity_at(&dir, &leaf_now)?.ok_or(FsError::DirtyWorkingState)?;
+        if !expected.get(&path).is_some_and(|e| e.same_identity(&id)) {
+            return Err(FsError::DirtyWorkingState);
+        }
+        let n = name(OsStr::new(&leaf_now))?;
+        let flags = if is_dir { libc::AT_REMOVEDIR } else { 0 };
+        // SAFETY: n is NUL terminated and dir is live.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), n.as_ptr(), flags) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        freed += size;
+    }
+    parent.sync_all()?;
+    Ok(freed)
+}
 const MAX_LOCAL_CHANGES: usize = 128;
 fn note_local(ri: &mut RootIntent, path: &str) {
     if !ri.local_changes.iter().any(|p| p == path) && ri.local_changes.len() < MAX_LOCAL_CHANGES {
@@ -1050,7 +1147,86 @@ pub(crate) fn bound_identity(core: &Core) -> Result<Option<(u64, u64)>, FsError>
         .ok()
         .and_then(|b| b.observations.get("").map(|o| (o.dev, o.ino))))
 }
+thread_local! {
+    static HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Bytes hashed by root inventories on the calling thread (rescan cost evidence for tests).
+#[doc(hidden)]
+pub fn retained_hash_bytes_this_thread() -> u64 {
+    HASHED.with(|h| h.get())
+}
 impl Replica {
+    /// Release the retained displaced data of one application with no unresolved ambiguity:
+    /// the displaced root (or an abandoned stage) and displaced file generations. Explicit
+    /// operator action only; never automatic. Every removed entry must still be exactly the
+    /// recorded identity; anything else (late writes, local-only changes) refuses.
+    pub fn release_native_retention(
+        &self,
+        operation: OperationId,
+        actor: Actor,
+    ) -> Result<u64, FsError> {
+        let core = crate::engine::lock(&self.core)?;
+        crate::permissions::authority(&core.config, &actor)?;
+        let n = na::configuration(&core)?;
+        let mut r = na::records(&core)?
+            .into_iter()
+            .find(|r| r.operation == operation)
+            .ok_or(FsError::NotFound)?;
+        if r.released {
+            return Ok(0);
+        }
+        let abandoned = r
+            .root
+            .as_ref()
+            .is_some_and(|x| x.phase == RootPhase::Abandoned);
+        if !matches!(r.status, NativeApplyStatus::Ready { .. }) && !abandoned {
+            return Err(FsError::DirtyWorkingState);
+        }
+        if r.root.as_ref().is_some_and(RootIntent::exchanged)
+            && !matches!(rescan(&core, &n.policy, &mut r, true)?, Rescan::Unchanged)
+        {
+            return Err(FsError::DirtyWorkingState);
+        }
+        if r.ambiguous() || r.root.as_ref().is_some_and(|x| !x.local_changes.is_empty()) {
+            return Err(FsError::DirtyWorkingState);
+        }
+        let mut freed = 0u64;
+        let generations = na::verified_generations(&r)?;
+        if let Some(ri) = r.root.clone() {
+            let expected: BTreeMap<String, Observation> = if ri.exchanged() {
+                ri.displaced
+                    .iter()
+                    .map(|(p, s)| (p.clone(), s.observation.clone()))
+                    .collect()
+            } else {
+                ri.staged.clone()
+            };
+            if !expected.is_empty() {
+                let parent = directory(&ri.parent)?;
+                if !Observation::metadata(&parent.metadata()?).same_identity(&ri.parent_identity) {
+                    return Err(FsError::UnsafeStorage);
+                }
+                freed += remove_tree(&parent, &ri.stage_leaf, &expected)?;
+            }
+        }
+        let stage = if generations.is_empty() {
+            None
+        } else {
+            Some(na::stage_open(&r)?)
+        };
+        for (leaf, size) in generations {
+            let n = name(OsStr::new(&leaf))?;
+            // SAFETY: n is NUL terminated, stage is a live verified directory.
+            if unsafe { libc::unlinkat(stage.as_ref().unwrap().as_raw_fd(), n.as_ptr(), 0) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            freed += size;
+        }
+        r.released = true;
+        na::save(&core, &r)?;
+        na::refresh_status(&core)?;
+        Ok(freed)
+    }
     /// The verified native root identity. A watcher rebinds only when this changes.
     pub fn native_root_identity(&self) -> Result<Option<(u64, u64)>, FsError> {
         let core = crate::engine::lock(&self.core)?;

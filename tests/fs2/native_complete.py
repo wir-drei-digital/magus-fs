@@ -149,7 +149,13 @@ class Complete(NativeJourney):
         step('directory-tree-delete', delete, [], {'archive': None, 'archive/note': None})
         settled = ep.status(c);time.sleep(2.5);after = ep.status(c)
         assert len(after['status']['submissions']) == len(settled['status']['submissions']), 'structural application echoed a capture'
-        self.record(ep.platform, 'structural-service-matrix', before=before, steps=steps, retained_root=displaced[-1], no_echo_submissions=len(after['status']['submissions']), rebound=[l for l in self.log(ep, c).splitlines() if 'native_watch_rebound' in l])
+        # Explicit operator release (Ruling R7) of one unambiguous retained root.
+        retained = [d for d in after['native']['displacements'] if d['path'] == '']
+        released = ep.cli(c, 'sync', 'recovery', 'release', '--operation-id', retained[0]['operation'])
+        assert released['released_bytes'] > 0 and not ep.exists(retained[0]['retained_path'])
+        remaining = [d for d in ep.status(c)['native']['displacements'] if d['path'] == '']
+        assert len(remaining) == len(retained) - 1 and all(d['operation'] != retained[0]['operation'] for d in remaining)
+        self.record(ep.platform, 'structural-service-matrix', before=before, steps=steps, retained_root=displaced[-1], no_echo_submissions=len(after['status']['submissions']), rebound=[l for l in self.log(ep, c).splitlines() if 'native_watch_rebound' in l], released=released, released_operation=retained[0]['operation'])
         ep.stop(c)
 
     # ---- held FD/CWD across a root exchange; recovery list/capture/export; restart ----
