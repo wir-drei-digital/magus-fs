@@ -261,7 +261,7 @@ class Reconciliation(NativeJourney):
         _, before_hide, _ = self.tree();winner_new = before_hide['reports/new.txt']['id']
         hidden = next(i for i, d in details.items() if d['summary']['reason'] == 'add_add' and any(a['entry'] == winner_new for a in d['alternatives']))
         cur = next(a['id'] for a in details[hidden]['alternatives'] if a['side'] == 'current');base_alt = next(a['id'] for a in details[hidden]['alternatives'] if a['side'] == 'base')
-        self.set_file('reports/new.txt', plan[wep.platform]['reports/new.txt'], 'hide-entry', mode=0)
+        advanced = self.set_file('reports/new.txt', plan[wep.platform]['reports/new.txt'], 'hide-entry', mode=0)
         assert hidden not in [x['id'] for x in self.ok(lep, lc, 'sync', 'conflicts', 'list')['page']['items']]
         visible = [i for i in details if i != hidden]
         ids = ','.join(visible + [hidden])
