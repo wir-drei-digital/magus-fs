@@ -22,17 +22,17 @@ use std::{
 use unicode_normalization::UnicodeNormalization;
 
 #[cfg(target_os = "macos")]
-const TYPE_MASK: u32 = libc::S_IFMT as u32;
+pub(crate) const TYPE_MASK: u32 = libc::S_IFMT as u32;
 #[cfg(not(target_os = "macos"))]
-const TYPE_MASK: u32 = libc::S_IFMT;
+pub(crate) const TYPE_MASK: u32 = libc::S_IFMT;
 #[cfg(target_os = "macos")]
-const DIRECTORY_KIND: u32 = libc::S_IFDIR as u32;
+pub(crate) const DIRECTORY_KIND: u32 = libc::S_IFDIR as u32;
 #[cfg(not(target_os = "macos"))]
-const DIRECTORY_KIND: u32 = libc::S_IFDIR;
+pub(crate) const DIRECTORY_KIND: u32 = libc::S_IFDIR;
 #[cfg(target_os = "macos")]
-const FILE_KIND: u32 = libc::S_IFREG as u32;
+pub(crate) const FILE_KIND: u32 = libc::S_IFREG as u32;
 #[cfg(not(target_os = "macos"))]
-const FILE_KIND: u32 = libc::S_IFREG;
+pub(crate) const FILE_KIND: u32 = libc::S_IFREG;
 #[cfg(target_os = "macos")]
 const SYMLINK_KIND: u32 = libc::S_IFLNK as u32;
 #[cfg(not(target_os = "macos"))]

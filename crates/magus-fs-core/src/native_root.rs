@@ -175,10 +175,16 @@ fn identity_at(parent: &File, leaf: &str) -> Result<Option<Observation>, FsError
     let mode = stat.st_mode as u32;
     #[cfg(not(target_os = "macos"))]
     let mode = stat.st_mode;
+    // dev_t is i32 on macOS and u64 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    let dev = stat.st_dev as u64;
+    // nlink_t is u16 on macOS, u32 on Linux aarch64 and u64 on Linux x86_64.
+    #[allow(clippy::unnecessary_cast)]
+    let nlink = stat.st_nlink as u64;
     Ok(Some(Observation {
-        dev: stat.st_dev as u64,
+        dev,
         ino: stat.st_ino,
-        kind: mode & (libc::S_IFMT as u32),
+        kind: mode & crate::capture::TYPE_MASK,
         size: stat.st_size as u64,
         mtime: 0,
         mtime_ns: 0,
@@ -187,7 +193,7 @@ fn identity_at(parent: &File, leaf: &str) -> Result<Option<Observation>, FsError
         uid: stat.st_uid,
         gid: stat.st_gid,
         mode,
-        nlink: stat.st_nlink as u64,
+        nlink,
         names: vec![],
     }))
 }
@@ -280,8 +286,8 @@ impl Inventory {
                 let Some(kind) = identity_at(&file, &part)? else {
                     return Err(FsError::UnstableCapture.into());
                 };
-                let is_dir = kind.kind == libc::S_IFDIR as u32;
-                if !is_dir && kind.kind != libc::S_IFREG as u32 {
+                let is_dir = kind.kind == crate::capture::DIRECTORY_KIND;
+                if !is_dir && kind.kind != crate::capture::FILE_KIND {
                     self.unsupported(next)?;
                     continue;
                 }
@@ -1093,7 +1099,7 @@ fn remove_tree(
             if !expected.get(&next).is_some_and(|e| e.same_identity(&id)) {
                 return Err(FsError::DirtyWorkingState);
             }
-            if id.kind == libc::S_IFDIR as u32 {
+            if id.kind == crate::capture::DIRECTORY_KIND {
                 walk(&open_dir(dir, &part)?, &next, expected, found)?;
             } else {
                 found.push((next, false, id.size));
