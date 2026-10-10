@@ -141,10 +141,29 @@ fn save(core: &Core, r: &Intent) -> Result<(), FsError> {
     )?;
     Ok(())
 }
+fn displacements(rows: &[Intent]) -> Vec<NativeDisplacement> {
+    rows.iter()
+        .flat_map(|r| {
+            r.files
+                .iter()
+                .filter(|f| f.expected.is_some() && f.exchanged)
+                .map(|f| NativeDisplacement {
+                    operation: r.operation.clone(),
+                    path: f.path.clone(),
+                    retained_path: r.stage.join(&f.stage),
+                    versions: f.versions.clone(),
+                    ambiguous: f.ambiguous,
+                })
+        })
+        .collect()
+}
 fn status_save(core: &Core, s: &NativeStatus) -> Result<(), FsError> {
+    // Every status transition exposes the current durable intents, including failed preflight.
+    let mut s = s.clone();
+    s.displacements = displacements(&records(core)?);
     core.journal.db.execute(
         "INSERT OR REPLACE INTO native_status VALUES(1,?)",
-        [json(s)?],
+        [json(&s)?],
     )?;
     Ok(())
 }
@@ -232,6 +251,14 @@ fn metadata_matches(core: &Core, file: &File, entry: &Entry) -> Result<(), FsErr
     Ok(())
 }
 fn verify_file(core: &Core, file: &mut File, entry: &Entry) -> Result<(), FsError> {
+    verify_file_generation(core, file, entry).map(|_| ())
+}
+fn verify_file_generation(
+    core: &Core,
+    file: &mut File,
+    entry: &Entry,
+) -> Result<(Observation, String), FsError> {
+    let mut hash = Sha256::new();
     let before = observation(file)?;
     let deadline = Instant::now() + Duration::from_secs(30);
     let EntryContent::File { version } = &entry.content else {
@@ -259,6 +286,7 @@ fn verify_file(core: &Core, file: &mut File, entry: &Entry) -> Result<(), FsErro
                 }
                 let mut found = vec![0; *length as usize];
                 file.read_exact(&mut found)?;
+                hash.update(&found);
                 if found != bytes[*offset as usize..(*offset + *length) as usize] {
                     return Err(FsError::UnstableCapture);
                 }
@@ -272,6 +300,7 @@ fn verify_file(core: &Core, file: &mut File, entry: &Entry) -> Result<(), FsErro
                     }
                     let n = left.min(8192) as usize;
                     file.read_exact(&mut b[..n])?;
+                    hash.update(&b[..n]);
                     if b[..n].iter().any(|v| *v != 0) {
                         return Err(FsError::UnstableCapture);
                     }
@@ -283,7 +312,7 @@ fn verify_file(core: &Core, file: &mut File, entry: &Entry) -> Result<(), FsErro
     if observation(file)? != before {
         return Err(FsError::UnstableCapture);
     }
-    Ok(())
+    Ok((before, crate::model::hex(&hash.finalize())))
 }
 fn scan_tree(core: &Core, n: &NativeConfig, tree: &Tree) -> Result<ScanRecord, FsError> {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -736,21 +765,7 @@ impl Replica {
         if authority_revision(&core).is_err() {
             status.status = blocked("permission_denied")
         }
-        status.displacements = rows
-            .iter()
-            .flat_map(|r| {
-                r.files
-                    .iter()
-                    .filter(|f| f.expected.is_some() && f.exchanged)
-                    .map(|f| NativeDisplacement {
-                        operation: r.operation.clone(),
-                        path: f.path.clone(),
-                        retained_path: r.stage.join(&f.stage),
-                        versions: f.versions.clone(),
-                        ambiguous: f.ambiguous,
-                    })
-            })
-            .collect();
+        status.displacements = displacements(&rows);
         if !matches!(status.status, NativeApplyStatus::Ready { .. }) {
             if let Some(w) = &core.working {
                 let mut w = w.clone();
@@ -1234,21 +1249,24 @@ fn finish(core: &mut Core, n: &NativeConfig, r: &mut Intent) -> Result<NativeApp
             r.files[i].ambiguous = true;
             save(core, r)?;
             let mut displaced = open_file(&stage, &f.stage)?;
-            if !same_generation(expected, &observation(&displaced)?)
-                || verify_file(
-                    core,
-                    &mut displaced,
-                    f.old_entry.as_ref().ok_or(FsError::InvalidTree)?,
-                )
-                .is_err()
-            {
-                r.files[i].ambiguous = true;
-                save(core, r)?;
-                return Ok(blocked("unexpected_displacement"));
+            let verified = verify_file_generation(
+                core,
+                &mut displaced,
+                f.old_entry.as_ref().ok_or(FsError::InvalidTree)?,
+            );
+            let (observed, hash) = match verified {
+                Ok(pair) if same_generation(expected, &pair.0) => pair,
+                _ => return Ok(blocked("unexpected_displacement")),
+            };
+            crate::faults::capture_barrier("native-displaced-verified", 1)?;
+            // Never adopt a later observation/hash as the verified canonical baseline.
+            // A write after this check still differs from the saved verified digest on rescan.
+            if observation(&displaced)? != observed || native_hash(&mut displaced)? != hash {
+                return Ok(pending("late_displaced_write"));
             }
             r.files[i].ambiguous = false;
-            r.files[i].last_displaced = Some(observation(&displaced)?);
-            r.files[i].last_displaced_hash = Some(native_hash(&mut displaced)?);
+            r.files[i].last_displaced = Some(observed);
+            r.files[i].last_displaced_hash = Some(hash);
             save(core, r)?;
         }
     }

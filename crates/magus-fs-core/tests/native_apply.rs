@@ -223,6 +223,10 @@ fn interrupted(point: &str, race: Option<&str>, create: bool) {
     let (d, rep, n, base) = fixture();
     let next = incoming(d.path(), &rep, &base, create);
     let generation = rep.status().unwrap().generation;
+    let mut held = fs::OpenOptions::new()
+        .write(true)
+        .open(n.root.join("a"))
+        .unwrap();
     let op = OperationId::random().unwrap();
     drop(rep);
     let marker = d.path().join("barrier");
@@ -249,6 +253,10 @@ fn interrupted(point: &str, race: Option<&str>, create: bool) {
     }
     if let Some(race) = race {
         match race {
+            "held" => {
+                held.write_all(b"late!!").unwrap();
+                held.sync_all().unwrap();
+            }
             "replace" => {
                 fs::write(n.root.join("editor-save"), b"racing-editor").unwrap();
                 fs::rename(
@@ -282,6 +290,30 @@ fn interrupted(point: &str, race: Option<&str>, create: bool) {
         return;
     }
     let rep = reopened.unwrap();
+    if race == Some("held") {
+        let immediate = rep.native_status().unwrap().unwrap();
+        assert!(
+            !matches!(immediate.status, NativeApplyStatus::Ready { .. }),
+            "late write after verification must not become Ready: {immediate:?}"
+        );
+        let observed = rep.scan_native_status().unwrap();
+        assert!(!matches!(observed.status, NativeApplyStatus::Ready { .. }));
+        assert!(observed
+            .displacements
+            .iter()
+            .any(|d| d.ambiguous && d.versions.iter().any(|v| fs::read(v).unwrap() == b"late!!")));
+        assert_eq!(fs::read(n.root.join("a")).unwrap(), b"incoming");
+        let enumeration = serde_json::to_value(&observed.displacements).unwrap();
+        drop(rep);
+        let rep = Replica::reopen(d.path().join("state")).unwrap();
+        let retained = rep.native_status().unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&retained.displacements).unwrap(),
+            enumeration
+        );
+        assert!(!matches!(retained.status, NativeApplyStatus::Ready { .. }));
+        return;
+    }
     if race.is_none() {
         let recovered = rep.recover_native_application(actor()).unwrap();
         assert!(recovered
@@ -326,6 +358,11 @@ fn interrupted(point: &str, race: Option<&str>, create: bool) {
             _ => assert_eq!(fs::read(d.path().join("moved/a")).unwrap(), b"before"),
         }
     }
+}
+#[cfg(feature = "test-faults")]
+#[test]
+fn native_displaced_verified_gap_retains_late_write() {
+    interrupted("native-displaced-verified", Some("held"), false);
 }
 #[cfg(feature = "test-faults")]
 #[test]
@@ -534,6 +571,25 @@ fn late_displacement_candidate_prevents_new_ready_claim() {
         "{result:?}"
     );
     assert!(!rep.live_status().unwrap().applied);
+    let enumeration = serde_json::to_value(&status.displacements).unwrap();
+    let after = rep.native_status().unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&after.displacements).unwrap(),
+        enumeration,
+        "rejected apply must preserve immediate enumeration"
+    );
+    drop(rep);
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    let after = rep.native_status().unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&after.displacements).unwrap(),
+        enumeration,
+        "reopen must preserve enumeration without a scan"
+    );
+    assert!(after
+        .displacements
+        .iter()
+        .any(|d| d.versions.iter().any(|p| fs::read(p).unwrap() == b"late!!")));
 }
 #[test]
 fn old_apply_operation_cannot_claim_current_readiness() {

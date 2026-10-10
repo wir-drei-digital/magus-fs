@@ -116,10 +116,28 @@ class NativeJourney(Journey):
         reports={'path':'reports','id':identity('entry'),'parent':self.tree_root['id'],'owner':ALICE,'group':GROUP,'mode':493,'content':{'kind':'directory'}}
         body=b'initial native ordinary bytes';upload,rid=self.stage(self.descriptor([reports,file_entry('reports/live',reports['id'],body)]),bodies=[body]);self.expect('native-seed','POST',self.root+'/seed',200,body={'branch':'main','revision':rid,'upload':upload})
         for platform in self.platforms:
-            ep=Endpoint(self,platform,self.image);self.endpoints.append(ep);self.supplement(ep) if self.case=='supplement' else self.permissions(ep) if self.case=='permissions' else self.platform(ep)
+            ep=Endpoint(self,platform,self.image);self.endpoints.append(ep);self.retention(ep) if self.case=='retention' else self.supplement(ep) if self.case=='supplement' else self.permissions(ep) if self.case=='permissions' else self.platform(ep)
     def directory_mode(self,mode):
         view,r=self.view();next(e for e in r['tree']['entries'] if e['path']=='reports')['mode']=mode
         _,private=self.candidate(view,r,'alice',[]);return self.expect('native-directory-mode','POST',self.root+'/integrations',200,body=self.integrate_request(private,view))
+    def retention(self,ep):
+        c=ep.create('verified-gap');ep.start(c);self.until(lambda:ep.ready(c));ep.stop(c)
+        tag=c['path']+'/held';ep.children.append({'creating':tag});ep.save()
+        code="import json,os,sys,time\ns=json.loads(sys.argv[1]);fd=os.open(s['file'],os.O_RDWR);old=os.fstat(fd).st_ino;open(s['tag']+'-ready','w').close();deadline=time.monotonic()+40\nwhile not os.path.exists(s['tag']+'-go'):\n assert time.monotonic()<deadline\n time.sleep(.02)\nbody=b'verification gap alternative';os.pwrite(fd,body,0);os.ftruncate(fd,len(body));os.fsync(fd);open(s['tag']+'-done','w').write(json.dumps({'old_inode':old,'current_inode':os.stat(s['file']).st_ino,'bytes':os.pread(fd,4096,0).hex()}));os.close(fd)"
+        pid=ep.run("p=subprocess.Popen(['python3','-c',s['code'],json.dumps(s['args'])],stdout=open(s['tag']+'-log','w'),stderr=subprocess.STDOUT);print(json.dumps(p.pid))",{'code':code,'args':{'file':c['root']+'/reports/live','tag':tag},'tag':tag});ep.children[-1]={'pid':pid,'tag':tag};ep.save();self.until(lambda:ep.exists(tag+'-ready'))
+        incoming=(ep.platform+' verified gap incoming').encode();self.publish(incoming);ep.start(c,'native-displaced-verified');ep.barrier(c)
+        ep.run("open(s+'-go','w').close();print('{}')",tag);self.until(lambda:ep.exists(tag+'-done'));held=ep.run("print(open(s+'-done').read())",tag);ep.children[-1]['stopped']=True;ep.save();assert held['old_inode']!=held['current_inode'];ep.release(c)
+        self.until(lambda:any(d['ambiguous'] and d['versions'] for d in ep.status(c)['native']['displacements']))
+        before=ep.status(c);records=before['native']['displacements'];assert 'Ready' not in before['native']['status'] and not before['live']['applied'];assert ep.read(c)==incoming.hex()
+        retained={v:ep.run("print(json.dumps(open(s,'rb').read().hex()))",v) for d in records for v in d['versions']};assert held['bytes'] in retained.values()
+        ep.stop(c,kill=True);reopened=ep.status(c);assert reopened['native']['displacements']==records;assert 'Ready' not in reopened['native']['status'];assert all(ep.run("print(json.dumps(open(s,'rb').read().hex()))",v)==body for v,body in retained.items())
+        self.record(ep.platform,'verified-gap-held-write-owner-restart',before=before,reopened=reopened,held=held,retained=retained,barrier='native-displaced-verified')
+        # The ahead head triggers rejected applications; enumeration must also survive those writes.
+        self.publish((ep.platform+' subsequent incoming blocked').encode());ep.start(c)
+        self.until(lambda:ep.status(c)['native']['incoming_revision']!=before['native']['incoming_revision'])
+        rejected=ep.status(c);assert rejected['native']['displacements']==records;assert 'Ready' not in rejected['native']['status'];ep.stop(c,kill=True);reopened=ep.status(c)
+        assert reopened['native']['displacements']==records;assert 'Ready' not in reopened['native']['status'] and not reopened['live']['applied'];assert ep.read(c)==incoming.hex();assert all(ep.run("print(json.dumps(open(s,'rb').read().hex()))",v)==body for v,body in retained.items())
+        self.record(ep.platform,'rejected-apply-retained-enumeration-reopen',rejected=rejected,reopened=reopened,retained=retained)
     def supplement(self,ep):
         c=ep.create('late-restart');ep.start(c);self.until(lambda:ep.ready(c));original=ep.status(c)
         self.i.docker('exec',self.i.service,'python3','-c',"import os,signal;pid=int(open('/tmp/service.pid').read());assert os.readlink('/proc/'+str(pid)+'/exe')=='/usr/local/bin/magus-fs-service';os.kill(pid,signal.SIGTERM)")
@@ -195,7 +213,7 @@ class NativeJourney(Journey):
         for ep in self.endpoints:ep.cleanup()
 
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument('--output',required=True);ap.add_argument('--platform',choices=['all','macos','linux'],default='all');ap.add_argument('--skip-build',action='store_true');ap.add_argument('--image');ap.add_argument('--case',choices=['full','supplement','permissions'],default='full');a=ap.parse_args();i=OwnedInfra(a.output);j=None;code=1
+    ap=argparse.ArgumentParser();ap.add_argument('--output',required=True);ap.add_argument('--platform',choices=['all','macos','linux'],default='all');ap.add_argument('--skip-build',action='store_true');ap.add_argument('--image');ap.add_argument('--case',choices=['full','supplement','permissions','retention'],default='full');a=ap.parse_args();i=OwnedInfra(a.output);j=None;code=1
     try:
         i.preflight();source=capture(i);image=a.image or i.owner+'-native';i.write_json('image-ownership.json',{'tag':image,'intent':'retained native test image'})
         if not a.skip_build:
