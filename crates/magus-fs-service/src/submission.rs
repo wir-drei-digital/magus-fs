@@ -182,7 +182,7 @@ pub(crate) fn authorize_candidate(s: &r::Snapshot, derived: &Revision) -> Result
     )?;
     // R19: an effect that cannot be composed at current locations is denied, never skipped.
     let effect = merge.effect()?;
-    authorize_tree_transition(&current.tree, &effect, a, &s.authorities, &s.scope())
+    authorize_tree_transition(&merge.current, &effect, a, &s.authorities, &s.scope())
         .map_err(core_error)?;
     Ok(())
 }
@@ -752,6 +752,28 @@ mod tests {
                 "{reasons:?}"
             );
         }
+    }
+    #[test]
+    fn r20_collision_with_an_entry_hidden_after_the_base_is_denied_at_integration() {
+        // Others create an entry the caller cannot read at the path the caller creates
+        // offline: the private submission is accepted (only touched visible entries are
+        // checked) and integration is denied without disclosure; nothing is replaced.
+        let mut s = folder_fixture();
+        let derived = offline(&s, |t| {
+            let mut new = at(t, "reports/F/old.txt").clone();
+            new.id = EntryId::random().unwrap();
+            new.path = "reports/F/x".into();
+            t.entries.push(new);
+        });
+        let current = &mut s.current.as_mut().unwrap().tree;
+        let mut hidden = at(current, "reports/F/old.txt").clone();
+        hidden.id = EntryId::random().unwrap();
+        hidden.path = "reports/F/x".into();
+        hidden.mode = 0;
+        current.entries.push(hidden);
+        current.entries.sort_by(|x, y| x.path.cmp(&y.path));
+        assert!(authorize_candidate(&s, &derived).is_ok());
+        assert_eq!(integration(&s, &derived).map(|o| o.0), Err("not_found"));
     }
     #[test]
     fn unchanged_hidden_move_does_not_invalidate_authorized_candidate() {

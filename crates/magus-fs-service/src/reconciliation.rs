@@ -429,9 +429,11 @@ impl CallerMerge {
             Err(_) => Err(Error::not_found()),
         }
     }
-    /// The candidate's effect at the current locations of what it touches: the full tree a
-    /// merge preferring the candidate would produce, never placing an identity of the
-    /// original projection that is absent from the current one (nor anything beneath it).
+    /// The candidate's effect at the current locations of what it touches, in the caller's
+    /// current projection (authorized against `current`): the tree a merge preferring the
+    /// candidate would produce, never placing an identity of the original projection that is
+    /// absent from the current one (nor anything beneath it). Hidden entries are untouched
+    /// by construction; a collision with one is decided at integration (`complete`).
     /// Callers fail closed on `Err` (ruling R19): no current-location check is skipped.
     pub(crate) fn effect(&self) -> Result<Tree> {
         let tree = resolve_trees(
@@ -451,7 +453,7 @@ impl CallerMerge {
             .map(|e| e.id.clone())
             .filter(|id| !present.contains(id))
             .collect();
-        self.complete(without(&tree, &absent))
+        Ok(without(&tree, &absent))
     }
 }
 
