@@ -411,11 +411,11 @@ pub(crate) fn resolve(
     // R16: with hidden conflicts, previously shared entries this caller can no longer see
     // at the head (and that no visible conflict names) stay at their head value: absent
     // from the projected replacement, so the service keeps the current hidden entry.
+    let now: BTreeSet<&EntryId> = current.tree.entries.iter().map(|e| &e.id).collect();
+    let shared: BTreeSet<&EntryId> = base.tree.entries.iter().map(|e| &e.id).collect();
     let tree = if hidden.is_empty() {
         tree
     } else {
-        let now: BTreeSet<&EntryId> = current.tree.entries.iter().map(|e| &e.id).collect();
-        let shared: BTreeSet<&EntryId> = base.tree.entries.iter().map(|e| &e.id).collect();
         let mut doomed: BTreeSet<EntryId> = tree
             .entries
             .iter()
@@ -445,6 +445,27 @@ pub(crate) fn resolve(
                 .collect(),
         }
     };
+    // Ruling R18: a kept version of a previously shared identity whose head side is absent
+    // to this caller (deleted by others, or moved out of its scope) is always re-created
+    // under a fresh identity at its in-scope path, so both cases resolve identically and
+    // nothing is written outside the caller's scope.
+    let mut fresh = BTreeMap::new();
+    for e in tree
+        .entries
+        .iter()
+        .filter(|e| !now.contains(&e.id) && shared.contains(&e.id))
+    {
+        fresh.insert(e.id.clone(), EntryId::random()?);
+    }
+    let mut tree = tree;
+    for e in &mut tree.entries {
+        if let Some(id) = fresh.get(&e.id) {
+            e.id = id.clone();
+        }
+        if let Some(parent) = fresh.get(&e.parent) {
+            e.parent = parent.clone();
+        }
+    }
     let actor = super::publication_actor(rep, rep.actor_for_uid(unsafe { libc::geteuid() })?)?;
     let operation = match operation {
         Some(op) => op,

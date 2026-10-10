@@ -45,3 +45,5 @@ ALTER TABLE views ADD COLUMN IF NOT EXISTS alternative_entry text;
 -- Ruling R16: conflicts hidden from the resolving caller are closed as superseded by the
 -- resolution that left their entries at head values; their alternatives stay immutable.
 ALTER TABLE conflict_resolutions ADD COLUMN IF NOT EXISTS superseded boolean NOT NULL DEFAULT false;
+-- Ruling R18: identity re-use checks at candidate submission.
+CREATE INDEX IF NOT EXISTS conflicts_entry ON conflicts(namespace,entry);

@@ -28,17 +28,20 @@ class Endpoint:
     def cli(self,c,*args):
         return self.run("deadline=time.monotonic()+3\nwhile True:\n p=subprocess.run([s[0],*s[1]],capture_output=True,text=True,timeout=12)\n if p.returncode==0:break\n if json.loads(p.stdout).get('error')!='replica_busy' or time.monotonic()>=deadline:raise AssertionError((s[1],p.stdout,p.stderr))\n time.sleep(.03)\nprint(p.stdout)",[self.binary,[*args,'--state',c['state']]])
     def status(self,c):return self.cli(c,'sync','status')
-    def create(self,name,nest=False):
+    def create(self,name,nest=False,prefixes=None):
         replica=identity('replica')
-        code,grant=self.j.request('POST',self.j.root+'/grants',body={'delegate':{'replica':replica,'expires':int(time.time())+1800,'actions':['read','write','history','integrate'],'branches':['main'],'prefixes':['']}});assert code==200,grant
-        view,r=self.j.view();bodies={}
+        code,grant=self.j.request('POST',self.j.root+'/grants',body={'delegate':{'replica':replica,'expires':int(time.time())+1800,'actions':['read','write','history','integrate'],'branches':['main'],'prefixes':prefixes or ['']}});assert code==200,grant
+        # A path-scoped owner hydrates exactly its own authorized projection.
+        actor='scoped-'+replica if prefixes else 'alice'
+        if prefixes:self.j.tokens[actor]=grant['token']
+        view,r=self.j.view(actor);bodies={}
         for e in r['tree']['entries']:
             if e['content']['kind']=='file':
                 body=b''
                 for x in e['content']['version']['extents']:
                     assert x['kind']=='chunk'
                     import http.client
-                    conn=http.client.HTTPSConnection('127.0.0.1',self.i.port,context=self.j.ca,timeout=10);conn.request('GET',self.j.root+'/views/'+view['view']+'/objects/'+x['object'],headers={'Authorization':'Bearer '+self.j.tokens['alice']});response=conn.getresponse();part=response.read();assert response.status==200;conn.close();body+=part[x['offset']:x['offset']+x['length']]
+                    conn=http.client.HTTPSConnection('127.0.0.1',self.i.port,context=self.j.ca,timeout=10);conn.request('GET',self.j.root+'/views/'+view['view']+'/objects/'+x['object'],headers={'Authorization':'Bearer '+self.j.tokens[actor]});response=conn.getresponse();part=response.read();assert response.status==200;conn.close();body+=part[x['offset']:x['offset']+x['length']]
                 bodies[e['path']]=body.hex()
         path=self.base+'/'+name;self.clients.append({'path':path,'creating':True});self.save()
         c=self.run('''p=s['path'];os.mkdir(p,0o700);base=p+'/native' if s['nest'] else p

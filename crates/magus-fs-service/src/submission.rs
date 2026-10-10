@@ -320,6 +320,43 @@ pub(crate) async fn candidate(
         id = revision.parents[0].clone();
     }
     let mut required = BTreeMap::new();
+    // Ruling R18: an identity absent from the caller's authorized base view may not be
+    // re-used: hidden head identities are refused by `lift`, and identities named by a
+    // recorded conflict (e.g. deleted or moved out of scope by others) are refused here
+    // with the same response, so a resolution cannot tell the two apart.
+    let issued: std::collections::BTreeSet<&EntryId> =
+        view.projected.tree.entries.iter().map(|e| &e.id).collect();
+    let introduced: Vec<String> = chain
+        .iter()
+        .flat_map(|(_, r)| r.tree.entries.iter())
+        .filter(|e| !issued.contains(&e.id))
+        .map(|e| e.id.as_str().to_owned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !introduced.is_empty() {
+        let reused = state
+            .db
+            .acquire()
+            .await?
+            .run(|db| {
+                let ns = &ns;
+                let introduced = &introduced;
+                Box::pin(async move {
+                    Ok(db
+                        .query_opt(
+                            "SELECT 1 FROM conflicts WHERE namespace=$1 AND entry=ANY($2) LIMIT 1",
+                            &[ns, introduced],
+                        )
+                        .await?
+                        .is_some())
+                })
+            })
+            .await?;
+        if reused {
+            return Err(Error::not_found());
+        }
+    }
     for (_, revision) in chain.iter().rev() {
         let derived = views::lift(&view.full, &view.projected, revision)?;
         authorize_candidate(&s, &derived)?;

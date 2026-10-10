@@ -444,6 +444,48 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         assert deleted_shape == moved_shape == [('base', False), ('candidate', False), ('current', True)], (deleted, moved)
         cur = lambda d: next(a['id'] for a in d['alternatives'] if a['side'] == 'current')
         assert export(deleted['summary']['id'], cur(deleted)) == export(moved['summary']['id'], cur(moved)) == (404, {'code': 'not_found'})
+        # R19-C: others additionally make the moved-out file unreadable: still exactly like the
+        # deleted one (out-of-scope current permissions never apply to historic versions).
+        self.publish_tree(lambda t: next(e for e in t['entries'] if e['path'] == 'secret/mv.txt').update(mode=0), label='r19c-unreadable')
+        _, unreadable_shape = shape(outcomes['edit-vs-move-out'][1]['conflicts'][0])
+        assert unreadable_shape == deleted_shape, (unreadable_shape, deleted_shape)
+        # R18 (service): re-using an identity absent from the caller's head view is refused
+        # identically for a deleted and for a moved-out identity.
+        view, r = self.view('worker');reports = next(e['id'] for e in r['tree']['entries'] if e['path'] == 'reports')
+        reuse = {}
+        for label, d in [('deleted', deleted), ('moved', moved)]:
+            entry = next(a['entry'] for a in d['alternatives'] if a['entry'])
+            rr = copy.deepcopy(r);f = file_entry('reports/reuse-' + label + '.txt', reports, b'reuse');f['id'] = entry;rr['tree']['entries'].append(f)
+            request = self.stage_request(view, rr, [b'reuse'])
+            reuse[label] = self.request('POST', self.root + '/candidates', actor='worker', body=request)
+        assert reuse['deleted'] == reuse['moved'] == (404, {'code': 'not_found'}), reuse
+        # R19-B: creating beneath a folder others deleted vs moved out of scope: identical.
+        for folder in ['reports/fold-del', 'reports/fold-mv']:
+            def mkdir(t, folder=folder):
+                t['entries'].append({'path': folder, 'id': identity('entry'), 'parent': next(e['id'] for e in t['entries'] if e['path'] == 'reports'), 'owner': ALICE, 'group': GROUP, 'mode': 493, 'content': {'kind': 'directory'}})
+            self.publish_tree(mkdir, label='r19b-folder')
+            self.set_file(folder + '/old.txt', b'old', 'r19b-file')
+        fv, fr = self.view('worker')
+        def rmdir(path):
+            return lambda t: t.update(entries=[e for e in t['entries'] if e['path'] != path and not e['path'].startswith(path + '/')])
+        def mvdir(src, dst):
+            def mutate(t):
+                for e in t['entries']:
+                    if e['path'] == src:e['path'] = dst;e['parent'] = next(x['id'] for x in t['entries'] if x['path'] == dst.rsplit('/', 1)[0])
+                    elif e['path'].startswith(src + '/'):e['path'] = dst + e['path'][len(src):]
+            return mutate
+        self.publish_tree(rmdir('reports/fold-del'), label='r19b-delete-folder')
+        self.publish_tree(mvdir('reports/fold-mv', 'secret/fold-mv'), label='r19b-move-folder')
+        creations = {}
+        for folder in ['reports/fold-del', 'reports/fold-mv']:
+            rr = copy.deepcopy(fr);parent = next(e['id'] for e in rr['tree']['entries'] if e['path'] == folder)
+            rr['tree']['entries'].append(file_entry(folder + '/new.txt', parent, b'created offline'))
+            _, private = self.worker_candidate(copy.deepcopy(fv), rr, [b'created offline'])
+            code, body_ = self.request('POST', self.root + '/integrations', actor='worker', body=self.integrate_request(private, {'head': self.head()}))
+            creations[folder] = (code, sorted(x['reason'] for x in self.conflicts('worker') if x['id'] in (body_ or {}).get('conflicts', [])))
+        assert creations['reports/fold-del'] == creations['reports/fold-mv'] and creations['reports/fold-del'][0] == 409, creations
+        av, files, _ = self.tree();assert 'secret/fold-mv/new.txt' not in files and 'secret/fold-mv/old.txt' in files
+        self.r18_native()
         # I6: an identity moved out of scope AFTER its conflict was recorded is likewise
         # presented as deleted; for a caller without history both are hidden alike.
         late = {}
@@ -471,7 +513,7 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         self.expect('i4-merge-conflict-narrowed-denied', 'POST', self.root + '/integrations', 404, {'code': 'not_found'}, body=attempt, actor='worker')
         assert self.sql("SELECT count(*) FROM operations WHERE operation='" + attempt['operation'] + "';") == '0'
         assert self.sql("SELECT count(*) FROM conflicts WHERE integration='" + attempt['operation'] + "';") == '0'
-        self.record('service', 'p7-r14-i4-i6', outcomes=outcomes, deleted=deleted, moved=moved, late_hidden=hidden_late)
+        self.record('service', 'p7-r14-i4-i6', outcomes=outcomes, deleted=deleted, moved=moved, late_hidden=hidden_late, r19c_unreadable_shape=unreadable_shape, r18_reuse=reuse, r19b_creations=creations)
         # (c) A collision with an entry the worker cannot read is denied without disclosure.
         view, r = self.view('worker');reports = next(e['id'] for e in r['tree']['entries'] if e['path'] == 'reports')
         collide = self.set_file('reports/hidden-x', b'unreadable to the worker', 'hidden-collision', mode=0)
@@ -544,6 +586,38 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         assert self.head() == advance['head'] and self.sql("SELECT count(*) FROM operations WHERE operation='" + integration['operation'] + "';") == '0'
         self.stop_service();self.start_service()
         self.record('service', 'scoped-negatives', hidden_merge=merged, moved=moved, collision=collide, unknown=body, resolution=done, revoked_status=status)
+    def r18_native(self):
+        """R18 through the real CLI: a path-scoped native owner keeps its offline edits of a file
+        another user deleted and of one moved out of its scope; both resolve identically by
+        re-creating under fresh identities in scope, and nothing is written out of scope."""
+        ep = next(e for e in self.endpoints if e.platform == 'macos')
+        for path in ['reports/r18-del.txt', 'reports/r18-mv.txt']:
+            self.set_file(path, (path + ' v0').encode(), 'r18-seed')
+        c = ep.create('r18', prefixes=['reports']);ep.start(c);self.until(lambda: ep.ready(c), 20);ep.stop(c)
+        known = {p['operation'] for p in self.subs(ep, c)}
+        _, before, _ = self.tree();ids = {p: before[p]['id'] for p in ['reports/r18-del.txt', 'reports/r18-mv.txt']}
+        self.publish_tree(lambda t: t['entries'].remove(next(e for e in t['entries'] if e['path'] == 'reports/r18-del.txt')), label='r18-delete')
+        def move(t):
+            e = next(e for e in t['entries'] if e['path'] == 'reports/r18-mv.txt');e['path'] = 'secret/r18-mv.txt';e['parent'] = next(x['id'] for x in t['entries'] if x['path'] == 'secret')
+        self.publish_tree(move, label='r18-move-out')
+        ep.run("for p,b in s.items():\n with open(p,'r+b') as f:f.write(bytes.fromhex(b));f.truncate();f.flush();os.fsync(f.fileno())\nprint('{}')", {c['root'] + '/' + p: ('offline ' + p).encode().hex() for p in ids})
+        ep.start(c)
+        record = self.until(lambda: next((p for p in self.subs(ep, c) if p['operation'] not in known and p['error'] == 'conflicted'), None), 45)
+        items = [x for x in self.ok(ep, c, 'sync', 'conflicts', 'list')['page']['items'] if x['receipt'] == record['private_receipt']['receipt']]
+        assert sorted(x['reason'] for x in items) == ['edit_delete', 'edit_delete'], items
+        shapes = [sorted((a['side'], a['path'] is None) for a in self.ok(ep, c, 'sync', 'conflicts', 'show', '--conflict', x['id'])['conflict']['alternatives']) for x in items]
+        assert shapes[0] == shapes[1], shapes
+        head = self.head()
+        resolved = self.ok(ep, c, 'sync', 'resolve', '--conflicts', ','.join(x['id'] for x in items), '--expected-head', head, '--select', 'candidate')['progress']
+        assert resolved['state'] == 'Shared', resolved
+        av, after, _ = self.tree()
+        for p, old in ids.items():
+            assert self.body(av, after[p]) == ('offline ' + p).encode() and after[p]['id'] != old, (p, after.get(p))
+        hidden = json.loads(self.sql("SELECT convert_from(r.descriptor,'UTF8') FROM revisions r JOIN branches b ON b.revision=r.revision AND b.namespace=r.namespace WHERE b.name='main';"))
+        moved = [e for e in hidden['tree']['entries'] if e['id'] == ids['reports/r18-mv.txt']]
+        assert [e['path'] for e in moved] == ['secret/r18-mv.txt'] and self.body(av, after['secret/r18-mv.txt']) == b'reports/r18-mv.txt v0'
+        self.ready_files(ep, c, {p: ('offline ' + p).encode() for p in ids}, resolved['shared_receipt']['head'], 25);ep.stop(c)
+        self.record('macos', 'r18-scoped-keep-edit-deleted-vs-moved-out', conflicts=items, shapes=shapes, resolution=resolved, recreated={p: after[p]['id'] for p in ids}, original=ids)
     def submit(self, actor, replica, view, r, bodies):
         r['parents'] = [view['revision']];r['replica'] = replica;r['operation'] = identity('operation')
         upload, rid = self.stage(r, actor, bodies)
