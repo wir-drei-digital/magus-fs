@@ -1,4 +1,5 @@
--- FS2-B Task 2 collaboration records. Additive and repeatable; nothing is backfilled.
+-- FS2-B Task 2 collaboration records. Additive and repeatable; only the R21 identity registry
+-- is backfilled, from immutable published revisions (facts, no fabricated provenance).
 -- Candidates committed before this migration have no causality sidecar and are judged by
 -- their derived descriptor provenance only. Conflict payloads are immutable (payload+digest);
 -- resolution is a separate link row, so a resolved conflict keeps its original alternatives.
@@ -45,5 +46,24 @@ ALTER TABLE views ADD COLUMN IF NOT EXISTS alternative_entry text;
 -- Ruling R16: conflicts hidden from the resolving caller are closed as superseded by the
 -- resolution that left their entries at head values; their alternatives stay immutable.
 ALTER TABLE conflict_resolutions ADD COLUMN IF NOT EXISTS superseded boolean NOT NULL DEFAULT false;
--- Ruling R18: identity re-use checks at candidate submission.
-CREATE INDEX IF NOT EXISTS conflicts_entry ON conflicts(namespace,entry);
+-- Ruling R21: namespace identity registry, every EntryId ever published in a shared revision
+-- (seed, fast-forward, merge, resolution) of the namespace. Created and backfilled exactly once
+-- (serialized across concurrently starting service processes) from the revisions that were
+-- ever a branch head; every later publication registers its new identities in its commit.
+DO $$
+BEGIN
+ PERFORM pg_advisory_xact_lock(hashtext('magus-fs namespace_entries'));
+ IF to_regclass('namespace_entries') IS NULL THEN
+  CREATE TABLE namespace_entries(
+   namespace text NOT NULL REFERENCES namespaces(id), entry text NOT NULL,
+   PRIMARY KEY(namespace,entry));
+  INSERT INTO namespace_entries(namespace,entry)
+  SELECT DISTINCT s.namespace, e->>'id'
+  FROM (SELECT namespace,revision FROM branches
+        UNION SELECT namespace,derived_revision FROM operations
+         WHERE status=200 AND kind IN ('seed','integration','resolution') AND derived_revision IS NOT NULL
+        UNION SELECT namespace,revision FROM revision_provenance) s
+  JOIN revisions r ON r.namespace=s.namespace AND r.revision=s.revision
+  CROSS JOIN LATERAL jsonb_array_elements(convert_from(r.descriptor,'UTF8')::jsonb #> '{tree,entries}') e;
+ END IF;
+END $$;

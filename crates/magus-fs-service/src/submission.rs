@@ -173,18 +173,86 @@ pub(crate) fn authorize_candidate(s: &r::Snapshot, derived: &Revision) -> Result
         }
     }
     authorize_tree_transition(&now, &checked, a, &s.authorities, &s.scope()).map_err(core_error)?;
-    let presented =
-        crate::reconciliation::present(&view.full.tree, &current.tree, &derived.tree, &visible);
+    let merge = crate::reconciliation::CallerMerge::new(
+        view,
+        current,
+        &derived.tree,
+        a,
+        &s.context.prefixes,
+    )?;
     // R19: an effect that cannot be composed at current locations is denied, never skipped.
-    let effect =
-        crate::reconciliation::effect(&view.full.tree, &presented).ok_or(Error::not_found())?;
-    authorize_tree_transition(&presented.left, &effect, a, &s.authorities, &s.scope())
+    let effect = merge.effect()?;
+    authorize_tree_transition(&current.tree, &effect, a, &s.authorities, &s.scope())
         .map_err(core_error)?;
     Ok(())
 }
 /// Rulings R12/R17: the same current-location authorization before a retained outcome.
 pub(crate) fn authorize_retained(s: &r::Snapshot, derived: &Revision) -> Result<()> {
     authorize_candidate(s, derived)
+}
+/// Distinct identities of the given trees, for `refuse_revived`.
+pub(crate) fn entry_ids<'a>(trees: impl IntoIterator<Item = &'a Tree>) -> Vec<String> {
+    trees
+        .into_iter()
+        .flat_map(|t| t.entries.iter().map(|e| e.id.as_str().to_owned()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+/// Ruling R21: the namespace identity registry (`namespace_entries`: every identity ever
+/// published in a shared revision of the namespace). An identity a candidate introduces
+/// beyond its issued base view that the registry knows but that is absent from the caller's
+/// current authorized projection (deleted, moved out of scope or made unreadable alike) is
+/// refused with the same `404 not_found` a hidden identity gets, at submission, integration,
+/// resolution and replay. Identities hidden at the base are `lift`'s concern (same response).
+/// The lookup reads published identities only; it never consults conflicts of anyone.
+pub(crate) async fn refuse_revived(
+    state: &ServiceState,
+    s: &r::Snapshot,
+    ids: &[String],
+) -> Result<()> {
+    let view = s.view.as_ref().ok_or(Error::not_found())?;
+    let current = s.current.as_ref().ok_or(Error::not_found())?;
+    let visible =
+        crate::reconciliation::caller_visible(current, s.authority()?, &s.context.prefixes)?;
+    let known: std::collections::BTreeSet<&str> = view
+        .full
+        .tree
+        .entries
+        .iter()
+        .map(|e| e.id.as_str())
+        .chain(visible.iter().map(|id| id.as_str()))
+        .collect();
+    let introduced: Vec<String> = ids
+        .iter()
+        .filter(|id| !known.contains(id.as_str()))
+        .cloned()
+        .collect();
+    if introduced.is_empty() {
+        return Ok(());
+    }
+    let ns = &s.context.namespace;
+    let published = state
+        .db
+        .acquire()
+        .await?
+        .run(|db| {
+            let introduced = &introduced;
+            Box::pin(async move {
+                Ok(db
+                    .query_opt(
+                        "SELECT 1 FROM namespace_entries WHERE namespace=$1 AND entry=ANY($2) LIMIT 1",
+                        &[ns, introduced],
+                    )
+                    .await?
+                    .is_some())
+            })
+        })
+        .await?;
+    if published {
+        return Err(Error::not_found());
+    }
+    Ok(())
 }
 pub(crate) async fn replay(
     state: &ServiceState,
@@ -199,10 +267,17 @@ pub(crate) async fn replay(
     })?;
     if let Some(derived) = &op.derived {
         if op.view.is_some() {
-            // A replay *reads* a recorded result: the A rule that every formerly visible
-            // identity of its base must still be readable applies (deleted and moved-out or
-            // unreadable alike), in addition to current rights over the delta.
-            s.validate_receipt_base()?;
+            if op.kind == "candidate" {
+                // A private receipt replay *reads* the caller's own base: the A rule that
+                // every formerly visible identity of it is still readable applies (deleted,
+                // moved-out or unreadable alike).
+                s.validate_receipt_base()?;
+            }
+            // Ruling R22: a recorded integration or resolution result (e.g. a retained
+            // edit/delete conflict) is recovered by lookup or exact replay under current
+            // rights at current locations (R14/R20, R21), identically for deleted and
+            // moved-out identities.
+            refuse_revived(state, &s, &entry_ids([&derived.tree])).await?;
             authorize_candidate(&s, derived)?;
         }
     }
@@ -324,46 +399,10 @@ pub(crate) async fn candidate(
         id = revision.parents[0].clone();
     }
     let mut required = BTreeMap::new();
-    // Ruling R18: an identity absent from the caller's authorized base view may not be
-    // re-used: hidden head identities are refused by `lift`, and identities named by a
-    // recorded conflict (e.g. deleted or moved out of scope by others) are refused here
-    // with the same response, so a resolution cannot tell the two apart.
-    let issued: std::collections::BTreeSet<&EntryId> =
-        view.projected.tree.entries.iter().map(|e| &e.id).collect();
-    let introduced: Vec<String> = chain
-        .iter()
-        .flat_map(|(_, r)| r.tree.entries.iter())
-        .filter(|e| !issued.contains(&e.id))
-        .map(|e| e.id.as_str().to_owned())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    if !introduced.is_empty() {
-        let reused = state
-            .db
-            .acquire()
-            .await?
-            .run(|db| {
-                let ns = &ns;
-                let introduced = &introduced;
-                Box::pin(async move {
-                    Ok(db
-                        .query_opt(
-                            // Only identities that existed in a shared head (base or head
-                            // side of a recorded conflict); a candidate's own never-published
-                            // identities (e.g. one side of an add/add) stay usable.
-                            "SELECT 1 FROM conflicts WHERE namespace=$1 AND entry=ANY($2) AND ((payload::jsonb #> '{conflict,base}') <> 'null'::jsonb OR (payload::jsonb #> '{conflict,left}') <> 'null'::jsonb) LIMIT 1",
-                            &[ns, introduced],
-                        )
-                        .await?
-                        .is_some())
-                })
-            })
-            .await?;
-        if reused {
-            return Err(Error::not_found());
-        }
-    }
+    // Rulings R18/R21: an identity the chain introduces beyond the issued base that the
+    // namespace has published but that is absent from the caller's current projection is
+    // refused exactly like a hidden one (`lift`), whether deleted, moved out or unreadable.
+    refuse_revived(&state, &s, &entry_ids(chain.iter().map(|(_, r)| &r.tree))).await?;
     for (_, revision) in chain.iter().rev() {
         let derived = views::lift(&view.full, &view.projected, revision)?;
         authorize_candidate(&s, &derived)?;
@@ -418,7 +457,6 @@ pub(crate) async fn candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
     fn fixture() -> (r::Snapshot, Revision) {
         let principal = PrincipalId::parse(format!("principal:{:032x}", 1)).unwrap();
         let group = GroupId::parse(format!("group:{:032x}", 1)).unwrap();
@@ -509,6 +547,212 @@ mod tests {
             derived,
         )
     }
+    type Outcome = std::result::Result<(u16, Vec<ConflictReason>, Tree), &'static str>;
+    type Shown = std::result::Result<
+        (u16, Vec<ConflictReason>, Vec<(String, u16, EntryContent)>),
+        &'static str,
+    >;
+    fn hole(size: u64) -> EntryContent {
+        EntryContent::File {
+            version: FileVersion {
+                size,
+                extents: vec![Extent::Hole { length: size }],
+            },
+        }
+    }
+    /// The fixture plus `reports/F` holding `old.txt` and `z.txt`, all visible to the
+    /// `reports`-scoped caller; the current head equals the issued base.
+    fn folder_fixture() -> r::Snapshot {
+        let (mut s, _) = fixture();
+        let authority = s.authorities[0].clone();
+        let view = s.view.as_mut().unwrap();
+        let reports = view.full.tree.entries[0].clone();
+        let dir = Entry {
+            path: "reports/F".into(),
+            id: EntryId::random().unwrap(),
+            parent: reports.id.clone(),
+            ..reports.clone()
+        };
+        let file = |name: &str, size| Entry {
+            path: format!("reports/F/{name}"),
+            id: EntryId::random().unwrap(),
+            parent: dir.id.clone(),
+            mode: 0o600,
+            content: hole(size),
+            ..reports.clone()
+        };
+        let files = [file("old.txt", 1), file("z.txt", 2)];
+        view.full.tree.entries.push(dir.clone());
+        view.full.tree.entries.extend(files);
+        view.full.tree.entries.sort_by(|x, y| x.path.cmp(&y.path));
+        view.projected =
+            views::project(&view.full, &view.full.tree, &authority, &["reports".into()]).unwrap();
+        s.current = Some(view.full.clone());
+        s
+    }
+    fn at<'a>(t: &'a mut Tree, path: &str) -> &'a mut Entry {
+        t.entries.iter_mut().find(|e| e.path == path).unwrap()
+    }
+    /// The caller's offline change of its issued projection, lifted as at submission.
+    fn offline(s: &r::Snapshot, change: impl FnOnce(&mut Tree)) -> Revision {
+        let view = s.view.as_ref().unwrap();
+        let mut submitted = view.projected.clone();
+        change(&mut submitted.tree);
+        views::lift(&view.full, &view.projected, &submitted).unwrap()
+    }
+    /// Others delete `path` (with its subtree) or move it beneath `secret`, out of scope.
+    fn others(s: &mut r::Snapshot, variant: &str, path: &str) {
+        let tree = &mut s.current.as_mut().unwrap().tree;
+        let inside = |p: &str| p == path || p.starts_with(&format!("{path}/"));
+        if variant == "deleted" {
+            tree.entries.retain(|e| !inside(&e.path));
+        } else {
+            let secret = tree
+                .entries
+                .iter()
+                .find(|e| e.path == "secret")
+                .unwrap()
+                .id
+                .clone();
+            for e in &mut tree.entries {
+                if e.path == path {
+                    e.parent = secret.clone();
+                }
+                if inside(&e.path) {
+                    e.path = format!("secret/{}", e.path.trim_start_matches("reports/"));
+                }
+            }
+            tree.entries.sort_by(|x, y| x.path.cmp(&y.path));
+        }
+    }
+    /// The service integration outcome of a stale candidate with an opaque policy: current
+    /// rights first, then the merge, completion and the reauthorized resulting delta.
+    fn integration(s: &r::Snapshot, derived: &Revision) -> Outcome {
+        authorize_retained(s, derived).map_err(|e| e.code)?;
+        let view = s.view.as_ref().unwrap();
+        let current = s.current.as_ref().unwrap();
+        let a = s.authority().unwrap();
+        let merge = crate::reconciliation::CallerMerge::new(
+            view,
+            current,
+            &derived.tree,
+            a,
+            &s.context.prefixes,
+        )
+        .map_err(|e| e.code)?;
+        match reconcile_trees(
+            &merge.base,
+            &merge.current,
+            &merge.candidate,
+            &MergePolicy::opaque(),
+            &crate::reconciliation::NoContent,
+        )
+        .map_err(|_| "invalid")?
+        {
+            MergeOutcome::Clean { tree, .. } => {
+                let tree = merge.complete(tree).map_err(|e| e.code)?;
+                authorize_tree_transition(&current.tree, &tree, a, &s.authorities, &s.scope())
+                    .map_err(|e| core_error(e).code)?;
+                Ok((200, vec![], tree))
+            }
+            MergeOutcome::Conflicted { alternatives } => {
+                crate::reconciliation::conflicts_visible(s, view, current, &alternatives)
+                    .map_err(|e| e.code)?;
+                let mut reasons: Vec<_> = alternatives.iter().map(|c| c.reason).collect();
+                reasons.sort();
+                Ok((409, reasons, current.tree.clone()))
+            }
+        }
+    }
+    /// Only the caller-visible part of an outcome may be compared across variants.
+    fn in_scope(outcome: &Outcome) -> Shown {
+        // Each variant uses its own fixture (fresh identities): compare locations and values.
+        outcome.clone().map(|(status, reasons, tree)| {
+            let shown = tree
+                .entries
+                .into_iter()
+                .filter(|e| e.path.starts_with("reports"))
+                .map(|e| (e.path, e.mode, e.content))
+                .collect();
+            (status, reasons, shown)
+        })
+    }
+    #[test]
+    fn r20_delete_beneath_a_deleted_or_moved_out_folder_is_identical() {
+        // The caller deletes F/old.txt offline; others delete F, or move F out of scope.
+        let mut outcomes = vec![];
+        for variant in ["deleted", "moved"] {
+            let mut s = folder_fixture();
+            let derived = offline(&s, |t| t.entries.retain(|e| e.path != "reports/F/old.txt"));
+            others(&mut s, variant, "reports/F");
+            outcomes.push(integration(&s, &derived));
+        }
+        assert_eq!(in_scope(&outcomes[0]), in_scope(&outcomes[1]));
+        assert_eq!(outcomes[0].as_ref().map(|o| o.0), Ok(200));
+        // Nothing is written out of scope: the moved folder keeps old.txt unchanged.
+        let moved = &outcomes[1].as_ref().unwrap().2;
+        assert!(moved.entries.iter().any(|e| e.path == "secret/F/old.txt"));
+    }
+    #[test]
+    fn r20_edit_of_an_entry_moved_out_of_a_deleted_or_moved_out_folder_is_identical() {
+        // Others move F/z.txt to reports/z.txt, then delete F or move F out of scope; the
+        // caller edits z at its old location offline.
+        let mut outcomes = vec![];
+        for variant in ["deleted", "moved"] {
+            let mut s = folder_fixture();
+            let derived = offline(&s, |t| at(t, "reports/F/z.txt").content = hole(5));
+            let current = &mut s.current.as_mut().unwrap().tree;
+            let reports = current.entries[0].id.clone();
+            let z = at(current, "reports/F/z.txt");
+            z.path = "reports/z.txt".into();
+            z.parent = reports;
+            current.entries.sort_by(|x, y| x.path.cmp(&y.path));
+            others(&mut s, variant, "reports/F");
+            outcomes.push(integration(&s, &derived));
+        }
+        assert_eq!(in_scope(&outcomes[0]), in_scope(&outcomes[1]));
+        let (status, _, mut tree) = outcomes[0].clone().unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(at(&mut tree, "reports/z.txt").content, hole(5));
+        let moved = &outcomes[1].as_ref().unwrap().2;
+        assert!(!moved.entries.iter().any(|e| e.path == "secret/F/z.txt"));
+    }
+    #[test]
+    fn r20_edit_and_creation_beneath_a_deleted_or_moved_out_folder_are_identical() {
+        // R14 edit/delete and R19-B creation beneath the folder: identical retained conflicts.
+        for change in [0, 1] {
+            let mut outcomes = vec![];
+            for variant in ["deleted", "moved"] {
+                let mut s = folder_fixture();
+                let derived = offline(&s, |t| {
+                    if change == 0 {
+                        at(t, "reports/F/old.txt").content = hole(7);
+                    } else {
+                        let mut new = at(t, "reports/F/old.txt").clone();
+                        new.id = EntryId::random().unwrap();
+                        new.path = "reports/F/new.txt".into();
+                        t.entries.push(new);
+                    }
+                });
+                others(&mut s, variant, "reports/F");
+                outcomes.push(integration(&s, &derived));
+            }
+            assert_eq!(
+                in_scope(&outcomes[0]),
+                in_scope(&outcomes[1]),
+                "change {change}"
+            );
+            let reasons = outcomes[0].as_ref().unwrap().1.clone();
+            assert!(
+                reasons.contains(&if change == 0 {
+                    ConflictReason::EditDelete
+                } else {
+                    ConflictReason::DirectoryDelete
+                }),
+                "{reasons:?}"
+            );
+        }
+    }
     #[test]
     fn unchanged_hidden_move_does_not_invalidate_authorized_candidate() {
         let (mut s, derived) = fixture();
@@ -565,33 +809,6 @@ mod tests {
         assert!(authorize_candidate(&s, &derived).is_ok());
     }
     #[test]
-    fn creation_under_moved_out_or_deleted_folder_is_presented_identically() {
-        // R19-B: base has dir `secret`; the candidate creates `secret/new`; others either
-        // deleted `secret` or moved it out of the caller's scope (invisible).
-        let (s, _) = fixture();
-        let base = s.view.as_ref().unwrap().full.tree.clone();
-        let folder = base.entries[1].clone();
-        let mut derived = base.clone();
-        let mut child = folder.clone();
-        child.id = EntryId::random().unwrap();
-        child.path = "secret/new".into();
-        child.parent = folder.id.clone();
-        derived.entries.push(child);
-        let visible = BTreeSet::from([base.root.id.clone(), base.entries[0].id.clone()]);
-        let mut moved = base.clone();
-        moved.entries[1].path = "elsewhere".into();
-        let mut deleted = base.clone();
-        deleted.entries.remove(1);
-        let a = crate::reconciliation::present(&base, &moved, &derived, &visible);
-        let b = crate::reconciliation::present(&base, &deleted, &derived, &visible);
-        assert_eq!(a.left, b.left);
-        assert_eq!(a.right, b.right);
-        assert_eq!(
-            crate::reconciliation::effect(&base, &a),
-            crate::reconciliation::effect(&base, &b)
-        );
-    }
-    #[test]
     fn uncomposable_effect_fails_closed() {
         // R19: the current head turned the touched parent identity into a file; the
         // candidate's child cannot be placed, so authorization denies instead of skipping.
@@ -608,26 +825,5 @@ mod tests {
             authorize_candidate(&s, &derived).unwrap_err().code,
             "not_found"
         );
-    }
-    #[test]
-    fn hidden_touched_identities_are_presented_as_absent() {
-        // R14: edit vs moved-out-of-scope becomes edit/delete (head side absent); delete vs
-        // moved-out-of-scope is moot and keeps the hidden head entry.
-        let (s, _) = fixture();
-        let base = s.view.as_ref().unwrap().full.tree.clone();
-        let mut current = base.clone();
-        current.entries[1].path = "elsewhere".into();
-        let visible = BTreeSet::from([current.root.id.clone(), current.entries[0].id.clone()]);
-        let mut edited = base.clone();
-        edited.entries[1].mode = 0o750;
-        let p = crate::reconciliation::present(&base, &current, &edited, &visible);
-        assert_eq!(p.hidden_edits, BTreeSet::from([base.entries[1].id.clone()]));
-        assert!(!p.left.entries.iter().any(|e| e.id == base.entries[1].id));
-        let mut deleted = base.clone();
-        deleted.entries.remove(1);
-        let p = crate::reconciliation::present(&base, &current, &deleted, &visible);
-        assert!(p.hidden_edits.is_empty());
-        assert_eq!(p.left, current);
-        assert!(p.right.entries.iter().any(|e| e == &base.entries[1]));
     }
 }

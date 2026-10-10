@@ -48,13 +48,18 @@ retained conflicts) and also private submission and receipt replay (rulings R12,
 R17): the read action and the caller's own issued base; the candidate's delta with current
 metadata for identities the caller can still see at their current location; and its effect
 at the *current locations* of what it touches (current scope and write permission).
-Visible changes by others to untouched entries never deny. Touched identities that others
-deleted, moved out of the caller's scope or made unreadable — and untouched ancestors of
-touched or created entries in the same state (R19) — are presented identically as
-absent on the head side; an effect that cannot be composed at current locations is
-denied, never skipped: an edit becomes a retained `edit_delete` conflict (the caller's
-alternative kept, never writable there), a deletion of such an identity is moot and keeps
-the hidden head entry. Competing renames are retained conflicts. A revoked or narrowed
+Visible changes by others to untouched entries never deny. Ruling R20: the effect and the
+merge are computed entirely in the caller's *current authorized projection* — base = the
+candidate's original projected view, current = the head projected for the caller now,
+candidate = the candidate in that projection space. Entries outside the current projection
+are never merge inputs and are reinserted unchanged; a result that would replace, move or
+orphan one is denied (`404`, as a hidden collision). An identity of the original projection
+that is absent from the current one coalesces identically whether others deleted it, moved
+it out of the caller's scope or made it unreadable: a caller deletion of it (or of anything
+beneath it) is moot and keeps the hidden entry, an edit becomes a retained `edit_delete`
+conflict (the caller's alternative kept, never writable there), a creation beneath it a
+retained `directory_delete` conflict. An effect that cannot be composed at current
+locations is denied, never skipped (R19). Competing renames are retained conflicts. A revoked or narrowed
 submitter is denied with no 409 result or conflict row. Otherwise:
 
 1. A candidate whose revision or unpublished ancestry carried
@@ -63,8 +68,9 @@ submitter is denied with no 409 result or conflict row. Otherwise:
    or merged: one whole-candidate `unknown_causality` conflict is retained with
    base/current/candidate alternatives (rulings R1/R6/R10).
 2. A candidate based on the current head fast-forwards exactly as in A.
-3. Otherwise the original private candidate (lifted to the full tree) is merged with
-   its recorded full base and the current full destination. Ruling R11: using the
+3. Otherwise the original private candidate is merged with its original projected base
+   and the current head in the caller's current projection (R20), hidden entries
+   reinserted unchanged. Ruling R11: using the
    caller's own issued view as a write base (candidate submission, integration, merge,
    receipt replay) does not need `history`; reading an old view's descriptor or objects
    still does. Text inputs are read from verified storage
@@ -175,10 +181,24 @@ resumes. `--operation-id` resumes an interrupted resolution with its frozen requ
 `hidden`, and keeps previously shared entries it can no longer see at their head value.
 Ruling R18: keeping a version of a previously shared identity whose head side is absent to
 the caller (deleted, or moved out of its scope) always re-creates it under a fresh identity
-at its in-scope path; the service refuses re-use of an identity absent from the caller's
-issued base view (hidden head identities, identities named by recorded conflicts) with the
-same `404`. The re-created file loses identity continuity; the conflict alternatives keep
-the link.
+at its in-scope path. The re-created file loses identity continuity; the conflict
+alternatives keep the link. Ruling R21: the service keeps a namespace identity registry
+(`namespace_entries`: every identity ever published in a shared revision; created and
+backfilled once by migration 004 from the revisions that were ever a branch head, then
+maintained in every publishing commit). An identity a submission introduces beyond its
+issued base that the registry knows but that is absent from the caller's current projection
+is refused with the same `404` a hidden identity gets — at candidate submission,
+integration, resolution and replay — so a crafted client can neither revive a deleted
+identity (and inherit current permissions over its old versions) nor tell deleted from
+moved out or unreadable. The lookup reads published identities only, never anyone's
+conflicts. Cost: a client that re-submits an identity it saw published and that is then
+deleted before its submission or integration is denied rather than reviving it.
+
+Ruling R22: a lost reply is recovered by `GET /operations/{replica}/{operation}` or the
+exact re-POST. An integration or resolution result (including a retained `409 conflicted`
+with its conflict IDs) is replayed under current rights at current locations (R14/R20,
+R21), identically for deleted and moved-out entries; a private receipt replay keeps A's
+rule that every formerly visible identity of its base is still readable.
 
 Limitation: local composition is opaque, so an entry the service could have text-merged
 takes its chosen side when the same candidate also has real conflicts (choose or replace
@@ -195,6 +215,9 @@ native ordinary-folder owners on macOS and Linux, and exercises disconnected com
 and text merges, text/binary/namespace conflicts with atomic non-publication, alternative
 export and explicit absence, delayed and commit-raced resolution, the unknown-causality
 hold → conflict → resolution → resumed application path on both OSes, scoped
-hidden-sibling/move/collision/revocation negatives, the killable worker deadline and a
-service killed between generated-object installation and commit. Exit 0/1/2 =
+hidden-sibling/move/collision/revocation negatives, the R20–R22 identity cases (deletion
+or edit beneath a folder deleted vs moved out of scope, crafted identity re-use at
+submission and integration, lost-reply recovery of a retained conflict, registry backfill
+equals upkeep), the killable worker deadline and a service killed between
+generated-object installation and commit. Exit 0/1/2 =
 passed/failed/missing prerequisite.

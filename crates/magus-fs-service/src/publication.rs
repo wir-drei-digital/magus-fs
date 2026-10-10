@@ -117,6 +117,7 @@ pub(crate) async fn seed(
                 )
                 .await?;
                 r::save_revision(&tx, &ns, &req.revision, &bytes, &generations).await?;
+                r::register_entries(&tx, &ns, None, &revision.tree).await?;
                 tx.execute(
                     "INSERT INTO branches(namespace,name,revision,head) VALUES($1,$2,$3,$4)",
                     &[
@@ -229,6 +230,9 @@ pub(crate) async fn integrate(
         let mut generated = vec![];
         // Rulings R12/R14/R17: current rights at current locations before ANY outcome
         // (stale, unknown causality, fast-forward, merge, conflicts) is decided or recorded.
+        // Ruling R21: a candidate never revives a published identity that is now absent
+        // from the caller's projection (refused before any outcome, like at submission).
+        submission::refuse_revived(&state, &s, &submission::entry_ids([&derived.tree])).await?;
         submission::authorize_retained(&s, derived)?;
         let decision = if s.head.as_deref() != Some(req.expected_head.as_str()) {
             Decision::Stale
@@ -264,23 +268,19 @@ pub(crate) async fn integrate(
                 .await?;
             // R14: touched identities deleted or moved out of the caller's current scope by
             // others are presented as absent on the head side.
-            let visible = crate::reconciliation::caller_visible(
+            let merge = crate::reconciliation::CallerMerge::new(
+                view,
                 current,
+                &derived.tree,
                 s.authority()?,
                 &s.context.prefixes,
             )?;
-            let presented = crate::reconciliation::present(
-                &view.full.tree,
-                &current.tree,
-                &derived.tree,
-                &visible,
-            );
             match crate::reconciliation::reconcile(
                 &state,
                 &ns,
-                &view.full.tree,
-                &presented.left,
-                &presented.right,
+                &merge.base,
+                &merge.current,
+                &merge.candidate,
                 &policy,
             )
             .await?
@@ -290,6 +290,7 @@ pub(crate) async fn integrate(
                     generated: objects,
                     mechanically_merged,
                 } => {
+                    let tree = merge.complete(tree)?;
                     let merged = Revision {
                         format: FORMAT.into(),
                         hash: HASH.into(),
@@ -360,6 +361,7 @@ pub(crate) async fn integrate(
    if let (Decision::Publish{provenance,..},Some((id,bytes,required,paths)))=(decision,published){
     let generations=r::ready(&tx,&current,required,None,required).await?;
     if id != derived_id { r::save_revision(&tx,&current.namespace,id,bytes,&generations).await?; }
+    if let (Decision::Publish{revision,..},Some(head))=(decision,s.current.as_ref()) { r::register_entries(&tx,&current.namespace,Some(&head.tree),&revision.tree).await?; }
     tx.execute("UPDATE branches SET revision=$3,head=$4 WHERE namespace=$1 AND name=$2",&[&current.namespace,&req.branch.as_str(),&id.as_str(),&receipt.head.as_str()]).await?;
     tx.execute("INSERT INTO changes(namespace,branch,head,paths) VALUES($1,$2,$3,$4)",&[&current.namespace,&req.branch.as_str(),&receipt.head.as_str(),paths]).await?;
     if let Some(p)=provenance { tx.execute("INSERT INTO revision_provenance(namespace,revision,kind,operation,payload,digest) VALUES($1,$2,'merge',$3,$4,$5)",&[&current.namespace,&id.as_str(),&req.operation.as_str(),p,&auth::digest(p.as_bytes())]).await?; }

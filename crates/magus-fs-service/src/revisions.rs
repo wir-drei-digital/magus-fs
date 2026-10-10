@@ -277,6 +277,32 @@ pub(crate) async fn save_revision(
     tx.execute("INSERT INTO revision_objects(namespace,revision,object_id,generation) SELECT $1,$2,unnest($3::text[]),unnest($4::text[]) ON CONFLICT DO NOTHING",&[&ns,&id.as_str(),&ids,&values]).await?;
     Ok(())
 }
+/// Ruling R21: registers the identities a newly shared head publishes (additive; the
+/// previous head is already registered by its own publication or the migration backfill).
+pub(crate) async fn register_entries(
+    tx: &Transaction<'_>,
+    ns: &str,
+    previous: Option<&Tree>,
+    published: &Tree,
+) -> Result<()> {
+    let before: std::collections::BTreeSet<&EntryId> = previous
+        .map(|t| t.entries.iter().map(|e| &e.id).collect())
+        .unwrap_or_default();
+    let ids: Vec<String> = published
+        .entries
+        .iter()
+        .filter(|e| !before.contains(&e.id))
+        .map(|e| e.id.as_str().to_owned())
+        .collect();
+    if !ids.is_empty() {
+        tx.execute(
+            "INSERT INTO namespace_entries(namespace,entry) SELECT $1,unnest($2::text[]) ON CONFLICT DO NOTHING",
+            &[&ns, &ids],
+        )
+        .await?;
+    }
+    Ok(())
+}
 pub(crate) async fn branch_for_view(
     database: &db::Database,
     c: &AuthContext,

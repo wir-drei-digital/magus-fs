@@ -620,6 +620,8 @@ pub(crate) async fn resolve(
             if unknown_causality(&state, &c, &req.replacement, derived).await? {
                 return Err(Error::invalid("invalid_resolution"));
             }
+            // Ruling R21: never revive a published identity absent from the projection.
+            submission::refuse_revived(&state, &s, &submission::entry_ids([&derived.tree])).await?;
             // Current rights and scope over the complete replacement; never broadens access.
             submission::authorize_candidate(&s, derived)?;
             let mut candidates = targets
@@ -668,8 +670,9 @@ pub(crate) async fn resolve(
             "current":r::rid(current)?,"candidates":resolved.parents,
         }))?;
         let bytes = r::encode(&resolved)?;
+        let resolved_tree = resolved.tree.clone();
         barrier("resolution").await;
-        let commit = state.db.acquire().await?.run(|db| { let req=&req; let serialized=&serialized; let ids=&ids; let candidate=&candidate; let original=&original; let receipt=&receipt; let result=&result; let paths=&paths; let required=&required; let bytes=&bytes; let resolved_id=&resolved_id; let derived_id=&derived_id; let provenance=&provenance; let s=&s; let superseded=&superseded; Box::pin(async move {
+        let commit = state.db.acquire().await?.run(|db| { let req=&req; let serialized=&serialized; let ids=&ids; let candidate=&candidate; let original=&original; let receipt=&receipt; let result=&result; let paths=&paths; let required=&required; let bytes=&bytes; let resolved_id=&resolved_id; let derived_id=&derived_id; let provenance=&provenance; let s=&s; let superseded=&superseded; let resolved_tree=&resolved_tree; Box::pin(async move {
             let tx = db.transaction().await?;
             let current = r::recheck(&tx, s, "integrate").await?;
             if tx.query_opt("SELECT operation FROM operations WHERE namespace=$1 AND replica=$2 AND operation=$3",&[&current.namespace,&current.replica,&req.operation.as_str()]).await?.is_some() {
@@ -683,6 +686,7 @@ pub(crate) async fn resolve(
                 }
                 let generations = r::ready(&tx, &current, required, None, required).await?;
                 r::save_revision(&tx, &current.namespace, resolved_id, bytes, &generations).await?;
+                r::register_entries(&tx, &current.namespace, s.current.as_ref().map(|c| &c.tree), resolved_tree).await?;
                 tx.execute("UPDATE branches SET revision=$3,head=$4 WHERE namespace=$1 AND name=$2",&[&current.namespace,&candidate.branch,&resolved_id.as_str(),&receipt.head.as_str()]).await?;
                 tx.execute("INSERT INTO changes(namespace,branch,head,paths) VALUES($1,$2,$3,$4)",&[&current.namespace,&candidate.branch,&receipt.head.as_str(),paths]).await?;
             }

@@ -322,10 +322,6 @@ pub(crate) fn caller_visible(
     ids.insert(current.tree.root.id.clone());
     Ok(ids)
 }
-fn fields(e: &Entry) -> (&EntryId, &str, &PrincipalId, &GroupId, u16, &EntryContent) {
-    let leaf = e.path.rsplit('/').next().unwrap_or(&e.path);
-    (&e.parent, leaf, &e.owner, &e.group, e.mode, &e.content)
-}
 fn without(tree: &Tree, ids: &BTreeSet<EntryId>) -> Tree {
     let mut doomed = ids.clone();
     loop {
@@ -350,77 +346,6 @@ fn without(tree: &Tree, ids: &BTreeSet<EntryId>) -> Tree {
             .collect(),
     }
 }
-/// Ruling R14: the caller's view of a stale merge. Identities the candidate touched that
-/// others deleted *or* moved out of the caller's current scope (or made unreadable) are
-/// both presented as absent on the head side: an edit becomes a retained edit/delete
-/// conflict with the caller's alternative kept (and can never be written there); a
-/// deletion of such an identity is moot and leaves the hidden head entry untouched.
-pub(crate) struct Presented {
-    pub left: Tree,
-    pub right: Tree,
-    pub hidden_edits: BTreeSet<EntryId>,
-}
-pub(crate) fn present(
-    base: &Tree,
-    current: &Tree,
-    derived: &Tree,
-    visible: &BTreeSet<EntryId>,
-) -> Presented {
-    let index = |t: &Tree| {
-        t.entries
-            .iter()
-            .map(|e| (e.id.clone(), e.clone()))
-            .collect::<BTreeMap<_, _>>()
-    };
-    let (b, c, r) = (index(base), index(current), index(derived));
-    let mut hidden_edits = BTreeSet::new();
-    let mut hidden_ancestors = BTreeSet::new();
-    let mut restore = vec![];
-    for id in b.keys().chain(r.keys()).collect::<BTreeSet<_>>() {
-        let touched = match (b.get(id), r.get(id)) {
-            (Some(x), Some(y)) => fields(x) != fields(y),
-            (None, None) => false,
-            _ => true,
-        };
-        if !touched {
-            continue;
-        }
-        // R19-B: an untouched ancestor of a touched (or created) entry that others deleted or
-        // moved out of scope is likewise absent on the head side, so creating beneath a
-        // moved-out folder behaves exactly like creating beneath a deleted one.
-        let mut parent = r.get(id).or(b.get(id)).map(|e| e.parent.clone());
-        let mut steps = 0;
-        while let Some(p) = parent {
-            if steps > MAX_ENTRIES || (!b.contains_key(&p) && !r.contains_key(&p)) {
-                break;
-            }
-            if c.contains_key(&p) && !visible.contains(&p) {
-                hidden_ancestors.insert(p.clone());
-            }
-            parent = r.get(&p).or(b.get(&p)).map(|e| e.parent.clone());
-            steps += 1;
-        }
-        if !c.contains_key(id) || visible.contains(id) {
-            continue;
-        }
-        match (b.get(id), r.get(id)) {
-            (_, Some(_)) => {
-                hidden_edits.insert(id.clone());
-            }
-            (Some(old), None) => restore.push(old.clone()),
-            (None, None) => {}
-        }
-    }
-    let mut right = derived.clone();
-    right.entries.extend(restore);
-    right.entries.sort_by(|x, y| x.path.cmp(&y.path));
-    let absent = hidden_edits.union(&hidden_ancestors).cloned().collect();
-    Presented {
-        left: without(current, &absent),
-        right,
-        hidden_edits,
-    }
-}
 /// Reconciliation of an explicit selection never reads content (opaque policy).
 pub(crate) struct NoContent;
 impl MergeContent for NoContent {
@@ -431,21 +356,103 @@ impl MergeContent for NoContent {
         Err(FsError::UnsupportedMode)
     }
 }
-/// The candidate's effect at the *current* locations of what it touched (hidden touched
-/// identities excluded): the tree a merge preferring the candidate would produce. `None`
-/// when that composition is structurally unresolvable (integration retains conflicts).
-pub(crate) fn effect(base: &Tree, presented: &Presented) -> Option<Tree> {
-    // Callers fail closed on None (ruling R19): no current-location check is ever skipped.
-    let tree = resolve_trees(
-        base,
-        &presented.left,
-        &presented.right,
-        &MergePolicy::opaque(),
-        &NoContent,
-        Side::Right,
-    )
-    .ok()?;
-    Some(without(&tree, &presented.hidden_edits))
+
+/// Ruling R20: stale-candidate reconciliation runs entirely in the caller's CURRENT
+/// authorized projection: base = the candidate's original projected view, left (current) =
+/// the current head projected for the caller now, right (candidate) = the candidate in that
+/// projection space. Entries outside the caller's current projection are never merge inputs
+/// and are reinserted unchanged. An identity of the original projection that is absent from
+/// the current one therefore coalesces as already deleted (a caller deletion) or as
+/// edit/delete (a caller edit) whatever the reason for its absence: deleted, moved out of
+/// scope or made unreadable by others are indistinguishable, and are never written.
+pub(crate) struct CallerMerge {
+    pub base: Tree,
+    pub current: Tree,
+    pub candidate: Tree,
+    /// Current head entries outside the caller's current projection.
+    hidden: Vec<Entry>,
+}
+impl CallerMerge {
+    pub(crate) fn new(
+        view: &r::BoundView,
+        current: &Revision,
+        derived: &Tree,
+        a: &Authority,
+        prefixes: &[String],
+    ) -> Result<Self> {
+        let projected = crate::views::project(current, &current.tree, a, prefixes)?.tree;
+        let shown: BTreeSet<&EntryId> = projected.entries.iter().map(|e| &e.id).collect();
+        let hidden = current
+            .tree
+            .entries
+            .iter()
+            .filter(|e| !shown.contains(&e.id))
+            .cloned()
+            .collect();
+        // The lifted candidate without the entries that were hidden from it at its base.
+        let issued: BTreeSet<&EntryId> =
+            view.projected.tree.entries.iter().map(|e| &e.id).collect();
+        let lifted: BTreeSet<&EntryId> = view
+            .full
+            .tree
+            .entries
+            .iter()
+            .map(|e| &e.id)
+            .filter(|id| !issued.contains(id))
+            .collect();
+        let candidate = Tree {
+            root: derived.root.clone(),
+            entries: derived
+                .entries
+                .iter()
+                .filter(|e| !lifted.contains(&e.id))
+                .cloned()
+                .collect(),
+        };
+        Ok(Self {
+            base: view.projected.tree.clone(),
+            current: projected,
+            candidate,
+            hidden,
+        })
+    }
+    /// The full tree: a result over the projection plus every hidden entry unchanged. A
+    /// result that would replace, move or orphan a hidden entry (or collide with one) is
+    /// refused with the same `not_found` as a hidden collision at submission.
+    pub(crate) fn complete(&self, merged: Tree) -> Result<Tree> {
+        let mut tree = merged;
+        tree.entries.extend(self.hidden.iter().cloned());
+        tree.entries.sort_by(|x, y| x.path.cmp(&y.path));
+        match validate_tree(&tree) {
+            Ok(()) => Ok(tree),
+            Err(FsError::LimitExceeded) => Err(Error::limit()),
+            Err(_) => Err(Error::not_found()),
+        }
+    }
+    /// The candidate's effect at the current locations of what it touches: the full tree a
+    /// merge preferring the candidate would produce, never placing an identity of the
+    /// original projection that is absent from the current one (nor anything beneath it).
+    /// Callers fail closed on `Err` (ruling R19): no current-location check is skipped.
+    pub(crate) fn effect(&self) -> Result<Tree> {
+        let tree = resolve_trees(
+            &self.base,
+            &self.current,
+            &self.candidate,
+            &MergePolicy::opaque(),
+            &NoContent,
+            Side::Right,
+        )
+        .map_err(|_| Error::not_found())?;
+        let present: BTreeSet<&EntryId> = self.current.entries.iter().map(|e| &e.id).collect();
+        let absent = self
+            .base
+            .entries
+            .iter()
+            .map(|e| e.id.clone())
+            .filter(|id| !present.contains(id))
+            .collect();
+        self.complete(without(&tree, &absent))
+    }
 }
 
 /// Conflicts are only disclosed when every identity they name was visible to the caller:

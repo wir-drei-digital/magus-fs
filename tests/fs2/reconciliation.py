@@ -21,7 +21,7 @@ def sha(data): return hashlib.sha256(data).hexdigest()
 def lines(*items): return ''.join(i + '\n' for i in items).encode()
 
 class Reconciliation(NativeJourney):
-    PHASES = ['merge', 'conflicts', 'unknown', 'scoped', 'worker']
+    PHASES = ['merge', 'conflicts', 'unknown', 'scoped', 'identity', 'worker']
     def __init__(self, i, image, platforms, phases=None):
         super().__init__(i, image, platforms, 'reconciliation');self.faulted = False;self.phases = phases or self.PHASES
     # ---------- shared helpers ----------
@@ -96,6 +96,7 @@ class Reconciliation(NativeJourney):
         if 'unknown' in self.phases:
             for ep in self.endpoints:self.unknown_causality(ep)
         if 'scoped' in self.phases:self.scoped_negatives()
+        if 'identity' in self.phases:self.identity_rulings()
         if 'worker' in self.phases:self.worker_deadline_and_atomicity()
 
     def warm_storage(self):
@@ -114,8 +115,8 @@ class Reconciliation(NativeJourney):
     def protocol_surface(self):
         status, health = self.request('GET', '/health');assert status == 200 and health == {'protocol': 'magus-fs/service-v1', 'status': 'ok'}, health
         status, caps = self.request('GET', '/capabilities', actor='0' * 64);assert status == 200 and caps == {'protocol': 'magus-fs/service-v1', 'capabilities': ['collaboration-v1']}, caps
-        tables = self.sql("SELECT string_agg(table_name,',' ORDER BY table_name) FROM information_schema.tables WHERE table_name IN ('conflicts','conflict_alternatives','conflict_resolutions','revision_provenance','candidate_causality','branch_merge_policy');")
-        assert tables == 'branch_merge_policy,candidate_causality,conflict_alternatives,conflict_resolutions,conflicts,revision_provenance', tables
+        tables = self.sql("SELECT string_agg(table_name,',' ORDER BY table_name) FROM information_schema.tables WHERE table_name IN ('conflicts','conflict_alternatives','conflict_resolutions','revision_provenance','candidate_causality','branch_merge_policy','namespace_entries');")
+        assert tables == 'branch_merge_policy,candidate_causality,conflict_alternatives,conflict_resolutions,conflicts,namespace_entries,revision_provenance', tables
         assert json.loads(self.sql("SELECT policy FROM branch_merge_policy WHERE branch='main';")) == {'text_extensions': ['txt']}
         self.expect('conflicts-unauthenticated', 'GET', self.root + '/conflicts', 401, actor='0' * 64)
         self.record('service', 'protocol-surface', health=health, capabilities=caps, tables=tables)
@@ -618,6 +619,122 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         assert [e['path'] for e in moved] == ['secret/r18-mv.txt'] and self.body(av, after['secret/r18-mv.txt']) == b'reports/r18-mv.txt v0'
         self.ready_files(ep, c, {p: ('offline ' + p).encode() for p in ids}, resolved['shared_receipt']['head'], 25);ep.stop(c)
         self.record('macos', 'r18-scoped-keep-edit-deleted-vs-moved-out', conflicts=items, shapes=shapes, resolution=resolved, recreated={p: after[p]['id'] for p in ids}, original=ids)
+    def identity_rulings(self):
+        """Round 4 (R20-R22) through direct service requests of a `reports`-scoped writer. Every
+        pair differs only in whether others deleted an entry or moved it out of the writer's
+        scope; each pair must be indistinguishable, and nothing is written out of scope."""
+        replica = 'replica:' + f'{9:032x}'
+        code, grant = self.request('POST', self.root + '/grants', body={'delegate': {'replica': replica, 'expires': int(time.time()) + 1800, 'actions': ['read', 'write', 'history', 'integrate'], 'branches': ['main'], 'prefixes': ['reports']}})
+        assert code == 200, (code, grant);self.tokens['scoped'] = grant['token'];self.i.private('scoped-token', grant['token'])
+        def entry(t, path):return next(e for e in t['entries'] if e['path'] == path)
+        def mkdir(path):
+            return lambda t: t['entries'].append({'path': path, 'id': identity('entry'), 'parent': entry(t, path.rsplit('/', 1)[0])['id'], 'owner': ALICE, 'group': GROUP, 'mode': 493, 'content': {'kind': 'directory'}})
+        def rm_tree(path):return lambda t: t.update(entries=[e for e in t['entries'] if e['path'] != path and not e['path'].startswith(path + '/')])
+        def mv_tree(src, dst):
+            def mutate(t):
+                parent = entry(t, dst.rsplit('/', 1)[0])['id']
+                for e in t['entries']:
+                    if e['path'] == src:e['path'] = dst;e['parent'] = parent
+                    elif e['path'].startswith(src + '/'):e['path'] = dst + e['path'][len(src):]
+            return mutate
+        def others(variant, path):
+            return rm_tree(path) if variant == 'deleted' else mv_tree(path, 'secret/' + path.split('/', 1)[1])
+        def edit(r, path, body):
+            e = entry(r['tree'], path);e['content'] = file_entry('x', e['parent'], body)['content'];return e
+        def integrate(private):
+            return self.request('POST', self.root + '/integrations', actor='scoped', body=self.integrate_request(private, {'head': self.head()}))
+        def reasons(body):return sorted(x['reason'] for x in self.conflicts('scoped') if x['id'] in (body or {}).get('conflicts', []))
+        def outcome(status, body):return (status, body.get('code') if status != 200 else None, reasons(body) if status == 409 else [])
+        variants = ['deleted', 'moved']
+        # R20 (i): the writer deletes F/old.txt offline; others delete F or move F out of scope.
+        for v in variants:
+            self.publish_tree(mkdir('reports/r20i-' + v), label='r20i-folder')
+            for name in ['old.txt', 'keep.txt']:self.set_file('reports/r20i-' + v + '/' + name, ('r20i ' + v + ' ' + name).encode(), 'r20i-file')
+        sv, sr = self.view('scoped')
+        for v in variants:self.publish_tree(others(v, 'reports/r20i-' + v), label='r20i-others-' + v)
+        r20i = {}
+        for v in variants:
+            rr = copy.deepcopy(sr);rr['tree']['entries'].remove(entry(rr['tree'], 'reports/r20i-' + v + '/old.txt'))
+            _, private = self.submit('scoped', replica, copy.deepcopy(sv), rr, [])
+            r20i[v] = outcome(*integrate(private))
+        av, files, _ = self.tree()
+        r20i_moved_intact = 'secret/r20i-moved/old.txt' in files and self.body(av, files['secret/r20i-moved/old.txt']) == b'r20i moved old.txt'
+        # R20 (ii): others move F/z.txt to a visible spot, then delete or move F; the writer
+        # edits z at its old location offline.
+        for v in variants:
+            self.publish_tree(mkdir('reports/r20ii-' + v), label='r20ii-folder')
+            for name in ['z.txt', 'other.txt']:self.set_file('reports/r20ii-' + v + '/' + name, ('r20ii ' + v + ' ' + name).encode(), 'r20ii-file')
+        sv, sr = self.view('scoped')
+        for v in variants:
+            def lift_z(t, v=v):
+                z = entry(t, 'reports/r20ii-' + v + '/z.txt');z['path'] = 'reports/r20ii-' + v + '-z.txt';z['parent'] = entry(t, 'reports')['id']
+            self.publish_tree(lift_z, label='r20ii-move-z-' + v)
+            self.publish_tree(others(v, 'reports/r20ii-' + v), label='r20ii-others-' + v)
+        r20ii = {}
+        for v in variants:
+            rr = copy.deepcopy(sr);body = ('scoped edit z ' + v).encode();edit(rr, 'reports/r20ii-' + v + '/z.txt', body)
+            _, private = self.submit('scoped', replica, copy.deepcopy(sv), rr, [body])
+            r20ii[v] = outcome(*integrate(private))
+        av, files, _ = self.tree()
+        r20ii_bytes = {v: self.body(av, files['reports/r20ii-' + v + '-z.txt']) if 'reports/r20ii-' + v + '-z.txt' in files else None for v in variants}
+        r20ii_moved_intact = 'secret/r20ii-moved/other.txt' in files and 'secret/r20ii-moved/z.txt' not in files
+        # R21 (submission): a crafted candidate re-uses the identity of an entry others deleted
+        # outside any conflict, or moved out of scope; identical refusal, nothing revived.
+        for v in variants:self.set_file('reports/r21-' + v + '.txt', ('r21 ' + v).encode(), 'r21-seed')
+        _, seen, _ = self.tree('scoped');ids = {v: seen['reports/r21-' + v + '.txt']['id'] for v in variants}
+        for v in variants:self.publish_tree(others(v, 'reports/r21-' + v + '.txt'), label='r21-others-' + v)
+        fv, fr = self.view('scoped');reports = entry(fr['tree'], 'reports')['id']
+        r21 = {}
+        for v in variants:
+            rr = copy.deepcopy(fr);f = file_entry('reports/r21-reuse-' + v + '.txt', reports, b'revived');f['id'] = ids[v];rr['tree']['entries'].append(f)
+            r21[v] = self.request('POST', self.root + '/candidates', actor='scoped', body=self.submit_request(replica, fv, rr, [b'revived']))
+        _, files, full = self.tree()
+        r21_revived = sorted(e['path'] for e in full['tree']['entries'] if e['id'] in ids.values())
+        # R21 (integration): an identity visible when the crafted candidate was submitted but
+        # deleted or moved out of scope before its integration is never revived either.
+        v0, r0 = self.view('scoped');reports = entry(r0['tree'], 'reports')['id']
+        for v in variants:self.set_file('reports/r21i-' + v + '.txt', ('r21i ' + v).encode(), 'r21i-seed')
+        _, seen, _ = self.tree('scoped')
+        late = {}
+        for v in variants:
+            rr = copy.deepcopy(r0);rr['tree']['entries'].append(copy.deepcopy(seen['reports/r21i-' + v + '.txt']))
+            _, late[v] = self.submit('scoped', replica, copy.deepcopy(v0), rr, [('r21i ' + v).encode()])
+        for v in variants:self.publish_tree(others(v, 'reports/r21i-' + v + '.txt'), label='r21i-others-' + v)
+        r21i = {v: integrate(late[v]) for v in variants}
+        _, files, _ = self.tree()
+        r21i_revived = sorted(p for p in files if p.startswith('reports/r21i-'))
+        # R22: the reply of a recorded edit_delete integration is lost after its commit; the
+        # result is recovered by operation lookup and by exact replay, identically.
+        for v in variants:self.set_file('reports/r22-' + v + '.txt', ('r22 ' + v).encode(), 'r22-seed')
+        lv, lr = self.view('scoped')
+        for v in variants:self.publish_tree(others(v, 'reports/r22-' + v + '.txt'), label='r22-others-' + v)
+        r22 = {}
+        for v in variants:
+            rr = copy.deepcopy(lr);body = ('scoped r22 ' + v).encode();edit(rr, 'reports/r22-' + v + '.txt', body)
+            _, private = self.submit('scoped', replica, copy.deepcopy(lv), rr, [body])
+            integration = self.integrate_request(private, {'head': self.head()})
+            self.drop_response(self.root + '/integrations', integration, 'scoped')
+            looked = self.request('GET', self.op_path(integration), actor='scoped')
+            replayed = self.request('POST', self.root + '/integrations', actor='scoped', body=integration)
+            r22[v] = {'lookup': outcome(*looked), 'replay_equal': replayed == looked, 'conflicts': len((looked[1] or {}).get('conflicts', []))}
+        # R21 registry upkeep: the incrementally maintained registry equals the one-time
+        # backfill from immutable published revisions (dropped here in the owned synthetic
+        # database only; the restarted service's migration recreates and backfills it).
+        registry = lambda: self.sql("SELECT count(*)||':'||md5(string_agg(entry,',' ORDER BY entry)) FROM namespace_entries WHERE namespace='" + NS + "';")
+        maintained = registry();self.stop_service();self.sql('DROP TABLE namespace_entries;');self.start_service();backfilled = registry()
+        self.record('service', 'r20-r22-identity', registry_maintained=maintained, registry_backfilled=backfilled, r20i=r20i, r20i_moved_intact=r20i_moved_intact, r20ii=r20ii, r20ii_bytes={v: (b or b'').decode() for v, b in r20ii_bytes.items()},
+                    r20ii_moved_intact=r20ii_moved_intact, r21=r21, r21_revived=r21_revived, r21_integration=r21i, r21i_revived=r21i_revived, r22=r22)
+        assert r20i['deleted'] == r20i['moved'] == (200, None, []) and r20i_moved_intact, r20i
+        assert r20ii['deleted'] == r20ii['moved'] == (200, None, []) and r20ii_moved_intact, r20ii
+        assert all(r20ii_bytes[v] == ('scoped edit z ' + v).encode() for v in variants), r20ii_bytes
+        assert r21['deleted'] == r21['moved'] == (404, {'code': 'not_found'}) and r21_revived == ['secret/r21-moved.txt'], (r21, r21_revived)
+        assert r21i['deleted'] == r21i['moved'] == (404, {'code': 'not_found'}) and r21i_revived == [], (r21i, r21i_revived)
+        assert maintained == backfilled and not maintained.startswith('0:'), (maintained, backfilled)
+        assert r22['deleted'] == r22['moved'] == {'lookup': (409, 'conflicted', ['edit_delete']), 'replay_equal': True, 'conflicts': 1}, r22
+    def submit_request(self, replica, view, r, bodies):
+        r['parents'] = [view['revision']];r['replica'] = replica;r['operation'] = identity('operation')
+        upload, rid = self.stage(r, 'scoped', bodies)
+        return {'operation': r['operation'], 'replica': replica, 'original_view': view['view'], 'original_head': view['head'], 'revision': rid, 'upload': upload}
     def submit(self, actor, replica, view, r, bodies):
         r['parents'] = [view['revision']];r['replica'] = replica;r['operation'] = identity('operation')
         upload, rid = self.stage(r, actor, bodies)
