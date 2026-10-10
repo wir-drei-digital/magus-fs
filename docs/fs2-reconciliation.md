@@ -49,8 +49,10 @@ R17): the read action and the caller's own issued base; the candidate's delta wi
 metadata for identities the caller can still see at their current location; and its effect
 at the *current locations* of what it touches (current scope and write permission).
 Visible changes by others to untouched entries never deny. Touched identities that others
-deleted, moved out of the caller's scope or made unreadable are presented identically as
-absent on the head side: an edit becomes a retained `edit_delete` conflict (the caller's
+deleted, moved out of the caller's scope or made unreadable — and untouched ancestors of
+touched or created entries in the same state (R19) — are presented identically as
+absent on the head side; an effect that cannot be composed at current locations is
+denied, never skipped: an edit becomes a retained `edit_delete` conflict (the caller's
 alternative kept, never writable there), a deletion of such an identity is moot and keeps
 the hidden head entry. Competing renames are retained conflicts. A revoked or narrowed
 submitter is denied with no 409 result or conflict row. Otherwise:
@@ -110,9 +112,11 @@ operation; unique per integration and entry), `conflict_alternatives`,
 Alternative views project the side's immutable tree under *current* metadata for
 identities that still exist (a historic mode never reopens access). An identity counts as
 present only at a current location inside the caller's scope: one moved out of scope is
-treated exactly like a deleted one (its historic in-scope versions need `history`; its
-current side is never disclosed), so "moved out of scope" and "deleted" are
-indistinguishable. They are re-authorized on every descriptor/object
+treated exactly like a deleted one (its historic in-scope versions need `history` and keep
+their historic metadata — current permissions apply only where the identity currently
+lies in scope; its current side is never disclosed), so "moved out of scope" and
+"deleted" are indistinguishable. Hidden-sibling decisions (R16) use the same snapshot whose
+head is checked against `expected_head`. They are re-authorized on every descriptor/object
 read and can never be a candidate base.
 
 A resolution names every conflict retained by the integration(s) it resolves that is
@@ -169,6 +173,12 @@ resumes. `--operation-id` resumes an interrupted resolution with its frozen requ
 
 `sync resolve` skips a named conflict that is now hidden (`404`), reports it under
 `hidden`, and keeps previously shared entries it can no longer see at their head value.
+Ruling R18: keeping a version of a previously shared identity whose head side is absent to
+the caller (deleted, or moved out of its scope) always re-creates it under a fresh identity
+at its in-scope path; the service refuses re-use of an identity absent from the caller's
+issued base view (hidden head identities, identities named by recorded conflicts) with the
+same `404`. The re-created file loses identity continuity; the conflict alternatives keep
+the link.
 
 Limitation: local composition is opaque, so an entry the service could have text-merged
 takes its chosen side when the same candidate also has real conflicts (choose or replace
