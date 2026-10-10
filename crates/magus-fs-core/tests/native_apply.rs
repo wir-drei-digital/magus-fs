@@ -1795,3 +1795,80 @@ fn replaced_unverified_root_is_never_captured_or_applied() {
         .unwrap()
         .is_some());
 }
+
+#[test]
+fn local_only_late_writes_are_reported_separately_and_never_managed() {
+    use std::ffi::CString;
+    let (d, rep, n, base) = excluded_fixture();
+    let mut held = fs::OpenOptions::new()
+        .write(true)
+        .open(n.root.join("cache/blob"))
+        .unwrap();
+    let cache = fs::File::open(n.root.join("cache")).unwrap();
+    let mut r = next_of(&rep, &base);
+    put_dir(&mut r, "d", 0o755);
+    let next = import(&rep, &sorted(r), ChunkSource::Unavailable);
+    assert!(ready(&apply(&rep, &next)));
+    held.write_all(b"SQLITE WAL STYLE WRITE").unwrap();
+    held.sync_all().unwrap();
+    let leaf = CString::new("new-cache-file").unwrap();
+    let fd = unsafe {
+        libc::openat(
+            std::os::fd::AsRawFd::as_raw_fd(&cache),
+            leaf.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )
+    };
+    assert!(fd >= 0);
+    unsafe { libc::close(fd) };
+    for _ in 0..3 {
+        let status = rep.scan_native_status().unwrap();
+        assert!(ready(&status.status), "{status:?}");
+        let root = status
+            .displacements
+            .iter()
+            .find(|v| v.path.is_empty())
+            .unwrap();
+        assert!(!root.ambiguous && root.versions.is_empty(), "{root:?}");
+        assert_eq!(
+            root.local_only_changes,
+            vec!["cache/blob".to_string(), "cache/new-cache-file".to_string()]
+        );
+    }
+    assert!(rep.list_native_recovery(actor()).unwrap().is_empty());
+    assert!(rep.live_status().unwrap().applied);
+    // A later structural application is not blocked by local-only activity.
+    let mut r = next_of(&rep, &next);
+    put_dir(&mut r, "e", 0o755);
+    let later = import(&rep, &sorted(r), ChunkSource::Unavailable);
+    assert!(ready(&apply(&rep, &later)));
+    // Recovery capture refuses paths outside the bound capture policy.
+    let copy = d.path().join("forged-copy");
+    fs::write(&copy, b"x").unwrap();
+    drop(rep);
+    let db = rusqlite::Connection::open(d.path().join("state/journal.sqlite")).unwrap();
+    let id = "0123456789abcdef0123456789abcdef";
+    let record = serde_json::json!({"id":id,"operation":OperationId::random().unwrap(),"original_base":base,"source_path":"cache/blob","observed_generation":0,"observed_digest":sha(b"x"),"causal_coverage":"Unknown"});
+    db.execute(
+        "INSERT INTO native_recovery VALUES(?,?,?,?)",
+        rusqlite::params![
+            id,
+            record["operation"].as_str().unwrap(),
+            serde_json::to_vec(&record).unwrap(),
+            copy.to_str().unwrap()
+        ],
+    )
+    .unwrap();
+    drop(db);
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    err(
+        rep.capture_native_recovery(
+            NativeRecoveryId::parse(id).unwrap(),
+            sha(b"x"),
+            OperationId::random().unwrap(),
+            actor(),
+        ),
+        "invalid_path",
+    );
+}

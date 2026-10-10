@@ -37,6 +37,10 @@ pub struct NativeDisplacement {
     pub retained_path: PathBuf,
     pub versions: Vec<PathBuf>,
     pub ambiguous: bool,
+    /// Capture-excluded (local-only) paths changed in a retained root: retained opaque bytes,
+    /// reported separately, never managed ambiguity or recovery candidates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_only_changes: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NativeStatus {
@@ -288,6 +292,7 @@ fn displacements(rows: &[Intent]) -> Vec<NativeDisplacement> {
                     retained_path: r.stage.join(&f.stage),
                     versions: f.versions.clone(),
                     ambiguous: f.ambiguous,
+                    local_only_changes: vec![],
                 })
                 .chain(r.root.iter().filter(|x| x.exchanged()).map(|x| {
                     // The displaced root is a whole retained generation at the empty path.
@@ -297,6 +302,7 @@ fn displacements(rows: &[Intent]) -> Vec<NativeDisplacement> {
                         retained_path: x.retained_path(),
                         versions: x.versions.iter().map(|v| v.version.clone()).collect(),
                         ambiguous: x.ambiguous,
+                        local_only_changes: x.local_changes.clone(),
                     }
                 }))
         })
@@ -844,7 +850,7 @@ impl Replica {
                 continue;
             }
             if r.root.as_ref().is_some_and(RootIntent::exchanged) {
-                match crate::native_root::rescan(&core, r)? {
+                match crate::native_root::rescan(&core, &n.policy, r)? {
                     crate::native_root::Rescan::Unchanged => {}
                     crate::native_root::Rescan::Changed => {
                         if !matches!(status.status, NativeApplyStatus::ApplyBlocked { .. }) {

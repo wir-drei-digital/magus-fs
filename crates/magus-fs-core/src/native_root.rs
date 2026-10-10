@@ -69,6 +69,9 @@ pub(crate) struct RootIntent {
     pub(crate) versions: Vec<RootVersion>,
     pub(crate) ambiguous: bool,
     pub(crate) staged_bytes: u64,
+    /// Changed capture-excluded paths in the displaced root (bounded, sorted).
+    #[serde(default)]
+    pub(crate) local_changes: Vec<String>,
 }
 impl RootIntent {
     pub(crate) fn exchanged(&self) -> bool {
@@ -536,6 +539,7 @@ fn stage(
         versions: vec![],
         ambiguous: false,
         staged_bytes,
+        local_changes: vec![],
     });
     na::save(core, r)?;
     match mkdir(&parent, &stage_leaf) {
@@ -746,18 +750,14 @@ pub(crate) fn finish(
         }
     }
     // The displaced root must still be exactly the verified original.
-    match rescan(core, r)? {
+    match rescan(core, &n.policy, r)? {
         Rescan::Unchanged => {}
         Rescan::Missing => return ambiguous(core, r, "retained_generation_missing"),
         Rescan::Backpressure => return ambiguous(core, r, "displacement_backpressure"),
         Rescan::Changed | Rescan::Unstable => return ambiguous(core, r, "ambiguous_root_exchange"),
     }
     let ri = r.root.clone().ok_or(FsError::InvalidDescriptor)?;
-    let displaced_matches = ri.displaced.len() == ri.original.len()
-        && ri
-            .original
-            .iter()
-            .all(|(p, s)| ri.displaced.get(p).is_some_and(|d| unchanged(s, d)));
+    let displaced_matches = managed_unchanged(&n.policy, &ri.original, &ri.displaced);
     if !displaced_matches {
         return ambiguous(core, r, "ambiguous_root_exchange");
     }
@@ -873,7 +873,11 @@ pub(crate) enum Rescan {
 /// Compare the retained displaced root with its last observation. Every changed or new regular
 /// file is copied into owner-private storage with an immutable unknown-causality record before
 /// the observation advances; removals and unsupported additions only mark ambiguity.
-pub(crate) fn rescan(core: &Core, r: &mut Intent) -> Result<Rescan, FsError> {
+pub(crate) fn rescan(
+    core: &Core,
+    policy: &CapturePolicy,
+    r: &mut Intent,
+) -> Result<Rescan, FsError> {
     let Some(ri) = r.root.clone() else {
         return Ok(Rescan::Unchanged);
     };
@@ -898,8 +902,16 @@ pub(crate) fn rescan(core: &Core, r: &mut Intent) -> Result<Rescan, FsError> {
         Err(Halt::Fs(e)) => return Err(e),
         Err(Halt::Block(_)) => return Ok(Rescan::Unstable),
     };
-    let mut changed = !inventory.unsupported.is_empty();
+    let local = |p: &str| !p.is_empty() && !policy.selected(p);
     let mut next = ri.clone();
+    let mut changed = false;
+    for path in &inventory.unsupported {
+        if local(path) {
+            note_local(&mut next, path);
+        } else {
+            changed = true;
+        }
+    }
     let (mut bytes, mut generations) = (0u64, 0usize);
     for row in na::records(core)? {
         let (b, g) = na::usage(&row);
@@ -912,11 +924,21 @@ pub(crate) fn rescan(core: &Core, r: &mut Intent) -> Result<Rescan, FsError> {
         if previous.is_some_and(|p| unchanged(p, now)) {
             continue;
         }
-        changed = true;
+        if local(path) {
+            // Opaque local-only bytes stay retained in the displaced root; never managed.
+            if now.digest.is_some() || previous.is_none() {
+                note_local(&mut next, path);
+            }
+            next.displaced.insert(path.clone(), now.clone());
+            continue;
+        }
         let Some(digest) = &now.digest else {
+            // Directory metadata follows its children; only a new managed directory is new work.
+            changed |= previous.is_none();
             next.displaced.insert(path.clone(), now.clone());
             continue;
         };
+        changed = true;
         if generations + 1 > RETAIN_GENERATIONS
             || bytes.saturating_add(now.observation.size) > RETAIN_BYTES
         {
@@ -972,7 +994,11 @@ pub(crate) fn rescan(core: &Core, r: &mut Intent) -> Result<Rescan, FsError> {
         .cloned()
         .collect();
     for path in removed {
-        changed = true;
+        if local(&path) {
+            note_local(&mut next, &path);
+        } else {
+            changed = true;
+        }
         next.displaced.remove(&path);
     }
     if changed {
@@ -986,6 +1012,37 @@ pub(crate) fn rescan(core: &Core, r: &mut Intent) -> Result<Rescan, FsError> {
     } else {
         Rescan::Unchanged
     })
+}
+const MAX_LOCAL_CHANGES: usize = 128;
+fn note_local(ri: &mut RootIntent, path: &str) {
+    if !ri.local_changes.iter().any(|p| p == path) && ri.local_changes.len() < MAX_LOCAL_CHANGES {
+        ri.local_changes.push(path.into());
+        ri.local_changes.sort();
+    }
+}
+/// Managed entries of the displaced root are unchanged since the pre-exchange inventory.
+/// Directories compare identity and their selected children only.
+fn managed_unchanged(
+    policy: &CapturePolicy,
+    original: &BTreeMap<String, Snapshot>,
+    now: &BTreeMap<String, Snapshot>,
+) -> bool {
+    let selected = |p: &String| p.is_empty() || policy.selected(p);
+    let names = |path: &str, s: &Snapshot| -> Vec<Vec<u8>> {
+        s.observation
+            .names
+            .iter()
+            .filter(|n| policy.selected(&child(path, &String::from_utf8_lossy(n))))
+            .cloned()
+            .collect()
+    };
+    original.keys().filter(|p| selected(p)).count() == now.keys().filter(|p| selected(p)).count()
+        && original.iter().filter(|(p, _)| selected(p)).all(|(p, a)| {
+            now.get(p).is_some_and(|b| match a.digest {
+                Some(_) => unchanged(a, b),
+                None => a.observation.same_identity(&b.observation) && names(p, a) == names(p, b),
+            })
+        })
 }
 /// Current verified bound-root identity for watcher rebinding (dev, inode).
 pub(crate) fn bound_identity(core: &Core) -> Result<Option<(u64, u64)>, FsError> {

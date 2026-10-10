@@ -196,6 +196,11 @@ impl Replica {
         if expected_digest != record.observed_digest {
             return Err(FsError::OperationMismatch);
         }
+        // Capture-excluded paths are opaque local content, never managed recovery candidates.
+        let policy = crate::native_apply::configuration(&core)?.policy;
+        if record.source_path.is_empty() || !policy.selected(&record.source_path) {
+            return Err(FsError::InvalidPath);
+        }
         let bytes = retained_bytes(&retained, &record.observed_digest)?;
         let base = core.revision(&record.original_base)?;
         let mut tree = base.tree.clone();
