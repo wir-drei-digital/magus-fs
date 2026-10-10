@@ -111,7 +111,28 @@ pub(crate) async fn operation(
     .transpose()
 }
 pub(crate) fn authorize_candidate(s: &r::Snapshot, derived: &Revision) -> Result<()> {
-    let view = s.validate_view()?;
+    authorize(s, derived, true)
+}
+/// Ruling R12: before a stale or unknown-causality outcome is recorded, the candidate is
+/// re-authorized under current rights (credential, grant, base read rights, current
+/// metadata and scope of its delta) without requiring unrelated path stability, so a
+/// later merge can still handle concurrent moves.
+pub(crate) fn authorize_retained(s: &r::Snapshot, derived: &Revision) -> Result<()> {
+    authorize(s, derived, false)
+}
+fn authorize(s: &r::Snapshot, derived: &Revision, stable_paths: bool) -> Result<()> {
+    let view = if stable_paths {
+        s.validate_base()?
+    } else {
+        // Retained outcomes: current credential/read action and an issued (non-alternative)
+        // base; deletions elsewhere in the base projection do not deny the record.
+        s.context.action("read")?;
+        let view = s.view.as_ref().ok_or(Error::not_found())?;
+        if view.alternative.is_some() {
+            return Err(Error::not_found());
+        }
+        view
+    };
     let a = s.authority()?;
     let delta = authorize_tree_transition(
         &view.full.tree,
@@ -149,7 +170,8 @@ pub(crate) fn authorize_candidate(s: &r::Snapshot, derived: &Revision) -> Result
     now.root = current.root.clone();
     for old in &mut now.entries {
         if let Some(present) = current.entries.iter().find(|e| e.id == old.id) {
-            if required.contains(&old.id)
+            if stable_paths
+                && required.contains(&old.id)
                 && (present.path != old.path || present.parent != old.parent)
             {
                 return Err(Error::not_found());
@@ -157,7 +179,7 @@ pub(crate) fn authorize_candidate(s: &r::Snapshot, derived: &Revision) -> Result
             old.owner = present.owner.clone();
             old.group = present.group.clone();
             old.mode = present.mode;
-        } else if required.contains(&old.id) {
+        } else if stable_paths && required.contains(&old.id) {
             return Err(Error::not_found());
         }
     }
@@ -275,7 +297,7 @@ pub(crate) async fn candidate(
     }
     let branch = r::branch_for_view(&state.db, &c, request.original_view.as_str()).await?;
     let s = r::snapshot(&state.db, &c, &branch, Some(request.original_view.as_str())).await?;
-    let view = s.validate_view()?;
+    let view = s.validate_base()?;
     // An alternative export binding is read-only evidence, never a candidate base.
     if request.original_head.as_str() != view.head || view.alternative.is_some() {
         return Err(Error::not_found());
@@ -463,6 +485,40 @@ mod tests {
         s.current.as_mut().unwrap().tree.entries[1].path = "renamed-secret".into();
         assert!(s.validate_view().is_ok());
         assert!(authorize_candidate(&s, &derived).is_ok());
+    }
+    #[test]
+    fn writer_without_history_uses_its_own_stale_base_but_not_old_reads() {
+        // Ruling R11: the recorded base of a write needs no history; reading an old view does.
+        let (mut s, derived) = fixture();
+        s.context.actions.retain(|a| a != "history");
+        assert!(s.validate_view().is_err_and(|e| e.code == "not_found"));
+        assert!(s.validate_base().is_ok());
+        assert!(authorize_candidate(&s, &derived).is_ok());
+        assert!(authorize_retained(&s, &derived).is_ok());
+    }
+    #[test]
+    fn retained_outcomes_reauthorize_current_rights_without_path_stability() {
+        // Ruling R12: narrowed rights deny before anything is recorded; a concurrent move of a
+        // required ancestor does not (a later merge handles it).
+        let (mut s, derived) = fixture();
+        s.current.as_mut().unwrap().tree.entries[0].path = "renamed-reports".into();
+        s.context.prefixes = vec!["".into()];
+        assert_eq!(
+            authorize_candidate(&s, &derived).unwrap_err().code,
+            "not_found"
+        );
+        assert!(authorize_retained(&s, &derived).is_ok());
+        s.current.as_mut().unwrap().tree.entries[0].mode = 0o500;
+        assert_eq!(
+            authorize_retained(&s, &derived).unwrap_err().code,
+            "not_found"
+        );
+        let (mut s, derived) = fixture();
+        s.context.actions.retain(|a| a != "write");
+        assert_eq!(
+            authorize_retained(&s, &derived).unwrap_err().code,
+            "not_found"
+        );
     }
     #[test]
     fn candidate_still_requires_current_parent_write_and_stable_required_path() {

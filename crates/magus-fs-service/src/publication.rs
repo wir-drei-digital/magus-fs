@@ -228,12 +228,15 @@ pub(crate) async fn integrate(
         };
         let mut generated = vec![];
         let decision = if s.head.as_deref() != Some(req.expected_head.as_str()) {
+            // R12: current rights before any durable outcome is recorded.
+            submission::authorize_retained(&s, derived)?;
             Decision::Stale
         } else if crate::conflicts::unknown_causality(&state, &c, &req.candidate_receipt, derived)
             .await?
         {
             // Rulings R1/R6/R10: never fast-forwarded, rebased or merged automatically.
-            s.context.action("read")?;
+            // R12: re-authorized before the conflict rows are recorded.
+            submission::authorize_retained(&s, derived)?;
             Decision::Conflicted(crate::conflicts::Retain::Whole(
                 ConflictReason::UnknownCausality,
             ))
@@ -246,9 +249,9 @@ pub(crate) async fn integrate(
                 provenance: None,
             }
         } else {
-            // A stale recorded base is historical input: it needs the history action.
+            // Ruling R11: merging against the caller's own recorded base needs no `history`;
+            // the base is never returned, and the merged delta is re-authorized below.
             s.context.action("read")?;
-            s.context.action("history")?;
             let policy = state
                 .db
                 .acquire()

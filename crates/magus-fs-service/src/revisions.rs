@@ -103,7 +103,21 @@ impl Snapshot {
             read_only: !self.context.actions.iter().any(|a| a == "write"),
         }
     }
+    /// Reading an issued view: an older head is historical content and needs `history`.
     pub fn validate_view(&self) -> Result<&BoundView> {
+        self.validate(true)
+    }
+    /// The caller's own issued view used as the recorded base of a write (candidate,
+    /// integration, merge, receipt replay). Ruling R11: no `history` requirement; current
+    /// read rights over the base projection are still required. Never an alternative view.
+    pub fn validate_base(&self) -> Result<&BoundView> {
+        let view = self.validate(false)?;
+        if view.alternative.is_some() {
+            return Err(Error::not_found());
+        }
+        Ok(view)
+    }
+    fn validate(&self, history: bool) -> Result<&BoundView> {
         self.context.action("read")?;
         let view = self.view.as_ref().ok_or(Error::not_found())?;
         if let Some((_, entry)) = &view.alternative {
@@ -121,7 +135,7 @@ impl Snapshot {
             }
             return Ok(view);
         }
-        if self.head.as_deref() != Some(&view.head) {
+        if history && self.head.as_deref() != Some(&view.head) {
             self.context.action("history")?;
         }
         let current = self.current.as_ref().ok_or(Error::not_found())?;
