@@ -201,7 +201,10 @@ class NativeJourney(Journey):
             if not symlink:assert ep.read(c)==b'unowned parent bytes'.hex()
             self.record(platform,'parent-symlink' if symlink else 'parent-movement',status=status,moved=ep.read(c,'reports-moved/live'))
         c=ep.create('dirty');ep.start(c);self.until(lambda:ep.ready(c));ep.stop(c);original=ep.status(c)['status']['binding'];ep.write(c,b'local dirty collision retained');shared=self.publish((platform+' remote collision accepted').encode());ep.start(c)
-        self.until(lambda:any(p['private_receipt'] and p['error']=='stale_head' for p in ep.status(c)['status']['submissions']))
+        # FS2-B Task 2: the definitively stale attempt is retained in `superseded` and the
+        # shared-live owner retries against the current head; both sides changed the same
+        # opaque file, so the service retains an immutable conflict instead of publishing.
+        self.until(lambda:any(p['private_receipt'] and p['error']=='conflicted' and p.get('superseded') for p in ep.status(c)['status']['submissions']))
         status=ep.status(c);assert ep.read(c)==b'local dirty collision retained'.hex();assert 'Ready' not in status['native']['status'];assert status['status']['binding']['view']['head']==original['view']['head'];assert all(p['private_receipt']['original_head']==original['view']['head'] for p in status['status']['submissions'] if p['private_receipt']);self.record(platform,'dirty-collision-frozen-base',status=status,original=original,incoming=shared);ep.stop(c)
         self.permissions(ep)
     def permissions(self,ep):

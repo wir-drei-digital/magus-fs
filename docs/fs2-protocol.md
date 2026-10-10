@@ -30,7 +30,7 @@ an arbitrary actor, raw full-revision read, or hash-existence query.
 | `GET /views/{view}/descriptor` | Exact projected canonical descriptor, no file bodies |
 | `GET /views/{view}/objects/{object}` | Verified bytes only when reachable through the caller's currently authorized view |
 | `POST /candidates` | `{operation,replica,original_view,original_head,revision,upload}`; private receipt |
-| `POST /integrations` | `{operation,replica,candidate_receipt,expected_head,branch}`; shared receipt or retained `409 stale_head` |
+| `POST /integrations` | `{operation,replica,candidate_receipt,expected_head,branch}`; shared receipt, retained `409 stale_head`, or (collaboration-v1) retained `409 {code:"conflicted",conflicts}`; see [fs2-reconciliation.md](fs2-reconciliation.md) |
 | `GET /operations/{replica}/{operation}` | Original result/status after current authorization |
 | `GET /changes?branch=main&after=0&limit=128` | `{events:[{sequence,head}],cursor}`; ordered durable paging |
 | `GET /notifications?branch=main` | Authenticated WSS, messages `{cursor}` only; hints are disposable |
@@ -67,9 +67,11 @@ metadata cannot be changed in the same candidate to manufacture write access.
 Submitted bytes remain staged, and immutable operation records retain their
 request, source view, submitted revision, derived full revision, actor and
 replica. Derived candidates parent the original full base. Private candidates
-do not update the shared branch. Integration is fast-forward only: both the
-expected head and original full base must match. A stale result is retained
-without rebasing or replacing either candidate.
+do not update the shared branch. Integration requires the expected head to be
+the current head (else a retained `stale_head`). In A it was fast-forward only;
+FS2-B Task 2 merges a candidate with an older base three-way against its recorded
+full base, or retains immutable conflicts, without rebasing or replacing either
+candidate ([fs2-reconciliation.md](fs2-reconciliation.md)).
 
 Operations are keyed by namespace, replica and operation ID, with credential,
 principal, kind and canonical request digest binding. Exact replays return the

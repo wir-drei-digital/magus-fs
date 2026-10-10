@@ -302,7 +302,7 @@ pub(crate) async fn integrate(
                     generated = objects;
                     let provenance = r::json(&serde_json::json!({
                         "kind":"merge","operation":req.operation,"receipt":req.candidate_receipt,
-                        "submitted":original.revision,"projected_base":original.original_view,
+                        "submitted":original.revision,"original_view":original.original_view,
                         "base":base_id,"candidate":derived_id,"current":current_id,
                         "mechanically_merged":mechanically_merged,
                     }))?;
