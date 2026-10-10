@@ -94,8 +94,15 @@ class Complete(NativeJourney):
                 if case in self.cases:getattr(self, case)(ep);self.reset()
         if 'nfs' in self.cases and 'macos' in self.platforms:self.nfs()
     def reset(self):
-        """Every case starts from the seeded identities and bytes on the shared branch."""
-        def seeded(t):t['entries'] = json.loads(json.dumps(self.seed_entries))
+        """Every case starts from the seeded paths and bytes on the shared branch. A seeded
+        identity that still exists keeps its identity; one a case deleted is re-created under
+        a fresh identity (ruling R21: the service never revives a published identity)."""
+        _, current = self.view();live = {e['id'] for e in current['tree']['entries']}
+        ids = {e['id']: e['id'] if e['id'] in live else identity('entry') for e in self.seed_entries}
+        entries = json.loads(json.dumps(self.seed_entries))
+        for e in entries:e['id'] = ids[e['id']];e['parent'] = ids.get(e['parent'], e['parent'])
+        self.seed_entries = entries
+        def seeded(t):t['entries'] = json.loads(json.dumps(entries))
         return self.publish_tree(seeded, [self.base_body])
 
     # ---- ordinary-folder structural application (both OSes) ----
