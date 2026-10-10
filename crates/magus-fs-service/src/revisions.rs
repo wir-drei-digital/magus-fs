@@ -107,16 +107,6 @@ impl Snapshot {
     pub fn validate_view(&self) -> Result<&BoundView> {
         self.validate(true)
     }
-    /// The caller's own issued view used as the recorded base of a write (candidate,
-    /// integration, merge, receipt replay). Ruling R11: no `history` requirement; current
-    /// read rights over the base projection are still required. Never an alternative view.
-    pub fn validate_base(&self) -> Result<&BoundView> {
-        let view = self.validate(false)?;
-        if view.alternative.is_some() {
-            return Err(Error::not_found());
-        }
-        Ok(view)
-    }
     fn validate(&self, history: bool) -> Result<&BoundView> {
         self.context.action("read")?;
         let view = self.view.as_ref().ok_or(Error::not_found())?;

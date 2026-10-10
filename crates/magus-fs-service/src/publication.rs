@@ -227,23 +227,21 @@ pub(crate) async fn integrate(
             head: HeadToken::random().map_err(core_error)?,
         };
         let mut generated = vec![];
+        // Rulings R12/R14/R17: current rights at current locations before ANY outcome
+        // (stale, unknown causality, fast-forward, merge, conflicts) is decided or recorded.
+        submission::authorize_retained(&s, derived)?;
         let decision = if s.head.as_deref() != Some(req.expected_head.as_str()) {
-            // R12: current rights before any durable outcome is recorded.
-            submission::authorize_retained(&s, derived)?;
             Decision::Stale
         } else if crate::conflicts::unknown_causality(&state, &c, &req.candidate_receipt, derived)
             .await?
         {
             // Rulings R1/R6/R10: never fast-forwarded, rebased or merged automatically.
-            // R12: re-authorized before the conflict rows are recorded.
-            submission::authorize_retained(&s, derived)?;
             Decision::Conflicted(crate::conflicts::Retain::Whole(
                 ConflictReason::UnknownCausality,
             ))
         } else if view.head == req.expected_head.as_str()
             && derived.parents == vec![base_id.clone()]
         {
-            submission::authorize_candidate(&s, derived)?;
             Decision::Publish {
                 revision: Box::new(derived.clone()),
                 provenance: None,
@@ -264,12 +262,25 @@ pub(crate) async fn integrate(
                     })
                 })
                 .await?;
+            // R14: touched identities deleted or moved out of the caller's current scope by
+            // others are presented as absent on the head side.
+            let visible = crate::reconciliation::caller_visible(
+                current,
+                s.authority()?,
+                &s.context.prefixes,
+            )?;
+            let presented = crate::reconciliation::present(
+                &view.full.tree,
+                &current.tree,
+                &derived.tree,
+                &visible,
+            );
             match crate::reconciliation::reconcile(
                 &state,
                 &ns,
                 &view.full.tree,
-                &current.tree,
-                &derived.tree,
+                &presented.left,
+                &presented.right,
                 &policy,
             )
             .await?

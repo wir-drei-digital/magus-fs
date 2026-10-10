@@ -310,6 +310,123 @@ pub(crate) async fn reconcile(
     }
 }
 
+/// Identities of the current head the caller can see now: readable at their *current*
+/// location, which lies within its current scope (plus the root).
+pub(crate) fn caller_visible(
+    current: &Revision,
+    a: &Authority,
+    prefixes: &[String],
+) -> Result<BTreeSet<EntryId>> {
+    let projected = crate::views::project(current, &current.tree, a, prefixes)?;
+    let mut ids: BTreeSet<EntryId> = projected.tree.entries.into_iter().map(|e| e.id).collect();
+    ids.insert(current.tree.root.id.clone());
+    Ok(ids)
+}
+fn fields(e: &Entry) -> (&EntryId, &str, &PrincipalId, &GroupId, u16, &EntryContent) {
+    let leaf = e.path.rsplit('/').next().unwrap_or(&e.path);
+    (&e.parent, leaf, &e.owner, &e.group, e.mode, &e.content)
+}
+fn without(tree: &Tree, ids: &BTreeSet<EntryId>) -> Tree {
+    let mut doomed = ids.clone();
+    loop {
+        let more: Vec<EntryId> = tree
+            .entries
+            .iter()
+            .filter(|e| doomed.contains(&e.parent) && !doomed.contains(&e.id))
+            .map(|e| e.id.clone())
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        doomed.extend(more);
+    }
+    Tree {
+        root: tree.root.clone(),
+        entries: tree
+            .entries
+            .iter()
+            .filter(|e| !doomed.contains(&e.id))
+            .cloned()
+            .collect(),
+    }
+}
+/// Ruling R14: the caller's view of a stale merge. Identities the candidate touched that
+/// others deleted *or* moved out of the caller's current scope (or made unreadable) are
+/// both presented as absent on the head side: an edit becomes a retained edit/delete
+/// conflict with the caller's alternative kept (and can never be written there); a
+/// deletion of such an identity is moot and leaves the hidden head entry untouched.
+pub(crate) struct Presented {
+    pub left: Tree,
+    pub right: Tree,
+    pub hidden_edits: BTreeSet<EntryId>,
+}
+pub(crate) fn present(
+    base: &Tree,
+    current: &Tree,
+    derived: &Tree,
+    visible: &BTreeSet<EntryId>,
+) -> Presented {
+    let index = |t: &Tree| {
+        t.entries
+            .iter()
+            .map(|e| (e.id.clone(), e.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let (b, c, r) = (index(base), index(current), index(derived));
+    let mut hidden_edits = BTreeSet::new();
+    let mut restore = vec![];
+    for id in b.keys().chain(r.keys()).collect::<BTreeSet<_>>() {
+        let touched = match (b.get(id), r.get(id)) {
+            (Some(x), Some(y)) => fields(x) != fields(y),
+            (None, None) => false,
+            _ => true,
+        };
+        if !touched || !c.contains_key(id) || visible.contains(id) {
+            continue;
+        }
+        match (b.get(id), r.get(id)) {
+            (_, Some(_)) => {
+                hidden_edits.insert(id.clone());
+            }
+            (Some(old), None) => restore.push(old.clone()),
+            (None, None) => {}
+        }
+    }
+    let mut right = derived.clone();
+    right.entries.extend(restore);
+    right.entries.sort_by(|x, y| x.path.cmp(&y.path));
+    Presented {
+        left: without(current, &hidden_edits),
+        right,
+        hidden_edits,
+    }
+}
+/// Reconciliation of an explicit selection never reads content (opaque policy).
+pub(crate) struct NoContent;
+impl MergeContent for NoContent {
+    fn read(&self, _: &FileVersion) -> std::result::Result<Vec<u8>, FsError> {
+        Err(FsError::UnsupportedMode)
+    }
+    fn generated(&self, _: &[u8]) -> std::result::Result<FileVersion, FsError> {
+        Err(FsError::UnsupportedMode)
+    }
+}
+/// The candidate's effect at the *current* locations of what it touched (hidden touched
+/// identities excluded): the tree a merge preferring the candidate would produce. `None`
+/// when that composition is structurally unresolvable (integration retains conflicts).
+pub(crate) fn effect(base: &Tree, presented: &Presented) -> Option<Tree> {
+    let tree = resolve_trees(
+        base,
+        &presented.left,
+        &presented.right,
+        &MergePolicy::opaque(),
+        &NoContent,
+        Side::Right,
+    )
+    .ok()?;
+    Some(without(&tree, &presented.hidden_edits))
+}
+
 /// Conflicts are only disclosed when every identity they name was visible to the caller:
 /// in the current authorized projection, in its original projected view, or newly created
 /// by its own candidate. Anything else is denied without revealing hidden siblings.

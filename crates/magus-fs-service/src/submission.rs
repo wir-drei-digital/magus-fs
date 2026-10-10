@@ -110,77 +110,38 @@ pub(crate) async fn operation(
     })
     .transpose()
 }
+/// Current-rights authorization of a candidate against its recorded base (ruling R14,
+/// also used before every retained outcome per R12/R17 and for fast-forward/replay):
+/// - read action and the caller's own issued, non-alternative base (no `history`, R11);
+/// - the delta at base locations, with *current* metadata for identities the caller can
+///   still see at their current location (hidden ones keep base metadata, never current
+///   access), within the current grant;
+/// - the delta's effect at the *current* locations of what it touches (current scope and
+///   current write permission); visible changes by others to untouched entries never deny,
+///   and touched identities deleted or moved out of scope by others are presented as
+///   absent (reconciled as retained edit/delete at integration).
 pub(crate) fn authorize_candidate(s: &r::Snapshot, derived: &Revision) -> Result<()> {
-    authorize(s, derived, true)
-}
-/// Ruling R12: before a stale or unknown-causality outcome is recorded, the candidate is
-/// re-authorized under current rights (credential, grant, base read rights, current
-/// metadata and scope of its delta) without requiring unrelated path stability, so a
-/// later merge can still handle concurrent moves.
-pub(crate) fn authorize_retained(s: &r::Snapshot, derived: &Revision) -> Result<()> {
-    authorize(s, derived, false)
-}
-fn authorize(s: &r::Snapshot, derived: &Revision, stable_paths: bool) -> Result<()> {
-    let view = if stable_paths {
-        s.validate_base()?
-    } else {
-        // Retained outcomes: current credential/read action and an issued (non-alternative)
-        // base; deletions elsewhere in the base projection do not deny the record.
-        s.context.action("read")?;
-        let view = s.view.as_ref().ok_or(Error::not_found())?;
-        if view.alternative.is_some() {
-            return Err(Error::not_found());
-        }
-        view
-    };
-    let a = s.authority()?;
-    let delta = authorize_tree_transition(
-        &view.full.tree,
-        &derived.tree,
-        a,
-        &s.authorities,
-        &s.scope(),
-    )
-    .map_err(core_error)?;
-    // Only the authorized change and its structural ancestors require stable
-    // current paths. Unchanged hidden siblings are not caller mutations.
-    let mut required = std::collections::BTreeSet::from([view.full.tree.root.id.clone()]);
-    for tree in [&view.full.tree, &derived.tree] {
-        let entries = tree
-            .entries
-            .iter()
-            .map(|e| (&e.id, e))
-            .collect::<BTreeMap<_, _>>();
-        for endpoint in delta
-            .operations
-            .iter()
-            .flat_map(|op| op.old.iter().chain(op.new.iter()))
-        {
-            let mut id = endpoint;
-            while let Some(entry) = entries.get(id) {
-                required.insert(entry.id.clone());
-                id = &entry.parent;
-            }
-        }
+    s.context.action("read")?;
+    let view = s.view.as_ref().ok_or(Error::not_found())?;
+    if view.alternative.is_some() {
+        return Err(Error::not_found());
     }
-    // Recheck current permissions without treating unrelated path changes as
-    // edits or restoring their old metadata.
-    let current = &s.current.as_ref().ok_or(Error::not_found())?.tree;
+    let a = s.authority()?;
+    let current = s.current.as_ref().ok_or(Error::not_found())?;
+    let visible = crate::reconciliation::caller_visible(current, a, &s.context.prefixes)?;
+    let present = current
+        .tree
+        .entries
+        .iter()
+        .map(|e| (&e.id, e))
+        .collect::<BTreeMap<_, _>>();
     let mut now = view.full.tree.clone();
-    now.root = current.root.clone();
+    now.root = current.tree.root.clone();
     for old in &mut now.entries {
-        if let Some(present) = current.entries.iter().find(|e| e.id == old.id) {
-            if stable_paths
-                && required.contains(&old.id)
-                && (present.path != old.path || present.parent != old.parent)
-            {
-                return Err(Error::not_found());
-            }
-            old.owner = present.owner.clone();
-            old.group = present.group.clone();
-            old.mode = present.mode;
-        } else if stable_paths && required.contains(&old.id) {
-            return Err(Error::not_found());
+        if let Some(p) = present.get(&old.id).filter(|_| visible.contains(&old.id)) {
+            old.owner = p.owner.clone();
+            old.group = p.group.clone();
+            old.mode = p.mode;
         }
     }
     let mut checked = derived.tree.clone();
@@ -188,12 +149,22 @@ fn authorize(s: &r::Snapshot, derived: &Revision, stable_paths: bool) -> Result<
     if derived.tree.root == view.full.tree.root {
         checked.root = now.root.clone()
     }
+    let base = view
+        .full
+        .tree
+        .entries
+        .iter()
+        .map(|e| (&e.id, e))
+        .collect::<BTreeMap<_, _>>();
+    let overlay = now
+        .entries
+        .iter()
+        .map(|e| (e.id.clone(), e.clone()))
+        .collect::<BTreeMap<_, _>>();
     for e in &mut checked.entries {
-        if let Some(old) = view.full.tree.entries.iter().find(|o| o.id == e.id) {
-            if (e.owner.clone(), e.group.clone(), e.mode)
-                == (old.owner.clone(), old.group.clone(), old.mode)
-            {
-                if let Some(p) = now.entries.iter().find(|p| p.id == e.id) {
+        if let Some(old) = base.get(&e.id) {
+            if (&e.owner, &e.group, e.mode) == (&old.owner, &old.group, old.mode) {
+                if let Some(p) = overlay.get(&e.id) {
                     e.owner = p.owner.clone();
                     e.group = p.group.clone();
                     e.mode = p.mode;
@@ -202,7 +173,17 @@ fn authorize(s: &r::Snapshot, derived: &Revision, stable_paths: bool) -> Result<
         }
     }
     authorize_tree_transition(&now, &checked, a, &s.authorities, &s.scope()).map_err(core_error)?;
+    let presented =
+        crate::reconciliation::present(&view.full.tree, &current.tree, &derived.tree, &visible);
+    if let Some(effect) = crate::reconciliation::effect(&view.full.tree, &presented) {
+        authorize_tree_transition(&presented.left, &effect, a, &s.authorities, &s.scope())
+            .map_err(core_error)?;
+    }
     Ok(())
+}
+/// Rulings R12/R17: the same current-location authorization before a retained outcome.
+pub(crate) fn authorize_retained(s: &r::Snapshot, derived: &Revision) -> Result<()> {
+    authorize_candidate(s, derived)
 }
 pub(crate) async fn replay(
     state: &ServiceState,
@@ -297,7 +278,10 @@ pub(crate) async fn candidate(
     }
     let branch = r::branch_for_view(&state.db, &c, request.original_view.as_str()).await?;
     let s = r::snapshot(&state.db, &c, &branch, Some(request.original_view.as_str())).await?;
-    let view = s.validate_base()?;
+    // R14: untouched visible changes by others never deny a private submission; the
+    // touched entries are authorized at their current locations below.
+    s.context.action("read")?;
+    let view = s.view.as_ref().ok_or(Error::not_found())?;
     // An alternative export binding is read-only evidence, never a candidate base.
     if request.original_head.as_str() != view.head || view.alternative.is_some() {
         return Err(Error::not_found());
@@ -389,6 +373,7 @@ pub(crate) async fn candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     fn fixture() -> (r::Snapshot, Revision) {
         let principal = PrincipalId::parse(format!("principal:{:032x}", 1)).unwrap();
         let group = GroupId::parse(format!("group:{:032x}", 1)).unwrap();
@@ -492,25 +477,17 @@ mod tests {
         let (mut s, derived) = fixture();
         s.context.actions.retain(|a| a != "history");
         assert!(s.validate_view().is_err_and(|e| e.code == "not_found"));
-        assert!(s.validate_base().is_ok());
         assert!(authorize_candidate(&s, &derived).is_ok());
         assert!(authorize_retained(&s, &derived).is_ok());
     }
     #[test]
-    fn retained_outcomes_reauthorize_current_rights_without_path_stability() {
-        // Ruling R12: narrowed rights deny before anything is recorded; a concurrent move of a
-        // required ancestor does not (a later merge handles it).
+    fn touched_entries_need_current_write_and_scope_at_current_locations() {
+        // R14/R17: a narrowed current parent or a lost write action denies.
         let (mut s, derived) = fixture();
-        s.current.as_mut().unwrap().tree.entries[0].path = "renamed-reports".into();
-        s.context.prefixes = vec!["".into()];
+        s.current.as_mut().unwrap().tree.entries[0].mode = 0o500;
+        assert!(s.validate_view().is_ok());
         assert_eq!(
             authorize_candidate(&s, &derived).unwrap_err().code,
-            "not_found"
-        );
-        assert!(authorize_retained(&s, &derived).is_ok());
-        s.current.as_mut().unwrap().tree.entries[0].mode = 0o500;
-        assert_eq!(
-            authorize_retained(&s, &derived).unwrap_err().code,
             "not_found"
         );
         let (mut s, derived) = fixture();
@@ -519,23 +496,47 @@ mod tests {
             authorize_retained(&s, &derived).unwrap_err().code,
             "not_found"
         );
+        // The parent moved out of the caller's scope by others: creating beneath its current
+        // location would escape the scope, so it is denied (stable identity is no escape).
+        let (mut s, derived) = fixture();
+        s.current.as_mut().unwrap().tree.entries[0].path = "outside".into();
+        assert_eq!(
+            authorize_candidate(&s, &derived).unwrap_err().code,
+            "not_found"
+        );
     }
     #[test]
-    fn candidate_still_requires_current_parent_write_and_stable_required_path() {
+    fn untouched_visible_changes_and_in_scope_ancestor_moves_never_deny() {
+        // R14: a rename of the touched entry's ancestor inside scope is handled by the merge,
+        // and an unrelated visible deletion does not deny the private submission.
         let (mut s, derived) = fixture();
-        s.current.as_mut().unwrap().tree.entries[0].mode = 0o500;
-        assert!(s.validate_view().is_ok());
-        assert_eq!(
-            authorize_candidate(&s, &derived).unwrap_err().code,
-            "not_found"
-        );
-        s.current.as_mut().unwrap().tree.entries[0].mode = 0o700;
-        s.current.as_mut().unwrap().tree.entries[0].path = "renamed-reports".into();
         s.context.prefixes = vec!["".into()];
-        assert!(s.validate_view().is_ok());
-        assert_eq!(
-            authorize_candidate(&s, &derived).unwrap_err().code,
-            "not_found"
-        );
+        s.current.as_mut().unwrap().tree.entries[0].path = "renamed-reports".into();
+        assert!(authorize_candidate(&s, &derived).is_ok());
+        let (mut s, derived) = fixture();
+        s.context.prefixes = vec!["".into()];
+        s.current.as_mut().unwrap().tree.entries.remove(1);
+        assert!(authorize_candidate(&s, &derived).is_ok());
+    }
+    #[test]
+    fn hidden_touched_identities_are_presented_as_absent() {
+        // R14: edit vs moved-out-of-scope becomes edit/delete (head side absent); delete vs
+        // moved-out-of-scope is moot and keeps the hidden head entry.
+        let (s, _) = fixture();
+        let base = s.view.as_ref().unwrap().full.tree.clone();
+        let mut current = base.clone();
+        current.entries[1].path = "elsewhere".into();
+        let visible = BTreeSet::from([current.root.id.clone(), current.entries[0].id.clone()]);
+        let mut edited = base.clone();
+        edited.entries[1].mode = 0o750;
+        let p = crate::reconciliation::present(&base, &current, &edited, &visible);
+        assert_eq!(p.hidden_edits, BTreeSet::from([base.entries[1].id.clone()]));
+        assert!(!p.left.entries.iter().any(|e| e.id == base.entries[1].id));
+        let mut deleted = base.clone();
+        deleted.entries.remove(1);
+        let p = crate::reconciliation::present(&base, &current, &deleted, &visible);
+        assert!(p.hidden_edits.is_empty());
+        assert_eq!(p.left, current);
+        assert!(p.right.entries.iter().any(|e| e == &base.entries[1]));
     }
 }
