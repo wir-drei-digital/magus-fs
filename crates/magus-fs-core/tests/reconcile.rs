@@ -660,3 +660,106 @@ fn collaboration_dtos_are_closed_bounded_and_snake_case() {
     assert!(ConflictReason::parse("lww").is_err());
     assert!(ConflictId::parse("0".repeat(31)).is_err());
 }
+
+#[test]
+fn permission_tuple_changes_on_different_sides_conflict_instead_of_composing() {
+    // Left changes the group, right the mode: composing would grant the new group a mode
+    // neither side authored. (owner, group, mode) is one unit.
+    let f = Fixture::new();
+    let mut base_file = f.file("f", b"v0");
+    base_file.mode = 0o640;
+    let base = f.tree(vec![base_file.clone()]);
+    let mut grouped = base_file.clone();
+    grouped.group = group(2);
+    let mut widened = base_file.clone();
+    widened.mode = 0o660;
+    assert_eq!(
+        conflicts(f.merge(
+            &base,
+            &f.tree(vec![grouped.clone()]),
+            &f.tree(vec![widened.clone()]),
+            &opaque()
+        )),
+        vec![(f.id("f"), ConflictReason::Metadata)]
+    );
+    let mut owned = base_file.clone();
+    owned.owner = principal(2);
+    assert_eq!(
+        conflicts(f.merge(
+            &base,
+            &f.tree(vec![owned]),
+            &f.tree(vec![widened.clone()]),
+            &opaque()
+        )),
+        vec![(f.id("f"), ConflictReason::Metadata)]
+    );
+    // The same tuple from both sides, or a tuple change against a content edit, is clean.
+    let (tree, _) = clean(f.merge(
+        &base,
+        &f.tree(vec![grouped.clone()]),
+        &f.tree(vec![grouped.clone()]),
+        &opaque(),
+    ));
+    assert_eq!(tree.entries[0].group, group(2));
+    let mut edited = base_file.clone();
+    edited.content = f.file("f", b"v1").content;
+    let (tree, _) = clean(f.merge(
+        &base,
+        &f.tree(vec![grouped]),
+        &f.tree(vec![edited.clone()]),
+        &opaque(),
+    ));
+    assert_eq!(
+        (tree.entries[0].group.clone(), tree.entries[0].mode),
+        (group(2), 0o640)
+    );
+    assert_eq!(tree.entries[0].content, edited.content);
+    // Root: group on one side, mode on the other.
+    let mut l = base.clone();
+    l.root.group = group(2);
+    let mut r = base.clone();
+    r.root.mode = 0o775;
+    assert_eq!(
+        conflicts(f.merge(&base, &l, &r, &opaque())),
+        vec![(f.root.id.clone(), ConflictReason::Metadata)]
+    );
+}
+
+#[test]
+fn explicit_resolution_applies_per_conflict_choices_and_base_selection() {
+    let f = Fixture::new();
+    let base = f.tree(vec![
+        f.file("a", b"a0"),
+        f.file("b", b"b0"),
+        f.file("c", b"c0"),
+    ]);
+    let left = f.tree(vec![
+        f.file("a", b"a-left"),
+        f.file("b", b"b-left"),
+        f.file("c", b"c0"),
+    ]);
+    let right = f.tree(vec![
+        f.file("a", b"a-right"),
+        f.file("b", b"b-right"),
+        f.file("c", b"c-right"),
+    ]);
+    let choices =
+        std::collections::BTreeMap::from([(f.id("a"), Side::Left), (f.id("b"), Side::Base)]);
+    let tree = resolve_trees_with(
+        &base,
+        &left,
+        &right,
+        &opaque(),
+        &f.store,
+        Side::Right,
+        &choices,
+    )
+    .unwrap();
+    assert_eq!(at(&tree, "a").content, at(&left, "a").content);
+    assert_eq!(at(&tree, "b").content, at(&base, "b").content);
+    // Non-conflicting change from the candidate survives.
+    assert_eq!(at(&tree, "c").content, at(&right, "c").content);
+    let all_base = resolve_trees(&base, &left, &right, &opaque(), &f.store, Side::Base).unwrap();
+    assert_eq!(at(&all_base, "a").content, at(&base, "a").content);
+    assert_eq!(at(&all_base, "c").content, at(&right, "c").content);
+}

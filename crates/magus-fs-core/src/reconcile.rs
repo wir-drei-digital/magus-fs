@@ -333,6 +333,25 @@ pub fn resolve_trees(
     Ok(merged.tree)
 }
 
+/// Explicit resolution with per-identity choices; identities without a choice (and
+/// structural repairs) take `default`.
+pub fn resolve_trees_with(
+    base: &Tree,
+    left: &Tree,
+    right: &Tree,
+    policy: &MergePolicy,
+    objects: &dyn MergeContent,
+    default: Side,
+    choices: &BTreeMap<EntryId, Side>,
+) -> Result<Tree, FsError> {
+    let merged = Reconciler::new(base, left, right, policy, objects, Some(default))?
+        .with_choices(choices.clone())
+        .run()?;
+    if !merged.conflicts.is_empty() {
+        return Err(FsError::TargetCollision);
+    }
+    Ok(merged.tree)
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Loc {
     parent: EntryId,
@@ -442,6 +461,7 @@ struct Reconciler<'a> {
     policy: &'a MergePolicy,
     objects: &'a dyn MergeContent,
     prefer: Option<Side>,
+    choices: BTreeMap<EntryId, Side>,
     conflicts: BTreeMap<EntryId, EntryConflict>,
 }
 impl<'a> Reconciler<'a> {
@@ -469,8 +489,18 @@ impl<'a> Reconciler<'a> {
             policy,
             objects,
             prefer,
+            choices: BTreeMap::new(),
             conflicts: BTreeMap::new(),
         })
+    }
+    fn with_choices(mut self, choices: BTreeMap<EntryId, Side>) -> Self {
+        self.choices = choices;
+        self
+    }
+    /// The explicit side for an identity under resolution; `None` while reconciling.
+    fn choose(&self, id: &EntryId) -> Option<Side> {
+        self.prefer
+            .map(|default| self.choices.get(id).copied().unwrap_or(default))
     }
     fn alternatives(&self, id: &EntryId) -> (Option<Entry>, Option<Entry>, Option<Entry>) {
         (
@@ -539,7 +569,7 @@ impl<'a> Reconciler<'a> {
                 (None, Some(l), Some(r)) => {
                     if same(l, r) {
                         Some(l.clone())
-                    } else if let Some(p) = self.prefer {
+                    } else if let Some(p) = self.choose(id) {
                         match p {
                             Side::Base => None,
                             Side::Left => Some(l.clone()),
@@ -554,7 +584,7 @@ impl<'a> Reconciler<'a> {
                 (Some(b), None, Some(x)) | (Some(b), Some(x), None) => {
                     if same(b, x) {
                         None
-                    } else if let Some(p) = self.prefer {
+                    } else if let Some(p) = self.choose(id) {
                         let deleted_left = l.is_none();
                         match (p, deleted_left) {
                             (Side::Base, _) => Some(b.clone()),
@@ -591,39 +621,32 @@ impl<'a> Reconciler<'a> {
     }
     fn root(&mut self) -> Root {
         let (b, l, r) = (&self.base.root, &self.left.root, &self.right.root);
-        let mut root = b.clone();
-        let mut conflicted = false;
-        match merge3(&b.owner, &l.owner, &r.owner) {
-            Some(v) => root.owner = v,
-            None => conflicted = true,
+        let tuple = |x: &Root| (x.owner.clone(), x.group.clone(), x.mode);
+        // Owner, group and mode are one permission unit: never composed across sides.
+        if merge3(&tuple(b), &tuple(l), &tuple(r)).is_some() {
+            return if tuple(l) == tuple(b) {
+                r.clone()
+            } else {
+                l.clone()
+            };
         }
-        match merge3(&b.group, &l.group, &r.group) {
-            Some(v) => root.group = v,
-            None => conflicted = true,
-        }
-        match merge3(&b.mode, &l.mode, &r.mode) {
-            Some(v) => root.mode = v,
-            None => conflicted = true,
-        }
-        if conflicted {
-            match self.prefer {
-                Some(p) => root = pick(p, b, l, r),
-                None => {
-                    self.conflicts.insert(
-                        b.id.clone(),
-                        EntryConflict {
-                            id: b.id.clone(),
-                            base: None,
-                            left: None,
-                            right: None,
-                            reason: ConflictReason::Metadata,
-                            policy: MergeMode::Opaque,
-                        },
-                    );
-                }
+        match self.choose(&b.id) {
+            Some(p) => pick(p, b, l, r),
+            None => {
+                self.conflicts.insert(
+                    b.id.clone(),
+                    EntryConflict {
+                        id: b.id.clone(),
+                        base: None,
+                        left: None,
+                        right: None,
+                        reason: ConflictReason::Metadata,
+                        policy: MergeMode::Opaque,
+                    },
+                );
+                b.clone()
             }
         }
-        root
     }
     /// Field-wise merge of an identity present on all three sides.
     fn entry(
@@ -635,34 +658,26 @@ impl<'a> Reconciler<'a> {
     ) -> Result<Option<(Entry, bool)>, FsError> {
         let mut reasons = vec![];
         let mut out = b.clone();
+        let choice = self.choose(&b.id);
         let location = merge3(&loc(b), &loc(l), &loc(r)).unwrap_or_else(|| {
             reasons.push(ConflictReason::CompetingRename);
-            pick(self.prefer.unwrap_or(Side::Base), &loc(b), &loc(l), &loc(r))
+            pick(choice.unwrap_or(Side::Base), &loc(b), &loc(l), &loc(r))
         });
         out.parent = location.parent;
         out.path = location.name;
-        out.owner = merge3(&b.owner, &l.owner, &r.owner).unwrap_or_else(|| {
-            reasons.push(ConflictReason::Metadata);
-            pick(
-                self.prefer.unwrap_or(Side::Base),
-                &b.owner,
-                &l.owner,
-                &r.owner,
-            )
-        });
-        out.group = merge3(&b.group, &l.group, &r.group).unwrap_or_else(|| {
-            reasons.push(ConflictReason::Metadata);
-            pick(
-                self.prefer.unwrap_or(Side::Base),
-                &b.group,
-                &l.group,
-                &r.group,
-            )
-        });
-        out.mode = merge3(&b.mode, &l.mode, &r.mode).unwrap_or_else(|| {
-            reasons.push(ConflictReason::Metadata);
-            pick(self.prefer.unwrap_or(Side::Base), &b.mode, &l.mode, &r.mode)
-        });
+        // Owner, group and mode are one permission unit: different changes on the two sides
+        // are a metadata conflict, never a composition neither side authored.
+        let tuple = |x: &Entry| (x.owner.clone(), x.group.clone(), x.mode);
+        (out.owner, out.group, out.mode) =
+            merge3(&tuple(b), &tuple(l), &tuple(r)).unwrap_or_else(|| {
+                reasons.push(ConflictReason::Metadata);
+                pick(
+                    choice.unwrap_or(Side::Base),
+                    &tuple(b),
+                    &tuple(l),
+                    &tuple(r),
+                )
+            });
         let mut text = false;
         out.content = match merge3(&b.content, &l.content, &r.content) {
             Some(content) => content,
@@ -677,7 +692,7 @@ impl<'a> Reconciler<'a> {
                             .merge_text(&input.base, &input.left, &input.right)?
                         {
                             TextMerge::Merged(bytes) if bytes.len() <= MAX_TEXT_OUTPUT => {
-                                if self.prefer.is_none() {
+                                if choice.is_none() {
                                     text = true;
                                     out.content = EntryContent::File {
                                         version: self.objects.generated(&bytes)?,
@@ -701,7 +716,7 @@ impl<'a> Reconciler<'a> {
                     Some(reason) => {
                         reasons.push(reason);
                         pick(
-                            self.prefer.unwrap_or(Side::Base),
+                            choice.unwrap_or(Side::Base),
                             &b.content,
                             &l.content,
                             &r.content,
@@ -710,7 +725,7 @@ impl<'a> Reconciler<'a> {
                 }
             }
         };
-        if self.prefer.is_none() {
+        if choice.is_none() {
             if let Some(reason) = reasons.into_iter().min_by_key(|r| match r {
                 ConflictReason::CompetingRename => 0,
                 ConflictReason::Content
@@ -748,7 +763,7 @@ impl<'a> Reconciler<'a> {
                 }
                 match entries.get(&parent) {
                     Some(p) if p.content == EntryContent::Directory => {}
-                    Some(_) => match self.prefer {
+                    Some(_) => match self.choose(&id) {
                         None => {
                             self.conflict(&id, ConflictReason::PathCollision);
                             self.conflict(&parent, ConflictReason::PathCollision);
@@ -756,7 +771,7 @@ impl<'a> Reconciler<'a> {
                         }
                         Some(_) => return Err(FsError::TargetCollision),
                     },
-                    None => match self.prefer {
+                    None => match self.choose(&parent).or(self.choose(&id)) {
                         None => {
                             self.conflict(&id, ConflictReason::DirectoryDelete);
                             self.conflict(&parent, ConflictReason::DirectoryDelete);
@@ -796,7 +811,7 @@ impl<'a> Reconciler<'a> {
             }
             let mut repaired = false;
             for id in &cyclic {
-                match self.prefer {
+                match self.choose(id) {
                     None => {
                         self.conflict(id, ConflictReason::CompetingRename);
                         entries.remove(id);
