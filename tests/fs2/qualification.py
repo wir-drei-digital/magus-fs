@@ -38,9 +38,10 @@ def normalize(evidence):
             require(isinstance(receipts,list) and bool(receipts),'receipts')
             for r in receipts:
                 private=r.get('private',{});shared=r.get('shared',{})
-                raw=r.get('raw_progress',{})
+                raw=r.get('raw_progress',{});integration=r.get('integration',{})
                 require(revision(r.get('revision')) and revision(r.get('applied')) and raw.get('local_revision')==r.get('revision') and raw.get('operation')==r.get('operation') and raw.get('applied_revision')==r.get('applied'),'revision identities')
                 require(all(private.get(k)==r.get(v) and r.get(v) is not None for k,v in [('operation','operation'),('submitted_revision','revision'),('original_view','original_view'),('original_head','original_head')]),'original receipt/base')
+                require(bool(integration) and raw.get('integration')==integration and integration.get('expected_head')==r.get('original_head') and integration.get('candidate_receipt')==private.get('receipt') and all(bool(integration.get(k)) and integration[k]==shared.get(k) for k in ['operation','replica','branch']) and integration.get('replica')==private.get('replica'),'original integration binding')
                 require(shared.get('candidate_receipt')==r.get('private_receipt')==private.get('receipt') and bool(r.get('private_receipt')) and shared.get('submitted_revision')==r.get('revision') and raw.get('private_receipt')==private and raw.get('shared_receipt')=={k:v for k,v in shared.items() if k!='candidate_receipt'},'private/shared receipt binding')
             saves=j.get('saves',[])
             require(len(saves)==20,'20 serialized saves')
@@ -48,6 +49,7 @@ def normalize(evidence):
             for sample in saves:
                 times=[sample.get(k) for k in ['capture','private','shared','visible']]
                 require(all(number(t) for t in times) and times==sorted(times),'save latency timeline')
+                require(number(sample.get('visible')) and sample['visible']<=15,'15s save visibility budget')
                 index=sample.get('receipt_index');valid=type(index) is int and 0<=index<len(receipts)
                 require(valid,'target save receipt')
                 if valid:

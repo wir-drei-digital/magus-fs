@@ -151,6 +151,8 @@ class Connected(NativeJourney):
         req=p['request'];private=p['private_receipt'];shared=p['shared_receipt'];integration=p['integration']
         assert private and shared and integration
         assert private['receipt']==integration['candidate_receipt'] and shared['submitted_revision']==p['local_revision']
+        assert integration['expected_head']==original_binding['view']['head'] and integration['branch']==original_binding['branch']
+        assert all(integration[k]==shared[k] for k in ['operation','replica','branch']) and integration['replica']==private['replica']
         assert p['applied_revision']==applied
         assert req['original_view']==original_binding['view']['view'] and req['original_head']==original_binding['view']['head']
         record={'operation':p['operation'],'revision':p['local_revision'],'original_view':original_binding['view']['view'],'original_head':original_binding['view']['head'],'private':private,'private_receipt':private['receipt'],'shared':{**shared,'candidate_receipt':integration['candidate_receipt']},'integration':integration,'applied':applied,'raw_progress':p}
@@ -206,12 +208,21 @@ class Connected(NativeJourney):
         self.assertion('faults','wss_hint','test_drop_wss_hint cursor=' in linux_logs,dropped_authenticated_text_frame=True,durable_poll_recovered=True)
         total=self.transfers();self.result['transfer'].update(procedure_body_bytes=procedure_transfer,backend_verification_bytes=total['backend_verification_body'],retries=self.result.get('fault_retries',0),unchanged_chunks_reused=True,all_physical_body_counters=total)
         self.i.write_json('service-transfer.log.json',self.log());self.save_result()
+    def until_visible(self,predicate,start):
+        # All observations share the original save deadline; exact drains keep60s.
+        while True:
+            assert time.monotonic()-start<=15,'save-to-visible deadline exceeded'
+            result=predicate();elapsed=time.monotonic()-start
+            assert elapsed<=15,'save-to-visible deadline exceeded'
+            if result:return result
+            assert elapsed<15,'save-to-visible deadline exceeded'
+            time.sleep(min(.05,15-elapsed))
     def save_target(self,mac,c,lazy,before,start,body,measure):
         prior={p['operation'] for p in before['status']['submissions']}
-        p=self.until(lambda:next((p for p in mac.status(c)['status']['submissions'] if p['operation'] not in prior),None));capture=time.monotonic()-start
+        p=self.until_visible(lambda:next((p for p in mac.status(c)['status']['submissions'] if p['operation'] not in prior),None),start);capture=time.monotonic()-start
         private=mac.cli(c,'sync','drain','--revision',p['local_revision'],'--level','private-remote','--deadline-ms','60000')['progress'];private_time=time.monotonic()-start;assert private['private_receipt']['submitted_revision']==p['local_revision']
         shared=mac.cli(c,'sync','drain','--revision',p['local_revision'],'--level','shared','--deadline-ms','60000')['progress'];shared_time=time.monotonic()-start
-        self.until(lambda:lazy.read('live/reports/procedure.txt')==body.hex());self.until(lambda:mac.ready(c,shared['shared_receipt']['head']));visible=time.monotonic()-start
+        self.until_visible(lambda:lazy.read('live/reports/procedure.txt')==body.hex(),start);self.until_visible(lambda:mac.ready(c,shared['shared_receipt']['head']),start);visible=time.monotonic()-start;assert visible<=15,'save-to-visible deadline exceeded'
         final=mac.cli(c,'sync','drain','--revision',p['local_revision'],'--level','applied','--deadline-ms','60000')['progress'];assert final['local_revision']==p['local_revision'];applied=mac.status(c)['native']['status']['Ready']['revision'];index=self.receipt(final,applied,before['status']['binding'])
         if measure:self.result['saves'].append({'capture':capture,'private':private_time,'shared':shared_time,'visible':visible,'receipt_index':index,'local_revision':p['local_revision'],'operation':p['operation']})
         self.save_result()
