@@ -240,12 +240,26 @@ impl Visibility {
         row: &Row,
         alternatives: &[Alternative],
     ) -> Result<Option<Vec<Option<String>>>> {
+        self.snapshot(state, c, &row.branch).await?;
+        let s = self.snapshots.remove(&row.branch).ok_or(Error::backend())?;
+        let result = self.paths_at(state, c, &s, row, alternatives).await;
+        self.snapshots.insert(row.branch.clone(), s);
+        result
+    }
+    /// The same rule against an explicit snapshot (R16: the snapshot whose head the
+    /// resolution's expected-head check and commit recheck use).
+    async fn paths_at(
+        &mut self,
+        state: &ServiceState,
+        c: &AuthContext,
+        s: &r::Snapshot,
+        row: &Row,
+        alternatives: &[Alternative],
+    ) -> Result<Option<Vec<Option<String>>>> {
         let mut paths = vec![];
         for alt in alternatives {
             self.revision(state, c, &alt.revision).await?;
         }
-        self.snapshot(state, c, &row.branch).await?;
-        let s = &self.snapshots[&row.branch];
         let current = s.current.as_ref().ok_or(Error::not_found())?;
         for alt in alternatives {
             paths.push(disclosed(
@@ -563,14 +577,17 @@ pub(crate) async fn resolve(
                 })
             })
             .await?;
-        // Ruling R16: named conflicts must be visible to the caller now; an unnamed sibling is
-        // acceptable only when it is hidden from the caller (it is then superseded, provided
-        // the replacement leaves its entry at the current head value).
+        let s = r::snapshot(&state.db, &c, &candidate.branch, candidate.view.as_deref()).await?;
+        s.context.action("integrate")?;
+        // Ruling R16 (R19: on the same snapshot whose head is checked against
+        // `expected_head` and re-checked at commit): named conflicts must be visible to the
+        // caller; an unnamed sibling is acceptable only when it is hidden from the caller (it
+        // is then superseded, provided the replacement leaves its entry at the head value).
         let mut visibility = Visibility::default();
         for t in &targets {
             let alternatives = alternatives(&state, &t.id).await?;
             if visibility
-                .paths(&state, &c, t, &alternatives)
+                .paths_at(&state, &c, &s, t, &alternatives)
                 .await?
                 .is_none()
             {
@@ -583,7 +600,7 @@ pub(crate) async fn resolve(
             let alternatives = alternatives(&state, &sibling.id).await?;
             if sibling.resolved
                 || visibility
-                    .paths(&state, &c, sibling, &alternatives)
+                    .paths_at(&state, &c, &s, sibling, &alternatives)
                     .await?
                     .is_some()
             {
@@ -591,8 +608,6 @@ pub(crate) async fn resolve(
             }
             hidden.push(sibling);
         }
-        let s = r::snapshot(&state.db, &c, &candidate.branch, candidate.view.as_deref()).await?;
-        s.context.action("integrate")?;
         let derived = candidate.derived.as_ref().ok_or(Error::not_found())?;
         let original: submission::CandidateRequest = r::parse(&candidate.request)?;
         let view = s.view.as_ref().ok_or(Error::not_found())?;
