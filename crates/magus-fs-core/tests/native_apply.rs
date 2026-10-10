@@ -2104,3 +2104,43 @@ fn explicit_release_frees_a_verified_displaced_file_generation() {
     let third = import(&rep, &sorted(r), sources(d.path(), &[b"third!!!"]));
     assert!(ready(&apply(&rep, &third)));
 }
+
+#[test]
+fn structural_apply_refreshes_applied_observations_without_false_unknown() {
+    let (d, rep, n, _) = fixture();
+    fs::write(n.root.join("b"), b"b0").unwrap();
+    let base = rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .unwrap()
+        .unwrap();
+    // Application 1 installs `a` (recorded); the user never edits it.
+    let mut r = next_of(&rep, &base);
+    entry_mut(&mut r, "a").content = content(b"incoming");
+    let first = import(&rep, &sorted(r), sources(d.path(), &[b"incoming"]));
+    assert!(ready(&apply(&rep, &first)));
+    // An incoming structural change re-creates every file with a new inode.
+    let mut r = next_of(&rep, &first);
+    put_dir(&mut r, "d", 0o755);
+    let second = import(&rep, &sorted(r), ChunkSource::Unavailable);
+    assert!(ready(&apply(&rep, &second)));
+    fs::write(n.root.join("b"), b"unrelated user save").unwrap();
+    let saved = rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rep.revision(&saved).unwrap().provenance,
+        "native_scan_delete_create"
+    );
+    // The never-edited applied file still protects against a later stale save.
+    fs::write(n.root.join(".a.swp"), b"before").unwrap();
+    fs::rename(n.root.join(".a.swp"), n.root.join("a")).unwrap();
+    let stale = rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rep.revision(&stale).unwrap().provenance,
+        UNKNOWN_CAUSALITY_PROVENANCE
+    );
+}

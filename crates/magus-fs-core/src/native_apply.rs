@@ -1677,14 +1677,24 @@ pub(crate) fn commit(
             }
         }
     }
+    // Rows still unconfirmed are re-observed from the committed scan: a root exchange gives
+    // every file a new inode without any user change. Rows of removed files are dropped.
     for (path, _) in &applied {
-        if !next
+        let kept = next
             .tree
             .entries
             .iter()
-            .any(|e| &e.path == path && e.content != EntryContent::Directory)
-        {
-            tx.execute("DELETE FROM native_applied WHERE path=?", [path])?;
+            .any(|e| &e.path == path && e.content != EntryContent::Directory);
+        match scan.observations.get(path).filter(|_| kept) {
+            Some(observed) => {
+                tx.execute(
+                    "UPDATE native_applied SET observation=? WHERE path=?",
+                    params![json(observed)?, path],
+                )?;
+            }
+            None => {
+                tx.execute("DELETE FROM native_applied WHERE path=?", [path])?;
+            }
         }
     }
     tx.execute(
