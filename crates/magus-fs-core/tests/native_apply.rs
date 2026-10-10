@@ -200,13 +200,27 @@ fn structural_or_readonly_parent_work_is_retained_blocked() {
     fs::set_permissions(&n.root, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Another test thread's fork may briefly share the parent's just-released owner-lock
+/// description until its exec; a child owner waits for that instead of failing.
+#[cfg(feature = "test-faults")]
+fn reopen_child(state: &str) -> Replica {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match Replica::reopen(state) {
+            Err(FsError::ReplicaBusy) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            other => return other.unwrap(),
+        }
+    }
+}
 #[cfg(feature = "test-faults")]
 #[test]
 fn native_apply_child() {
     let Ok(state) = std::env::var("FS2_NATIVE_CHILD_STATE") else {
         return;
     };
-    let rep = Replica::reopen(state).unwrap();
+    let rep = reopen_child(&state);
     let r = RevisionId::parse(std::env::var("FS2_NATIVE_CHILD_REV").unwrap()).unwrap();
     let op = OperationId::parse(std::env::var("FS2_NATIVE_CHILD_OP").unwrap()).unwrap();
     let result = rep
@@ -1691,7 +1705,7 @@ fn native_scan_child() {
     let Ok(state) = std::env::var("FS2_NATIVE_SCAN_CHILD_STATE") else {
         return;
     };
-    let rep = Replica::reopen(state).unwrap();
+    let rep = reopen_child(&state);
     println!("{:?}", rep.scan_native_status().map(|s| s.status));
 }
 #[cfg(feature = "test-faults")]
