@@ -45,12 +45,14 @@ class Reconciliation(NativeJourney):
         view, r = self.view();mutate(r['tree']);r['tree']['entries'].sort(key=lambda e: e['path'])
         _, private = self.candidate(view, r, 'alice', list(bodies))
         return self.expect(label, 'POST', self.root + '/integrations', 200, body=self.integrate_request(private, view))
-    def set_file(self, path, data, label='api-file', mode=420):
+    def set_file(self, path, data, label='api-file', mode=None):
         def mutate(t):
             old = next((e for e in t['entries'] if e['path'] == path), None)
             parent = t['root']['id'] if '/' not in path else next(e['id'] for e in t['entries'] if e['path'] == path.rsplit('/', 1)[0])
-            fresh = file_entry(path, parent, data);fresh['mode'] = mode
-            if old:old['content'] = fresh['content']
+            fresh = file_entry(path, parent, data);fresh['mode'] = 420 if mode is None else mode
+            if old:
+                old['content'] = fresh['content']
+                if mode is not None:old['mode'] = mode
             else:t['entries'].append(fresh)
         return self.publish_tree(mutate, [data] if data else [], label)
     def raw(self, ep, c, *args, timeout=40):
@@ -213,7 +215,8 @@ class Reconciliation(NativeJourney):
         absent = next(a for d in addadd for a in d['alternatives'] if a['side'] == 'base')
         assert absent['path'] is None and absent['entry'], absent
         missing = self.fail(lep, lc, 'sync', 'conflicts', 'export', '--conflict', next(d['summary']['id'] for d in addadd if absent in d['alternatives']), '--alternative', absent['id'], '--destination', lc['path'] + '/export-absent')
-        assert missing['error'] == 'absent_alternative', missing
+        # Absent and unauthorized are indistinguishable (I7): a plain not-found.
+        assert missing['error'] == 'denied', missing
         # Conflicts are scoped to the namespace/principal: another namespace sees nothing.
         self.expect('conflicts-cross-namespace', 'GET', self.root + '/conflicts', 404, actor='bob')
         partial = {'operation': identity('operation'), 'replica': loser['request']['replica'], 'conflicts': [mine[0]['id']], 'expected_head': winner_head, 'replacement': loser['private_receipt']['receipt']}
@@ -237,28 +240,62 @@ class Reconciliation(NativeJourney):
         assert self.head() == advanced['head'] and all(x['state'] == 'open' for x in self.conflicts('loser'))
         recorded = self.sql("SELECT status||' '||result FROM operations WHERE kind='resolution' ORDER BY result;")
         self.stop_service();self.start_service()
-        resolved = self.ok(lep, lc, 'sync', 'resolve', '--conflicts', ids, '--expected-head', advanced['head'], '--select', 'candidate')
+        # The conflicted owner's own bytes stayed in place while the head advanced twice.
+        held_bytes = {p: lep.read(lc, p) for p in ['reports/notes.txt', 'reports/live']}
+        assert held_bytes == {p: plan[lep.platform][p].hex() for p in held_bytes}, held_bytes
+        assert not any(x['id'] in ids.split(',') for x in self.conflicts('alice')), 'conflicts belong to the receipt-holding replica'
+        # I2: content, path and metadata replacement by ordinary local edits, then a
+        # per-conflict selection over the whole unpublished chain.
+        manual = lines('alpha', 'bravo MANUAL MERGE', 'charlie', 'delta', 'echo LINUX')
+        renamed = 'reports/new-' + lep.platform + '.txt'
+        known = {p['operation'] for p in self.subs(lep, lc)}
+        lep.run("r=s['root']\nwith open(r+'/reports/notes.txt','r+b') as f:\n f.write(bytes.fromhex(s['body']));f.truncate();f.flush();os.fsync(f.fileno())\nos.chmod(r+'/reports/notes.txt',0o600)\nos.rename(r+'/reports/new.txt',r+'/'+s['renamed'])\nprint('{}')", {'root': lc['root'], 'body': manual.hex(), 'renamed': renamed})
+        edited = self.until(lambda: next((p for p in self.subs(lep, lc) if p['operation'] not in known and p['error'] == 'conflicted'), None), 45)
+        chain = {loser['private_receipt']['receipt'], edited['private_receipt']['receipt']}
+        mine = [x for x in self.ok(lep, lc, 'sync', 'conflicts', 'list')['page']['items'] if x['receipt'] in chain and x['state'] == 'open']
+        details = {x['id']: self.ok(lep, lc, 'sync', 'conflicts', 'show', '--conflict', x['id'])['conflict'] for x in mine}
+        live = [i for i, d in details.items() if any(a['path'] == 'reports/live' for a in d['alternatives'])]
+        assert len(live) == 2, details  # the original candidate and the edited one
+        ids = ','.join(details)
+        choices = ','.join(i + ':current' for i in live)
+        resolved = self.ok(lep, lc, 'sync', 'resolve', '--conflicts', ids, '--expected-head', advanced['head'], '--select', 'candidate', '--choices', choices, '--replacement', edited['local_revision'])
         progress = resolved['progress'];assert progress['state'] == 'Shared' and progress['resolution']['conflicts'] == ids.split(','), progress
+        assert progress['resolves']['source'] == edited['local_revision']
         final = self.head();assert final == progress['shared_receipt']['head']
         view, files, _ = self.tree()
-        expect = {p: plan[lep.platform][p] for p in ['reports/notes.txt', 'reports/live', 'reports/new.txt', 'reports/' + lep.platform + '-extra.txt']}
-        expect.update({'reports/' + wep.platform + '-extra.txt': plan[wep.platform]['reports/' + wep.platform + '-extra.txt'], 'reports/race-one.txt': b'unrelated advance one', 'reports/race-two.txt': b'unrelated advance two'})
+        expect = {'reports/notes.txt': manual, 'reports/live': plan[wep.platform]['reports/live'], renamed: plan[lep.platform]['reports/new.txt'], 'reports/new.txt': plan[wep.platform]['reports/new.txt']}
+        expect.update({'reports/' + p + '-extra.txt': plan[p]['reports/' + p + '-extra.txt'] for p in self.platforms})
+        expect.update({'reports/race-one.txt': b'unrelated advance one', 'reports/race-two.txt': b'unrelated advance two'})
         for path, data in expect.items():assert self.body(view, files[path]) == data, path
-        after = self.conflicts('loser');assert all(x['state'] == 'resolved' for x in after if x['id'] in ids.split(',')), after
+        assert files['reports/notes.txt']['mode'] == 0o600, files['reports/notes.txt']
+        after = self.conflicts('loser');assert all(x['state'] == 'resolved' for x in after if x['id'] in details), after
         # The original alternatives remain addressable and exportable after resolution.
         dest = lc['path'] + '/export-after';self.ok(lep, lc, 'sync', 'conflicts', 'export', '--conflict', text['summary']['id'], '--alternative', next(a['id'] for a in text['alternatives'] if a['side'] == 'candidate'), '--destination', dest)
         assert bytes.fromhex(lep.run("print(json.dumps(open(s,'rb').read().hex()))", dest + '/reports/notes.txt')) == plan[lep.platform]['reports/notes.txt']
-        links = self.sql("SELECT count(*) FROM conflict_resolutions WHERE operation='" + progress['resolution']['operation'] + "';");assert links == str(len(mine)), links
+        links = self.sql("SELECT count(*) FROM conflict_resolutions WHERE operation='" + progress['resolution']['operation'] + "';");assert links == str(len(details)), links
         parents = json.loads(self.sql("SELECT convert_from(descriptor,'UTF8') FROM revisions WHERE revision=(SELECT revision FROM branches WHERE name='main');"))['parents']
-        assert len(parents) == 2, parents
-        # The loser's held state clears and both native folders converge on the resolution.
-        status = lep.status(lc);held = next(p for p in status['status']['submissions'] if p['operation'] == loser['operation'])
-        assert held['resolved_by']['operation'] == progress['resolution']['operation'], held
+        assert len(parents) == 3 and parents[1:] == sorted(parents[1:]), parents
+        # Every record of the resolved chain is linked; held state clears and both converge.
+        status = lep.status(lc);linked = {p['operation']: p.get('resolved_by') for p in status['status']['submissions'] if p['operation'] in (loser['operation'], edited['operation'])}
+        assert all(l and l['operation'] == progress['resolution']['operation'] for l in linked.values()), linked
         observed = {lep.platform: self.ready_files(lep, lc, expect, final, 25), wep.platform: self.ready_files(wep, wc, expect, final, 25)}
+        modes = {ep.platform: ep.run("import stat\nprint(json.dumps(stat.S_IMODE(os.stat(s).st_mode)))", c['root'] + '/reports/notes.txt') for ep, c in [(lep, lc), (wep, wc)]}
+        assert modes == {lep.platform: 0o600, wep.platform: 0o600}, modes
         later = self.set_file('reports/after-resolution.txt', b'incoming resumes', 'after-resolution')
         for ep, c in [(lep, lc), (wep, wc)]:self.ready_files(ep, c, {'reports/after-resolution.txt': b'incoming resumes'}, later['head'], 20)
         for ep, c, _ in clients:ep.stop(c)
-        self.record(lep.platform, 'explicit-and-delayed-resolution', stale_cli=stale, raced=raced, recorded_resolutions=recorded, resolution=progress, final_head=final, conflicts_after=after, resolved_link=held['resolved_by'], observed=observed, incoming_after=later)
+        # I6/I7: an entry that is authorized on no side under current metadata hides its
+        # conflict; export of an unauthorized and of an absent alternative fail identically.
+        winner_new = files['reports/new.txt']['id']
+        hidden = next(i for i, d in details.items() if d['summary']['reason'] == 'add_add' and any(a['entry'] == winner_new for a in d['alternatives']))
+        cur = next(a['id'] for a in details[hidden]['alternatives'] if a['side'] == 'current');base_alt = next(a['id'] for a in details[hidden]['alternatives'] if a['side'] == 'base')
+        self.set_file('reports/new.txt', plan[wep.platform]['reports/new.txt'], 'hide-entry', mode=0)
+        shown = self.fail(lep, lc, 'sync', 'conflicts', 'show', '--conflict', hidden)
+        unauthorized = self.fail(lep, lc, 'sync', 'conflicts', 'export', '--conflict', hidden, '--alternative', cur, '--destination', lc['path'] + '/export-hidden-current')
+        absent_export = self.fail(lep, lc, 'sync', 'conflicts', 'export', '--conflict', hidden, '--alternative', base_alt, '--destination', lc['path'] + '/export-hidden-base')
+        assert shown['error'] == unauthorized['error'] == absent_export['error'] == 'denied', (shown, unauthorized, absent_export)
+        assert hidden not in [x['id'] for x in self.ok(lep, lc, 'sync', 'conflicts', 'list')['page']['items']]
+        self.record(lep.platform, 'explicit-and-delayed-resolution', stale_cli=stale, raced=raced, recorded_resolutions=recorded, held_bytes=held_bytes, edited=edited, choices=choices, resolution=progress, final_head=final, conflicts_after=after, resolved_links=linked, observed=observed, modes=modes, incoming_after=later, hidden_conflict={'show': shown, 'unauthorized_export': unauthorized, 'absent_export': absent_export})
     def notes0_after_merge(self):
         return lines('alpha MAC', 'bravo', 'charlie', 'delta', 'echo LINUX') if 'merge' in self.phases else self.notes0
 
@@ -320,6 +357,26 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         r['tree']['entries'].append(file_entry('reports/worker.txt', reports, b'worker output'));_, private = self.worker_candidate(view, r, [b'worker output'])
         merged = self.expect('scoped-stale-merge', 'POST', self.root + '/integrations', 200, body=self.integrate_request(private, {'head': hidden['head']}), actor='worker')
         av, files, _ = self.tree();assert self.body(av, files['secret/plan']) == b'hidden v1 by alice' and self.body(av, files['reports/worker.txt']) == b'worker output'
+        # (I3/R11) A writer WITHOUT `history`: its own stale base still merges disjoint work
+        # and retains overlapping work as a conflict; reading the old view stays denied.
+        nohist_replica = 'replica:' + f'{7:032x}'
+        code, nohist = self.request('POST', self.root + '/grants', body={'delegate': {'replica': nohist_replica, 'expires': int(time.time()) + 1800, 'actions': ['read', 'write', 'integrate'], 'branches': ['main'], 'prefixes': ['reports']}})
+        assert code == 200;self.tokens['nohist'] = nohist['token']
+        view, r = self.view('nohist');reports = next(e['id'] for e in r['tree']['entries'] if e['path'] == 'reports')
+        disjoint = self.set_file('reports/nohist-other.txt', b'alice disjoint', 'nohist-disjoint-advance')
+        r['tree']['entries'].append(file_entry('reports/nohist.txt', reports, b'nohist offline'))
+        request, private = self.submit('nohist', nohist_replica, view, r, [b'nohist offline'])
+        self.expect('nohist-old-view-read-denied', 'GET', self.root + '/views/' + view['view'] + '/descriptor', 404, actor='nohist')
+        merged_nohist = self.expect('nohist-disjoint-merge', 'POST', self.root + '/integrations', 200, body=self.integrate_request(private, {'head': disjoint['head']}), actor='nohist')
+        av, files, _ = self.tree();assert self.body(av, files['reports/nohist.txt']) == b'nohist offline' and self.body(av, files['reports/nohist-other.txt']) == b'alice disjoint'
+        view, r = self.view('nohist')
+        overlap = self.set_file('reports/nohist.txt', b'alice overlapping edit', 'nohist-overlap-advance')
+        e = next(e for e in r['tree']['entries'] if e['path'] == 'reports/nohist.txt');e['content'] = file_entry('x', e['parent'], b'nohist overlapping edit')['content']
+        _, private = self.submit('nohist', nohist_replica, view, r, [b'nohist overlapping edit'])
+        conflicted = self.expect('nohist-overlap-conflict', 'POST', self.root + '/integrations', 409, body=self.integrate_request(private, {'head': overlap['head']}), actor='nohist')
+        assert conflicted['code'] == 'conflicted' and self.head() == overlap['head']
+        reasons = [x['reason'] for x in self.conflicts('nohist') if x['id'] in conflicted['conflicts']]
+        assert reasons and set(reasons) <= {'text_overlap', 'content'}, reasons
         # (b) The worker's private candidate edits an identity that is then moved out of its
         # scope: integration is denied, the private receipt is retained (re-authorized on read).
         target = self.set_file('reports/move-me.txt', b'move me v0', 'move-seed');view, r = self.view('worker')
@@ -348,6 +405,18 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         listed = self.conflicts('worker')
         self.expect('hidden-collision-denied', 'POST', self.root + '/integrations', 404, {'code': 'not_found'}, body=integration, actor='worker')
         assert self.sql("SELECT count(*) FROM conflicts WHERE integration='" + integration['operation'] + "';") == '0' and self.conflicts('worker') == listed
+        # (I4/R12) Narrowed rights are re-checked before any retained outcome is recorded.
+        view, r = self.view('worker');reports = next(e['id'] for e in r['tree']['entries'] if e['path'] == 'reports')
+        r['tree']['entries'].append(file_entry('reports/r12.txt', reports, b'unknown then narrowed'));_, narrowed_private = self.worker_candidate(view, r, [b'unknown then narrowed'], UNKNOWN)
+        def narrow(t):next(e for e in t['entries'] if e['path'] == 'reports')['mode'] = 0o555
+        narrowed_head = self.publish_tree(narrow, label='r12-narrow')
+        for label, head in [('r12-unknown-denied', narrowed_head['head']), ('r12-stale-denied', view['head'])]:
+            attempt = self.integrate_request(narrowed_private, {'head': head})
+            self.expect(label, 'POST', self.root + '/integrations', 404, {'code': 'not_found'}, body=attempt, actor='worker')
+            assert self.sql("SELECT count(*) FROM operations WHERE operation='" + attempt['operation'] + "';") == '0'
+            assert self.sql("SELECT count(*) FROM conflicts WHERE integration='" + attempt['operation'] + "';") == '0'
+        def widen(t):next(e for e in t['entries'] if e['path'] == 'reports')['mode'] = 0o755
+        self.publish_tree(widen, label='r12-widen')
         # (d) Service-level R1/R6/R10: an unknown-causality candidate is never fast-forwarded.
         view, r = self.view('worker');reports = next(e['id'] for e in r['tree']['entries'] if e['path'] == 'reports')
         r['tree']['entries'].append(file_entry('reports/unknown.txt', reports, b'unknown base'));_, private = self.worker_candidate(view, r, [b'unknown base'], UNKNOWN)
@@ -374,6 +443,14 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         r['tree']['entries'].append(file_entry('reports/unknown.txt', reports_e['id'], b'explicit replacement'));_, replacement = self.worker_candidate(view, r, [b'explicit replacement'])
         resolution = {'operation': identity('operation'), 'replica': WORKER, 'conflicts': [unknown_conflict], 'expected_head': widened['head'], 'replacement': replacement['receipt']}
         self.expect('resolution-other-credential-replacement', 'POST', self.root + '/resolutions', 404, body=dict(resolution, replica=REPLICA), actor='alice')
+        # (I5/R12) Another replica's head-based replacement cannot close these conflicts.
+        av, ar = self.view();_, foreign = self.candidate(av, ar, 'alice', [])
+        self.expect('resolution-other-replica', 'POST', self.root + '/resolutions', 404, {'code': 'not_found'}, body={'operation': identity('operation'), 'replica': REPLICA, 'conflicts': [unknown_conflict], 'expected_head': av['head'], 'replacement': foreign['receipt']})
+        assert unknown_conflict not in [x['id'] for x in self.conflicts('alice')]
+        assert [x['state'] for x in self.conflicts('worker') if x['id'] == unknown_conflict] == ['open']
+        view, r = self.view('worker');reports_e = next(e for e in r['tree']['entries'] if e['path'] == 'reports')
+        r['tree']['entries'].append(file_entry('reports/unknown.txt', reports_e['id'], b'explicit replacement'));_, replacement = self.worker_candidate(view, r, [b'explicit replacement'])
+        resolution = {'operation': identity('operation'), 'replica': WORKER, 'conflicts': [unknown_conflict], 'expected_head': view['head'], 'replacement': replacement['receipt']}
         done = self.expect('resolution-explicit', 'POST', self.root + '/resolutions', 200, body=resolution, actor='worker')
         self.expect('resolution-replay', 'POST', self.root + '/resolutions', 200, done, body=resolution, actor='worker')
         self.expect('resolution-digest-change', 'POST', self.root + '/resolutions', 409, {'code': 'conflict'}, body=dict(resolution, expected_head=secrets.token_hex(16)), actor='worker')
@@ -392,6 +469,11 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         assert self.head() == advance['head'] and self.sql("SELECT count(*) FROM operations WHERE operation='" + integration['operation'] + "';") == '0'
         self.stop_service();self.start_service()
         self.record('service', 'scoped-negatives', hidden_merge=merged, moved=moved, collision=collide, unknown=body, resolution=done, revoked_status=status)
+    def submit(self, actor, replica, view, r, bodies):
+        r['parents'] = [view['revision']];r['replica'] = replica;r['operation'] = identity('operation')
+        upload, rid = self.stage(r, actor, bodies)
+        request = {'operation': r['operation'], 'replica': replica, 'original_view': view['view'], 'original_head': view['head'], 'revision': rid, 'upload': upload}
+        return request, self.expect('private-' + actor, 'POST', self.root + '/candidates', 200, body=request, actor=actor)
     def stage_request(self, view, r, bodies):
         r['parents'] = [view['revision']];r['replica'] = WORKER;r['operation'] = identity('operation')
         upload, rid = self.stage(r, 'worker', bodies)
