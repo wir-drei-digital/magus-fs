@@ -161,8 +161,10 @@ struct Row {
     candidate: String,
     sequence: i64,
     resolved: bool,
+    replica: String,
+    entry: Option<String>,
 }
-const SELECT: &str = "SELECT c.id,c.branch,c.receipt,c.integration,c.reason,c.candidate_revision,c.sequence,(EXISTS(SELECT 1 FROM conflict_resolutions x WHERE x.conflict=c.id)) FROM conflicts c";
+const SELECT: &str = "SELECT c.id,c.branch,c.receipt,c.integration,c.reason,c.candidate_revision,c.sequence,(EXISTS(SELECT 1 FROM conflict_resolutions x WHERE x.conflict=c.id)),c.replica,c.entry FROM conflicts c";
 fn row(r: &tokio_postgres::Row) -> Row {
     Row {
         id: r.get(0),
@@ -173,6 +175,8 @@ fn row(r: &tokio_postgres::Row) -> Row {
         candidate: r.get(5),
         sequence: r.get(6),
         resolved: r.get(7),
+        replica: r.get(8),
+        entry: r.get(9),
     }
 }
 fn summary(row: &Row) -> Result<ConflictSummary> {
@@ -187,13 +191,75 @@ fn summary(row: &Row) -> Result<ConflictSummary> {
         },
     })
 }
-/// The caller's own conflicts on a branch its current grant names.
+/// Conflicts retained for candidates of the caller's own replica (the holder of the
+/// original private receipt) on a branch its current grant names.
 async fn load(state: &ServiceState, c: &AuthContext, id: &str) -> Result<Row> {
     let id = ConflictId::parse(id).map_err(|_| Error::not_found())?;
     let row = state.db.acquire().await?.run(|db| Box::pin(async move {
-        Ok(db.query_opt(&format!("{SELECT} WHERE c.namespace=$1 AND c.id=$2 AND c.principal=$3 AND c.branch=ANY($4)"),&[&c.namespace,&id.as_str(),&c.principal,&c.branches]).await?.map(|r| row(&r)))
+        Ok(db.query_opt(&format!("{SELECT} WHERE c.namespace=$1 AND c.id=$2 AND c.principal=$3 AND c.replica=$4 AND c.branch=ANY($5)"),&[&c.namespace,&id.as_str(),&c.principal,&c.replica,&c.branches]).await?.map(|r| row(&r)))
     })).await?;
     row.ok_or(Error::not_found())
+}
+/// Per-request caches of current branch snapshots and side descriptors.
+#[derive(Default)]
+struct Visibility {
+    snapshots: BTreeMap<String, r::Snapshot>,
+    revisions: BTreeMap<String, Revision>,
+}
+impl Visibility {
+    async fn snapshot(
+        &mut self,
+        state: &ServiceState,
+        c: &AuthContext,
+        branch: &str,
+    ) -> Result<&r::Snapshot> {
+        if !self.snapshots.contains_key(branch) {
+            let s = r::snapshot(&state.db, c, branch, None).await?;
+            self.snapshots.insert(branch.to_owned(), s);
+        }
+        Ok(&self.snapshots[branch])
+    }
+    async fn revision(
+        &mut self,
+        state: &ServiceState,
+        c: &AuthContext,
+        id: &str,
+    ) -> Result<&Revision> {
+        if !self.revisions.contains_key(id) {
+            let r = descriptor(state, c, id).await?;
+            self.revisions.insert(id.to_owned(), r);
+        }
+        Ok(&self.revisions[id])
+    }
+    /// Disclosed paths per alternative under the caller's current grant, scope and entry
+    /// authorization. An entry conflict whose identity is authorized on no side is hidden.
+    async fn paths(
+        &mut self,
+        state: &ServiceState,
+        c: &AuthContext,
+        row: &Row,
+        alternatives: &[Alternative],
+    ) -> Result<Option<Vec<Option<String>>>> {
+        let mut paths = vec![];
+        for alt in alternatives {
+            self.revision(state, c, &alt.revision).await?;
+        }
+        self.snapshot(state, c, &row.branch).await?;
+        let s = &self.snapshots[&row.branch];
+        let current = s.current.as_ref().ok_or(Error::not_found())?;
+        for alt in alternatives {
+            paths.push(disclosed(
+                s,
+                &self.revisions[&alt.revision],
+                current,
+                alt.entry.as_ref(),
+            ));
+        }
+        if row.entry.is_some() && paths.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        Ok(Some(paths))
+    }
 }
 async fn descriptor(state: &ServiceState, c: &AuthContext, revision: &str) -> Result<Revision> {
     let bytes = state
@@ -271,12 +337,25 @@ pub(crate) async fn list(
     let after = cursor(&c, raw)?;
     let limit = MAX_PAGE_ITEMS as i64 + 1;
     let rows = state.db.acquire().await?.run(|db| { let c=&c; Box::pin(async move {
-        Ok(db.query(&format!("{SELECT} WHERE c.namespace=$1 AND c.principal=$2 AND c.branch=ANY($3) AND c.sequence>$4 ORDER BY c.sequence LIMIT $5"),&[&c.namespace,&c.principal,&c.branches,&after,&limit]).await?.iter().map(row).collect::<Vec<_>>())
+        Ok(db.query(&format!("{SELECT} WHERE c.namespace=$1 AND c.principal=$2 AND c.replica=$3 AND c.branch=ANY($4) AND c.sequence>$5 ORDER BY c.sequence LIMIT $6"),&[&c.namespace,&c.principal,&c.replica,&c.branches,&after,&limit]).await?.iter().map(row).collect::<Vec<_>>())
     })}).await?;
     let more = rows.len() > MAX_PAGE_ITEMS;
     let rows = &rows[..rows.len().min(MAX_PAGE_ITEMS)];
+    // A filtered page may be short or empty; the cursor still advances past scanned rows.
+    let mut visibility = Visibility::default();
+    let mut items = vec![];
+    for row in rows {
+        let alternatives = alternatives(&state, &row.id).await?;
+        if visibility
+            .paths(&state, &c, row, &alternatives)
+            .await?
+            .is_some()
+        {
+            items.push(summary(row)?);
+        }
+    }
     Ok(Json(ConflictPage {
-        items: rows.iter().map(summary).collect::<Result<_>>()?,
+        items,
         next: if more {
             rows.last().map(|r| token(&c, r.sequence))
         } else {
@@ -317,19 +396,23 @@ pub(crate) async fn detail(
 ) -> Result<Json<ConflictDetail>> {
     let c = state.auth(&headers, &ns, "read").await?;
     let row = load(&state, &c, &id).await?;
-    let s = r::snapshot(&state.db, &c, &row.branch, None).await?;
-    let current = s.current.as_ref().ok_or(Error::not_found())?;
+    let alternatives = alternatives(&state, &row.id).await?;
+    let mut visibility = Visibility::default();
+    let paths = visibility
+        .paths(&state, &c, &row, &alternatives)
+        .await?
+        .ok_or(Error::not_found())?;
+    let s = visibility
+        .snapshots
+        .remove(&row.branch)
+        .ok_or(Error::backend())?;
     let mut refs = vec![];
-    let mut cache: BTreeMap<String, Revision> = BTreeMap::new();
-    for alt in alternatives(&state, &row.id).await? {
-        if !cache.contains_key(&alt.revision) {
-            let revision = descriptor(&state, &c, &alt.revision).await?;
-            cache.insert(alt.revision.clone(), revision);
-        }
+    for (alt, path) in alternatives.into_iter().zip(paths) {
+        // `path: None` is the explicit selector for absent *or* currently unauthorized.
         refs.push(AlternativeRef {
             id: AlternativeId::parse(alt.id).map_err(|_| Error::backend())?,
             side: alt.side,
-            path: disclosed(&s, &cache[&alt.revision], current, alt.entry.as_ref()),
+            path,
             entry: alt.entry,
         });
     }
@@ -360,14 +443,8 @@ pub(crate) async fn alternative(
     let s = r::snapshot(&state.db, &c, &row.branch, None).await?;
     let current = s.current.as_ref().ok_or(Error::not_found())?;
     let side = descriptor(&state, &c, &alt.revision).await?;
-    if let Some(entry) = &alt.entry {
-        if !side.tree.entries.iter().any(|e| &e.id == entry) {
-            return Err(Error {
-                status: StatusCode::NOT_FOUND,
-                code: "absent_alternative",
-            });
-        }
-    }
+    // Authorization first: an absent identity and a present-but-unauthorized one are the
+    // same `404 not_found` (views::alternative requires the identity in the projection).
     let projected = views::alternative(
         &side,
         &current.tree,
@@ -440,8 +517,12 @@ pub(crate) async fn resolve(
         let targets = state.db.acquire().await?.run(|db| { let c=&c; let ids=&ids; Box::pin(async move {
             Ok(db.query(&format!("{SELECT} WHERE c.namespace=$1 AND c.principal=$2 AND c.id=ANY($3) AND c.branch=ANY($4)"),&[&c.namespace,&c.principal,ids,&c.branches]).await?.iter().map(row).collect::<Vec<_>>())
         })}).await?;
+        // R12: only the replica holding the conflicted candidates' original private receipts
+        // (the source of this replacement) can close them, on the same branch.
         if targets.len() != req.conflicts.len()
-            || targets.iter().any(|t| t.branch != candidate.branch)
+            || targets
+                .iter()
+                .any(|t| t.branch != candidate.branch || t.replica != c.replica)
         {
             return Err(Error::not_found());
         }
@@ -497,8 +578,12 @@ pub(crate) async fn resolve(
             }
             // Current rights and scope over the complete replacement; never broadens access.
             submission::authorize_candidate(&s, derived)?;
-            for t in &targets {
-                let id = RevisionId::parse(t.candidate.clone()).map_err(|_| Error::backend())?;
+            let mut candidates = targets
+                .iter()
+                .map(|t| RevisionId::parse(t.candidate.clone()).map_err(|_| Error::backend()))
+                .collect::<Result<Vec<_>>>()?;
+            candidates.sort();
+            for id in candidates {
                 if !resolved.parents.contains(&id) {
                     resolved.parents.push(id);
                 }
@@ -591,6 +676,73 @@ mod tests {
             prefixes: vec!["".into()],
             depth: 0,
         }
+    }
+    #[test]
+    fn absent_and_unauthorized_alternatives_are_indistinguishable() {
+        let principal = PrincipalId::parse(format!("principal:{:032x}", 1)).unwrap();
+        let group = GroupId::parse(format!("group:{:032x}", 1)).unwrap();
+        let authority = Authority {
+            principal: principal.clone(),
+            uid: 1001,
+            gid: 1001,
+            primary_group: group.clone(),
+            groups: vec![group.clone()],
+            dac_override: false,
+            ownership_transfer: false,
+        };
+        let root = Root {
+            id: EntryId::random().unwrap(),
+            owner: principal.clone(),
+            group: group.clone(),
+            mode: 0o755,
+        };
+        let entry = |mode| Entry {
+            path: "f".into(),
+            id: EntryId::parse(format!("entry:{:032x}", 7)).unwrap(),
+            parent: root.id.clone(),
+            owner: principal.clone(),
+            group: group.clone(),
+            mode,
+            content: EntryContent::Directory,
+        };
+        let revision = |entries| Revision {
+            format: FORMAT.into(),
+            hash: HASH.into(),
+            layout: LAYOUT.into(),
+            parents: vec![],
+            operation: OperationId::random().unwrap(),
+            replica: ReplicaId::random().unwrap(),
+            principal: principal.clone(),
+            captured_at_ns: 0,
+            coverage: vec!["".into()],
+            provenance: "explicit".into(),
+            restoration: None,
+            tree: Tree {
+                root: root.clone(),
+                entries,
+            },
+        };
+        let id = entry(0).id;
+        let unauthorized = revision(vec![entry(0)]);
+        let absent = revision(vec![]);
+        let readable = revision(vec![entry(0o755)]);
+        let check = |side: &Revision, current: &Revision| {
+            views::alternative(
+                side,
+                &current.tree,
+                &authority,
+                &["".into()],
+                true,
+                Some(&id),
+            )
+            .map(|_| ())
+            .map_err(|e| (e.status, e.code))
+        };
+        // Current metadata governs a present identity: mode 0 now hides the side's entry.
+        let denied = check(&readable, &unauthorized).unwrap_err();
+        assert_eq!(check(&absent, &unauthorized).unwrap_err(), denied);
+        assert_eq!(denied, (StatusCode::NOT_FOUND, "not_found"));
+        assert!(check(&readable, &readable).is_ok());
     }
     #[test]
     fn continuation_tokens_are_namespace_principal_and_query_bound() {
