@@ -345,7 +345,10 @@ pub(crate) async fn candidate(
                 Box::pin(async move {
                     Ok(db
                         .query_opt(
-                            "SELECT 1 FROM conflicts WHERE namespace=$1 AND entry=ANY($2) LIMIT 1",
+                            // Only identities that existed in a shared head (base or head
+                            // side of a recorded conflict); a candidate's own never-published
+                            // identities (e.g. one side of an add/add) stay usable.
+                            "SELECT 1 FROM conflicts WHERE namespace=$1 AND entry=ANY($2) AND ((payload::jsonb #> '{conflict,base}') <> 'null'::jsonb OR (payload::jsonb #> '{conflict,left}') <> 'null'::jsonb) LIMIT 1",
                             &[ns, introduced],
                         )
                         .await?
