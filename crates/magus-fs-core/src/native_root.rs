@@ -44,6 +44,16 @@ pub(crate) enum RootPhase {
 pub(crate) struct Snapshot {
     pub(crate) observation: Observation,
     pub(crate) digest: Option<String>,
+    /// Wall time the digest was computed; a digest of a file changed within one second of
+    /// it is "racy" and never reused (timestamps can be coarser than a same-size rewrite).
+    #[serde(default)]
+    pub(crate) hashed_ns: u64,
+}
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RootVersion {
@@ -254,6 +264,7 @@ impl Inventory {
         if info.mode & 0o7000 != 0 || !metadata_inventory(&file, path)?.0.is_empty() {
             self.unsupported(path.into())?;
         }
+        let mut hashed_ns = 0;
         let digest = if m.is_dir() {
             info.names = names(&file).map_err(|e| self.unreadable(e))?;
             for raw in info.names.clone() {
@@ -302,16 +313,23 @@ impl Inventory {
             }
             let reused = self.prior.as_ref().and_then(|p| p.get(path)).and_then(|p| {
                 let o = &p.observation;
+                let changed_ns = (o.ctime.max(0) as u64)
+                    .saturating_mul(1_000_000_000)
+                    .saturating_add(o.ctime_ns.max(0) as u64);
                 (na::same_generation(o, &info)
                     && o.ctime == info.ctime
-                    && o.ctime_ns == info.ctime_ns)
-                    .then(|| p.digest.clone())
-                    .flatten()
+                    && o.ctime_ns == info.ctime_ns
+                    && changed_ns.saturating_add(1_000_000_000) < p.hashed_ns)
+                    .then(|| (p.digest.clone(), p.hashed_ns))
             });
             match reused {
-                Some(digest) => Some(digest),
+                Some((digest, at)) => {
+                    hashed_ns = at;
+                    digest
+                }
                 None => {
                     HASHED.with(|h| h.set(h.get().saturating_add(info.size)));
+                    hashed_ns = now_ns();
                     Some(na::native_hash(&mut file)?)
                 }
             }
@@ -324,6 +342,7 @@ impl Inventory {
             Snapshot {
                 observation: info,
                 digest,
+                hashed_ns,
             },
         );
         Ok(())
@@ -922,10 +941,7 @@ pub(crate) fn rescan(
     let held = open_dir(&displaced, ".")?;
     // Stat-gated: unchanged generations reuse digests; a full rehash still runs at least every
     // 60s (filesystem timestamp granularity can hide a same-size write) and when verifying.
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+    let now_ns = now_ns();
     let full = full || now_ns.saturating_sub(ri.full_hash_ns) > 60_000_000_000;
     let inventory = match Inventory::gated(displaced, false, (!full).then(|| ri.displaced.clone()))
     {
@@ -958,6 +974,8 @@ pub(crate) fn rescan(
     for (path, now) in &inventory.entries {
         let previous = ri.displaced.get(path);
         if previous.is_some_and(|p| unchanged(p, now)) {
+            // Keep the newest hash time so a once-racy digest can become reusable.
+            next.displaced.insert(path.clone(), now.clone());
             continue;
         }
         if local(path) {

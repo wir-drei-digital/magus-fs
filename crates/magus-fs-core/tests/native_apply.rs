@@ -1985,6 +1985,9 @@ fn retained_root_rescans_are_stat_gated() {
     put_dir(&mut r, "d", 0o755);
     let next = import(&rep, &sorted(r), ChunkSource::Unavailable);
     assert!(ready(&apply(&rep, &next)));
+    // Digests of files changed within 1s of hashing are racy and re-read (the same-size
+    // rewrite in the held-descriptor test covers that); after 1s they are reused.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     rep.scan_native_status().unwrap();
     let before = retained_hash_bytes_this_thread();
     for _ in 0..3 {
