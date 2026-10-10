@@ -161,6 +161,10 @@ class OwnedInfra:
                 break
             time.sleep(.25)
         else:
+            # Retain the owned container's logs and state before cleanup removes them.
+            logs=self.docker('logs',self.pg,check=False,evidence=False)
+            (self.output/'pg-readiness-failure.log').write_text(logs.stdout+logs.stderr)
+            self.write_json('pg-readiness-failure-state.json',self.inspect('container',self.pg).get('State',{}))
             raise RuntimeError('PG readiness timeout')
         self.certificates()
         config={'listen':'0.0.0.0:8443','database':f'host=pg user=postgres password={pgpass} dbname=postgres connect_timeout=2 options=\'-c statement_timeout=2000 -c lock_timeout=2000 -c idle_in_transaction_session_timeout=5000\'','s3_endpoint':'http://s3:8333','s3_bucket':'fs2','s3_access_key':self.access,'s3_secret_key':self.secret,'private_backend_http':True,'tls_cert':'/control/server.crt','tls_key':'/control/server.key'}

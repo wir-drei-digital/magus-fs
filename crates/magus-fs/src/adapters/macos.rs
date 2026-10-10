@@ -1,5 +1,8 @@
 //! Fixed configured actor over loopback NFS. Wire AUTH_UNIX is not authentication.
 //! Issued file identities/generations are retained until the daemon exits: NFS has no CLOSE.
+//! Attached mounts adopt accepted views as epochs: regular-file handles are epoch-qualified,
+//! directory handles are stable. Old file handles read their epoch's bytes under current
+//! authority; mutations through them fail NFS3ERR_STALE before any effect.
 use async_trait::async_trait;
 use magus_fs_core::*;
 use nfsserve::{
@@ -7,7 +10,17 @@ use nfsserve::{
     tcp::{NFSTcp, NFSTcpListener},
     vfs::*,
 };
-use std::{collections::BTreeMap, io::Write, path::Path, sync::Mutex};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Write,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+/// Retained epoch bound: NFS clients never close handles, so every issued epoch stays rooted
+/// for the daemon lifetime. Adoption beyond this bound is deferred and reported.
+const MAX_RETAINED_EPOCHS: usize = 128;
 type Result<T> = std::result::Result<T, FsError>;
 fn error(e: FsError) -> nfsstat3 {
     match e {
@@ -45,7 +58,10 @@ fn now() -> nfstime3 {
 struct State {
     ws: Workspace,
     config: ReplicaConfig,
-    ids: Vec<EntryId>,
+    /// fileid - 1 -> (identity, issuing epoch). Directory identities are epoch-stable.
+    ids: Vec<(EntryId, u64)>,
+    directories: BTreeSet<EntryId>,
+    epoch: u64,
     held: BTreeMap<u64, Handle>,
     times: BTreeMap<u64, Times>,
     started: Times,
@@ -73,24 +89,45 @@ impl State {
     fn identity(&self, id: u64) -> Result<&EntryId> {
         id.checked_sub(1)
             .and_then(|n| self.ids.get(n as usize))
+            .map(|v| &v.0)
             .ok_or(FsError::StaleHandle)
     }
-    fn id(&mut self, identity: &EntryId) -> u64 {
-        if let Some(i) = self.ids.iter().position(|v| v == identity) {
+    /// A file handle issued in an earlier adopted epoch.
+    fn stale(&self, id: u64) -> Result<bool> {
+        let identity = self.identity(id)?;
+        Ok(!self.directories.contains(identity) && self.ids[(id - 1) as usize].1 != self.epoch)
+    }
+    fn id(&mut self, identity: &EntryId, directory: bool) -> u64 {
+        if directory {
+            self.directories.insert(identity.clone());
+        }
+        let epoch = self.epoch;
+        let stable = self.directories.contains(identity);
+        if let Some(i) = self
+            .ids
+            .iter()
+            .position(|v| &v.0 == identity && (stable || v.1 == epoch))
+        {
             i as u64 + 1
         } else {
-            self.ids.push(identity.clone());
+            self.ids.push((identity.clone(), epoch));
             self.ids.len() as u64
         }
     }
     fn issue(&mut self, entry: &Entry) -> Result<u64> {
-        let id = self.id(&entry.id);
+        let id = self.id(&entry.id, entry.content == EntryContent::Directory);
         if entry.content != EntryContent::Directory && !self.held.contains_key(&id) {
             self.held.insert(id, self.ws.retain_identity(&entry.id)?);
         }
         Ok(id)
     }
     fn entry(&self, id: u64) -> Result<Entry> {
+        if self.stale(id)? {
+            // An old epoch handle keeps its own bytes/size, subject to current authority.
+            return self
+                .ws
+                .handle_attributes(self.held.get(&id).ok_or(FsError::StaleHandle)?);
+        }
         match self.ws.lookup_identity(self.identity(id)?) {
             Ok(e) => Ok(e),
             // Only an already-issued exact capability can supply an unlinked identity.
@@ -101,9 +138,34 @@ impl State {
         }
     }
     fn handle(&mut self, id: u64) -> Result<Handle> {
+        if self.stale(id)? {
+            return self.held.get(&id).cloned().ok_or(FsError::StaleHandle);
+        }
         let entry = self.entry(id)?;
         self.issue(&entry)?;
         self.held.get(&id).cloned().ok_or(FsError::IsDirectory)
+    }
+    /// Epochs still rooted by issued handles (NFS never releases them).
+    fn retained_epochs(&self) -> usize {
+        self.held
+            .values()
+            .map(Handle::epoch)
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+    /// Advance every directory's change time so client name caches revalidate.
+    fn adopted(&mut self, epoch: u64) {
+        self.epoch = epoch;
+        let directories: Vec<u64> = self
+            .ids
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| self.directories.contains(&v.0))
+            .map(|(i, _)| i as u64 + 1)
+            .collect();
+        for id in directories {
+            self.changed(id, true);
+        }
     }
     fn child(&self, id: u64, name: &[u8]) -> Result<String> {
         let parent = self.entry(id)?;
@@ -196,7 +258,7 @@ impl State {
     }
 }
 struct Adapter {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     read_only: bool,
     nonce: Vec<u8>,
     uid: u32,
@@ -406,7 +468,7 @@ impl NFSFileSystem for Adapter {
             let mode = s.creation_mode(&a, 0o666, self.uid)?;
             let path = s.child(dir, name)?;
             let h = s.ws.create(&path, mode)?;
-            let id = s.id(h.entry_id());
+            let id = s.id(h.entry_id(), false);
             s.held.insert(id, h.clone());
             s.changed(id, true);
             s.requested_times(id, &a);
@@ -440,7 +502,7 @@ impl NFSFileSystem for Adapter {
             let mode = s.creation_mode(&a, 0o777, self.uid)?;
             let path = s.child(dir, name)?;
             let identity = s.ws.mkdir(&path, mode)?;
-            let id = s.id(&identity);
+            let id = s.id(&identity, true);
             s.changed(id, true);
             s.requested_times(id, &a);
             s.changed(dir, true);
@@ -500,8 +562,8 @@ impl NFSFileSystem for Adapter {
             let parent = s.entry(dir)?;
             let children = s.ws.directory_entries(&parent.path)?;
             let mut entries = vec![];
-            for (name, identity, _) in children {
-                let id = s.id(&identity);
+            for (name, identity, directory) in children {
+                let id = s.id(&identity, directory);
                 if id <= after {
                     continue;
                 }
@@ -575,14 +637,26 @@ fn serve(
     rep.check_content_path(mountpoint)?;
     let uid = unsafe { libc::geteuid() };
     let actor = rep.actor_for_uid(uid)?;
-    let ws = rep.begin(revision, actor, read_only)?;
+    let binding = rep.sync_status()?.binding;
+    let ws = if binding.is_some() {
+        rep.begin_live(revision, actor.clone(), read_only)?
+    } else {
+        rep.begin(revision, actor.clone(), read_only)?
+    };
     let root = ws.lookup("")?.id;
+    let epoch = if binding.is_some() {
+        rep.live_status()?.epoch
+    } else {
+        0
+    };
     let t = now();
     let adapter = Adapter {
-        state: Mutex::new(State {
+        state: Arc::new(Mutex::new(State {
             ws,
             config,
-            ids: vec![root],
+            directories: BTreeSet::from([root.clone()]),
+            ids: vec![(root, epoch)],
+            epoch,
             held: BTreeMap::new(),
             times: BTreeMap::new(),
             started: Times {
@@ -590,14 +664,23 @@ fn serve(
                 mtime: t,
                 ctime: t,
             },
-        }),
+        })),
         read_only,
         nonce: OperationId::random()?.as_str().as_bytes()[10..].to_vec(),
         uid,
     };
+    let live_state = adapter.state.clone();
     let _control = super::control::Server::start(rep.clone(), state, read_only)?;
     std::fs::create_dir(mountpoint)?;
     rep.check_content_path(mountpoint)?;
+    if binding.is_some() && !prepare {
+        let rep = rep.clone();
+        let mountpoint = mountpoint.to_path_buf();
+        let shared_live = binding
+            .as_ref()
+            .is_some_and(|b| b.publication == PublicationMode::SharedLive);
+        std::thread::spawn(move || live(rep, live_state, mountpoint, actor, shared_live));
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -611,4 +694,124 @@ fn serve(
         if !prepare {std::thread::spawn(move||{let result=std::process::Command::new(&command[0]).args(&command[1..]).status();eprintln!("native mount result {result:?}; endpoint stays foreground for owned unmount/cleanup");});}
         listener.handle_forever().await.map_err(std::io::Error::other)?;Ok(())
     })
+}
+/// The kernel mount at `mountpoint` is NFS (the client path, not this process's state).
+fn nfs_mounted(mountpoint: &Path) -> bool {
+    let Ok(path) = std::ffi::CString::new(mountpoint.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: path is NUL terminated and fs is written on success.
+    if unsafe { libc::statfs(path.as_ptr(), fs.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let fs = unsafe { fs.assume_init() };
+    let kind = unsafe { std::ffi::CStr::from_ptr(fs.f_fstypename.as_ptr()) };
+    let on = unsafe { std::ffi::CStr::from_ptr(fs.f_mntonname.as_ptr()) };
+    kind.to_bytes() == b"nfs" && on.to_bytes() == mountpoint.as_os_str().as_encoded_bytes()
+}
+/// Acknowledge only after an ordinary kernel path walk through the NFS client observes the
+/// adopted epoch: new fileids, kinds and sizes for current names and absence of removed names.
+fn verify(
+    rep: &Replica,
+    state: &Mutex<State>,
+    mountpoint: &Path,
+    adoption: &Adoption,
+) -> Result<()> {
+    if !nfs_mounted(mountpoint) {
+        return Err(FsError::StaleHandle);
+    }
+    let current = rep.revision(&adoption.revision)?;
+    let expected = {
+        let mut s = state.lock().map_err(|_| FsError::ReplicaBusy)?;
+        let mut rows = vec![];
+        for e in &current.tree.entries {
+            // The fixed actor cannot observe names it may not traverse; skip, never guess.
+            if s.ws.lookup(&e.path).is_err() {
+                continue;
+            }
+            let directory = e.content == EntryContent::Directory;
+            let size = match &e.content {
+                EntryContent::File { version } => version.size,
+                EntryContent::Directory => 0,
+            };
+            rows.push((e.path.clone(), directory, size, s.id(&e.id, directory)));
+        }
+        rows
+    };
+    for (path, directory, size, fileid) in &expected {
+        let m = std::fs::symlink_metadata(mountpoint.join(path))?;
+        if m.ino() != *fileid || m.is_dir() != *directory || (!directory && m.len() != *size) {
+            return Err(FsError::StaleHandle);
+        }
+    }
+    for e in &adoption.entries {
+        if !e.path.is_empty()
+            && !current.tree.entries.iter().any(|v| v.path == e.path)
+            && std::fs::symlink_metadata(mountpoint.join(&e.path)).is_ok()
+        {
+            return Err(FsError::StaleHandle);
+        }
+    }
+    Ok(())
+}
+fn live(rep: Replica, state: Arc<Mutex<State>>, mountpoint: PathBuf, actor: Actor, shared: bool) {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _hints = crate::sync::subscribe(rep.clone(), stop);
+    let Ok(mut incoming) = crate::sync::Incoming::new(&rep) else {
+        return;
+    };
+    let mut pending = rep
+        .live_status()
+        .ok()
+        .filter(|_| shared)
+        .and_then(|status| {
+            rep.revision(&status.revision).ok().map(|r| Adoption {
+                revision: status.revision,
+                epoch: status.epoch,
+                entries: r.tree.entries,
+            })
+        });
+    let mut pressure = false;
+    loop {
+        let result = incoming.poll(|binding, generation| {
+            let mut s = state.lock().map_err(|_| FsError::ReplicaBusy)?;
+            let retained = s.retained_epochs();
+            if retained >= MAX_RETAINED_EPOCHS {
+                if !pressure {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"live_pressure":{"retained_epochs":retained,"limit":MAX_RETAINED_EPOCHS,"adoption":"deferred"}})
+                    );
+                }
+                pressure = true;
+                // Deferred like dirty state: authority is still observed, bytes stay retained.
+                return Err(FsError::DirtyWorkingState);
+            }
+            pressure = false;
+            let adoption = rep.adopt_remote_view(binding, generation, actor.clone())?;
+            s.adopted(adoption.epoch);
+            Ok(adoption)
+        });
+        if let Ok(Some(adoption)) = result {
+            pending = Some(adoption);
+        }
+        if let Some(adoption) = &pending {
+            let started = Instant::now();
+            if verify(&rep, &state, &mountpoint, adoption).is_ok()
+                && rep
+                    .acknowledge_adoption(&adoption.revision, adoption.epoch)
+                    .is_ok()
+            {
+                eprintln!(
+                    "live_applied epoch={} revision={} client_verification_us={}",
+                    adoption.epoch,
+                    adoption.revision.as_str(),
+                    started.elapsed().as_micros()
+                );
+                pending = None;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
