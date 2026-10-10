@@ -87,6 +87,20 @@ pub(crate) fn record(core: &Core, r: Retained<'_>) -> Result<(), FsError> {
     )?;
     Ok(())
 }
+/// A record already exists for this owner-private retained copy (checked before hashing).
+pub(crate) fn recorded(core: &Core, operation: &OperationId, copy: &Path) -> Result<bool, FsError> {
+    let retained = copy.to_str().ok_or(FsError::UnsafeStorage)?;
+    Ok(core
+        .journal
+        .db
+        .query_row(
+            "SELECT 1 FROM native_recovery WHERE operation=? AND retained=?",
+            params![operation.as_str(), retained],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
 fn load(core: &Core, id: &NativeRecoveryId) -> Result<(NativeRecoveryRecord, PathBuf), FsError> {
     let (bytes, retained) = core
         .journal

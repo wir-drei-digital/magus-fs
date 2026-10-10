@@ -2144,3 +2144,28 @@ fn structural_apply_refreshes_applied_observations_without_false_unknown() {
         UNKNOWN_CAUSALITY_PROVENANCE
     );
 }
+
+#[test]
+fn recorded_retained_versions_are_not_rehashed_every_scan() {
+    let (d, rep, n, base) = fixture();
+    let mut held = fs::OpenOptions::new()
+        .write(true)
+        .open(n.root.join("a"))
+        .unwrap();
+    let next = incoming(d.path(), &rep, &base, false);
+    assert!(ready(&apply(&rep, &next)));
+    held.write_all(b"late version bytes").unwrap();
+    held.sync_all().unwrap();
+    rep.scan_native_status().unwrap();
+    assert_eq!(rep.list_native_recovery(actor()).unwrap().len(), 1);
+    let before = retained_hash_bytes_this_thread();
+    for _ in 0..3 {
+        rep.scan_native_status().unwrap();
+    }
+    assert_eq!(
+        retained_hash_bytes_this_thread(),
+        before,
+        "an already recorded retained version must not be re-hashed under Core's mutex"
+    );
+    assert_eq!(rep.list_native_recovery(actor()).unwrap().len(), 1);
+}

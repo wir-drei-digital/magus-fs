@@ -1174,7 +1174,11 @@ pub(crate) fn bound_identity(core: &Core) -> Result<Option<(u64, u64)>, FsError>
 thread_local! {
     static HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
-/// Bytes hashed by root inventories on the calling thread (rescan cost evidence for tests).
+pub(crate) fn count_hashed(bytes: u64) {
+    HASHED.with(|h| h.set(h.get().saturating_add(bytes)));
+}
+/// Bytes hashed by retained-root inventories and retained-version record checks on the
+/// calling thread (rescan cost evidence for tests).
 #[doc(hidden)]
 pub fn retained_hash_bytes_this_thread() -> u64 {
     HASHED.with(|h| h.get())

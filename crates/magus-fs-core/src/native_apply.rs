@@ -195,11 +195,17 @@ pub(crate) fn records_for_versions(core: &Core, r: &Intent) -> Result<(), FsErro
     }
     let stage = stage_open(r)?;
     for (path, version) in versions {
+        // Recorded copies are immutable; never re-hash them on every scan.
+        if crate::native_recovery::recorded(core, &r.operation, version)? {
+            continue;
+        }
         let leaf = version
             .file_name()
             .and_then(|l| l.to_str())
             .ok_or(FsError::UnsafeStorage)?;
-        let digest = native_hash(&mut open_file(&stage, leaf)?)?;
+        let mut file = open_file(&stage, leaf)?;
+        crate::native_root::count_hashed(file.metadata()?.len());
+        let digest = native_hash(&mut file)?;
         record(
             core,
             Retained {
