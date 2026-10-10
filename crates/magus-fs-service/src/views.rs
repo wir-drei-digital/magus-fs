@@ -135,18 +135,37 @@ pub(crate) async fn create(
     let bytes = r::encode(&projected)?;
     let id = r::rid(&projected)?;
     let full_id = r::rid(full)?;
-    let view = ViewId::random().map_err(core_error)?;
     let head = HeadToken::parse(s.head.clone().ok_or(Error::not_found())?).map_err(core_error)?;
-    let result = ViewBinding {
-        view,
-        head,
-        revision: id,
-    };
-    state.db.acquire().await?.run(|db|Box::pin(async move {
-  let tx=db.transaction().await?;let c=r::recheck(&tx,&s,"read").await?;
-  tx.execute("INSERT INTO views(id,namespace,branch,credential,principal,replica,full_revision,head,projected_revision,descriptor) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[&result.view.as_str(),&ns,&req.branch.as_str(),&c.credential,&c.principal,&c.replica,&full_id.as_str(),&result.head.as_str(),&result.revision.as_str(),&bytes]).await?;
-  tx.commit().await?;Ok(Json(result))
- })).await
+    state.db.acquire().await?.run(|db| Box::pin(async move {
+        let tx = db.transaction().await?;
+        // Current authority and projection must always be computed and rechecked.
+        // This namespace lock serializes selection/insertion across service owners.
+        let c = r::recheck(&tx, &s, "read").await?;
+        let fields: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+            &ns, &req.branch.as_str(), &c.credential, &c.principal, &c.replica,
+            &full_id.as_str(), &head.as_str(), &id.as_str(), &bytes,
+            &c.generation, &c.actions, &c.branches, &c.prefixes,
+        ];
+        let existing = tx.query_opt(
+            "SELECT id FROM views WHERE namespace=$1 AND branch=$2 AND credential=$3 AND principal=$4 AND replica=$5 AND full_revision=$6 AND head=$7 AND projected_revision=$8 AND descriptor=$9 AND credential_generation=$10 AND grant_actions=$11 AND grant_branches=$12 AND grant_prefixes=$13 ORDER BY id LIMIT 1",
+            fields,
+        ).await?;
+        let view = if let Some(row) = existing {
+            ViewId::parse(row.get::<_, String>(0)).map_err(core_error)?
+        } else {
+            let view = ViewId::random().map_err(core_error)?;
+            let mut values = fields.to_vec();
+            let view_id = view.as_str();
+            values.push(&view_id);
+            tx.execute(
+                "INSERT INTO views(namespace,branch,credential,principal,replica,full_revision,head,projected_revision,descriptor,credential_generation,grant_actions,grant_branches,grant_prefixes,id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+                &values,
+            ).await?;
+            view
+        };
+        tx.commit().await?;
+        Ok(Json(ViewBinding { view, head, revision: id }))
+    })).await
 }
 pub(crate) async fn descriptor(
     State(state): State<ServiceState>,
