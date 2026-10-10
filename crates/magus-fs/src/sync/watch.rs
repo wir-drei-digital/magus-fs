@@ -32,6 +32,7 @@ impl NativeWatch {
                 // Fault builds qualify complete hint omission while retaining the real watcher.
                 #[cfg(feature = "test-faults")]
                 if std::env::var_os("MAGUS_TEST_DROP_NATIVE_HINTS").is_some() {
+                    eprintln!("test_drop_native_hint");
                     return;
                 }
                 if event.as_ref().is_err() || event.as_ref().is_ok_and(|e| e.need_rescan()) {

@@ -726,6 +726,11 @@ impl Transport {
                         if hint.cursor < 0 {
                             return Err(FsError::InvalidDescriptor);
                         }
+                        #[cfg(feature = "test-faults")]
+                        if std::env::var_os("MAGUS_TEST_DROP_WSS_HINTS").is_some() {
+                            eprintln!("test_drop_wss_hint cursor={}", hint.cursor);
+                            continue;
+                        }
                         eprintln!("live_hint cursor={}", hint.cursor);
                     }
                     Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))))

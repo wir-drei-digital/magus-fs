@@ -8,13 +8,17 @@ COPY benches ./benches
 COPY crates ./crates
 COPY tests ./tests
 ARG VERIFY=1
+ARG BUILD_PROFILE=dev
+ARG BIN_DIR=debug
 RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target if [ "$VERIFY" = service ]; then rustc --version --verbose && cargo fmt --all --check && cargo clippy --locked --workspace --all-targets --all-features -- -D warnings && cargo test --locked -p magus-fs-service --all-features; fi
 RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target if [ "$VERIFY" = client-fix ]; then rustc --version --verbose && cargo fmt --all --check && cargo clippy --locked -p magus-fs-core -p magus-fs --all-targets --all-features -- -D warnings && cargo test --locked -p magus-fs-core -p magus-fs --all-targets --all-features; fi
 RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target if [ "$VERIFY" = client ]; then rustc --version --verbose && cargo fmt --all --check && cargo clippy --locked -p magus-fs --all-targets --all-features -- -D warnings && cargo test --locked -p magus-fs --all-targets --all-features; fi
 RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target if [ "$VERIFY" = 1 ]; then rustc --version --verbose && cargo fmt --all --check && cargo clippy --locked --workspace --all-targets --all-features -- -D warnings && cargo test --locked --workspace --all-features; fi
-RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target cargo build --locked -p magus-fs-service --features test-faults && mkdir /out && cp target/debug/magus-fs-service /out/magus-fs-service-faults && cargo build --locked -p magus-fs-service && cp target/debug/magus-fs-service /out/magus-fs-service
-RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target cargo build --locked -p magus-fs --features test-faults && cp target/debug/magus-fs /out/magus-fs-client-faults && cargo build --locked -p magus-fs --examples && cp target/debug/examples/client_probe /out/client_probe && cargo build --locked -p magus-fs && cp target/debug/magus-fs /out/magus-fs
+RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target cargo build --profile "$BUILD_PROFILE" --locked -p magus-fs-service --features test-faults && mkdir /out && cp target/${BIN_DIR}/magus-fs-service /out/magus-fs-service-faults && cargo build --profile "$BUILD_PROFILE" --locked -p magus-fs-service && cp target/${BIN_DIR}/magus-fs-service /out/magus-fs-service
+RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target cargo build --profile "$BUILD_PROFILE" --locked -p magus-fs --features test-faults && cp target/${BIN_DIR}/magus-fs /out/magus-fs-client-faults && cargo build --profile "$BUILD_PROFILE" --locked -p magus-fs --examples && cp target/${BIN_DIR}/examples/client_probe /out/client_probe && cargo build --profile "$BUILD_PROFILE" --locked -p magus-fs && cp target/${BIN_DIR}/magus-fs /out/magus-fs
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+ARG BUILD_PROFILE=dev
+LABEL magus.fs2.build-profile=$BUILD_PROFILE
 RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates fuse3 util-linux && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/ /usr/local/bin/
 COPY --from=builder /src/ /src/

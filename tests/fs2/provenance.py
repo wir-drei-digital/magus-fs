@@ -22,7 +22,7 @@ def capture(infra):
     infra.write_json('source.json',data)
     return data
 
-def verify_image(infra,before):
+def verify_image(infra,before,host_profile="debug"):
     script="import hashlib,json; from pathlib import Path; expected=json.load(__import__('sys').stdin); print(json.dumps({p:hashlib.sha256((Path('/src')/p).read_bytes()).hexdigest() for p in expected}))"
     actual=json.loads(infra.docker('exec','-i',infra.service,'python3','-c',script,input=json.dumps(before['sha256']),evidence=False).stdout)
     if sources()!=before['sha256'] or actual!=before['sha256']:
@@ -33,7 +33,7 @@ def verify_image(infra,before):
     binaries={}
     for name in ['magus-fs-service','magus-fs-service-faults']:
         binaries[name]=infra.docker('exec',infra.service,'sha256sum','/usr/local/bin/'+name).stdout.strip().split()[0]
-    binaries['host-magus-fs-service']=hashlib.sha256((ROOT/'target/debug/magus-fs-service').read_bytes()).hexdigest()
+    binaries['host-magus-fs-service']=hashlib.sha256((ROOT/('target/'+host_profile+'/magus-fs-service')).read_bytes()).hexdigest()
     selected={}
     arch=infra.inspect('container',infra.service)['Platform']
     for ref in [PG,S3]:

@@ -25,3 +25,9 @@ Set `MAGUS_ICM_ROOT` to the active ICM checkout when using a nonstandard layout.
 ## Development and distribution
 
 Repository: [wir-drei-digital/magus-fs](https://github.com/wir-drei-digital/magus-fs). Initial documentation is published on `main`; FS1 development continues locally on `codex/fs-poc`. No runtime release exists. License and redistributable dependencies will be selected before external distribution; no license is granted by this planning README. Build/test commands are documented in the qualification runbook; no packaged installation exists.
+
+The FS2-A connected gate is documented in [FS2-A qualification](docs/fs2-qualification.md). It exercises a full native Mac folder, lazy Linux mount, isolated Python worker, explicit integration, real restart/hint/response-loss recovery and twenty serialized saves in each of two fresh journeys. The source, receipt, content-transfer and normal-unmount evidence qualifies this slice only; FS2-B implementation and full FS2/PoC qualification remain outstanding.
+
+```sh
+python3 tests/fs2/run.py --slice connected --platform all --output /private/tmp/FS2A_NEW_SHORT_PATH
+```

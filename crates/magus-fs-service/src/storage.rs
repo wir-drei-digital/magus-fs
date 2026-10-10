@@ -69,6 +69,10 @@ impl VerifiedObjects {
         id: &ObjectId,
         bytes: Bytes,
     ) -> Result<()> {
+        #[cfg(feature = "test-faults")]
+        if std::env::var_os("MAGUS_TEST_TRANSFER_LOG").is_some() {
+            eprintln!("fs2_transfer install_body {}", bytes.len());
+        }
         if bytes.len() as u64 > MAX_CHUNK {
             return Err(Error::limit());
         }
@@ -130,13 +134,19 @@ impl VerifiedObjects {
                 },
             )
             .await;
+        #[cfg(feature = "test-faults")]
+        if std::env::var_os("MAGUS_TEST_TRANSFER_LOG").is_some() && put.is_ok() {
+            eprintln!("fs2_transfer backend_put_body {}", bytes.len());
+        }
         match put {
             Ok(_) => {}
             Err(object_store::Error::AlreadyExists { .. })
             | Err(object_store::Error::Precondition { .. }) => {}
             Err(_) => return Err(Error::backend()),
         }
-        let readback = self.read_verified(&path, id, bytes.len()).await;
+        let readback = self
+            .read_verified(&path, id, bytes.len(), "backend_verification_body")
+            .await;
         let corrupt = readback.as_ref().is_err_and(|e| e.code == "corrupt_object")
             || readback.as_ref().is_ok_and(|stored| stored != &bytes);
         if corrupt {
@@ -180,7 +190,9 @@ impl VerifiedObjects {
     ) -> Result<Bytes> {
         let (snapshot, key, generation, size) =
             crate::views::object_record(&self.db, context, view, id).await?;
-        let bytes = self.read_verified(&Path::from(key), id, size).await;
+        let bytes = self
+            .read_verified(&Path::from(key), id, size, "authorized_body")
+            .await;
         if bytes.as_ref().is_err_and(|e| e.code == "corrupt_object") {
             self.db.acquire().await?.run(|db|Box::pin(async move {
                 let tx=db.transaction().await?;lock_namespace(&tx,&context.namespace).await?;
@@ -192,7 +204,15 @@ impl VerifiedObjects {
         crate::revisions::final_read(&self.db, &snapshot).await?;
         Ok(bytes)
     }
-    async fn read_verified(&self, path: &Path, id: &ObjectId, size: usize) -> Result<Bytes> {
+    async fn read_verified(
+        &self,
+        path: &Path,
+        id: &ObjectId,
+        size: usize,
+        traffic: &str,
+    ) -> Result<Bytes> {
+        #[cfg(not(feature = "test-faults"))]
+        let _ = traffic;
         let result = self.store.get(path).await.map_err(|_| Error::backend())?;
         if result.meta.size != size as u64 {
             return Err(Error::invalid("corrupt_object"));
@@ -200,6 +220,10 @@ impl VerifiedObjects {
         let mut stream = result.into_stream();
         let mut out = Vec::with_capacity(size);
         while let Some(chunk) = stream.try_next().await.map_err(|_| Error::backend())? {
+            #[cfg(feature = "test-faults")]
+            if std::env::var_os("MAGUS_TEST_TRANSFER_LOG").is_some() {
+                eprintln!("fs2_transfer {traffic} {}", chunk.len());
+            }
             if out.len() + chunk.len() > size {
                 return Err(Error::invalid("corrupt_object"));
             }

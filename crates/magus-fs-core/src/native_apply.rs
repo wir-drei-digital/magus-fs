@@ -436,11 +436,31 @@ fn stage_open(r: &Intent) -> Result<File, FsError> {
     }
     Ok(d)
 }
+#[derive(Clone, Copy)]
+enum NativeHydration {
+    Baseline,
+    Incoming,
+}
+impl NativeHydration {
+    fn closure_deadline(self, started: Instant) -> Instant {
+        let seconds = match self {
+            Self::Baseline => 60,
+            Self::Incoming => 30,
+        };
+        started + Duration::from_secs(seconds)
+    }
+    fn fetch_deadline(self, started: Instant, now: Instant) -> Instant {
+        self.closure_deadline(started)
+            .min(now + Duration::from_millis(4500))
+    }
+}
+
 impl Replica {
     fn prefetch_native(
         &self,
         revision: &RevisionId,
         source: Option<protocol::RemoteSourceId>,
+        hydration: NativeHydration,
     ) -> Result<(), FsError> {
         let (objects, source, fetcher) = {
             let core = lock(&self.core)?;
@@ -465,7 +485,7 @@ impl Replica {
                 core.remote_fetcher.clone(),
             )
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let started = Instant::now();
         for (id, size) in objects {
             {
                 let mut core = lock(&self.core)?;
@@ -487,9 +507,9 @@ impl Replica {
                     source,
                     &id,
                     size,
-                    deadline.min(Instant::now() + Duration::from_millis(4500)),
+                    hydration.fetch_deadline(started, Instant::now()),
                 )?,
-                _ => source.fetch(&id, size, deadline)?,
+                _ => source.fetch(&id, size, hydration.closure_deadline(started))?,
             };
             if bytes.len() as u64 != size || ObjectId::for_bytes(&bytes)? != id {
                 return Err(FsError::CorruptObject);
@@ -536,7 +556,7 @@ impl Replica {
             perm::authority(&core.config, &actor)?;
             core.working()?.head.clone()
         };
-        self.prefetch_native(&revision, None)?;
+        self.prefetch_native(&revision, None, NativeHydration::Baseline)?;
         let core = lock(&self.core)?;
         let n = configuration(&core)?;
         if core.working()?.head != revision {
@@ -1007,7 +1027,11 @@ impl Replica {
         }
         // The immutable revision/source is selected while owned; HTTP runs without Core's mutex.
         drop(core);
-        self.prefetch_native(revision, binding.as_ref().map(|b| b.source.clone()))?;
+        self.prefetch_native(
+            revision,
+            binding.as_ref().map(|b| b.source.clone()),
+            NativeHydration::Incoming,
+        )?;
         let mut core = lock(&self.core)?;
         if core.working()?.generation != generation
             || core.working()?.head != old.head
@@ -1362,5 +1386,31 @@ impl Core {
             out.extend(crate::cache::object_set(&self.revision(&r.base)?.tree));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod hydration_tests {
+    use super::*;
+    #[test]
+    fn baseline_can_continue_after_30_seconds_without_relaxing_object_or_incoming_bounds() {
+        let started = Instant::now();
+        let now = started + Duration::from_secs(31);
+        assert_eq!(
+            NativeHydration::Baseline.fetch_deadline(started, now),
+            now + Duration::from_millis(4500)
+        );
+        assert_eq!(
+            NativeHydration::Incoming.fetch_deadline(started, now),
+            started + Duration::from_secs(30)
+        );
+        assert_eq!(
+            NativeHydration::Baseline.fetch_deadline(started, started + Duration::from_secs(59)),
+            started + Duration::from_secs(60)
+        );
+        assert_eq!(
+            NativeHydration::Incoming.fetch_deadline(started, started),
+            started + Duration::from_millis(4500)
+        );
     }
 }

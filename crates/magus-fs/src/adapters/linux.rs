@@ -30,6 +30,40 @@ fn errno(error: FsError) -> Errno {
         _ => libc::EIO,
     })
 }
+#[cfg(feature = "test-faults")]
+fn lookup_epoch_barrier(name: &OsStr, ino: INodeNo) {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    if std::env::var("MAGUS_TEST_LOOKUP_EPOCH_NAME")
+        .ok()
+        .as_deref()
+        != name.to_str()
+    {
+        return;
+    }
+    let Ok(base) = std::env::var("MAGUS_TEST_LOOKUP_EPOCH_BARRIER") else {
+        return;
+    };
+    if !Path::new(&format!("{base}.arm")).exists() {
+        return;
+    }
+    let Ok(mut marker) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(format!("{base}.hit"))
+    else {
+        return;
+    };
+    let _ = write!(marker, "{}", ino.0);
+    let _ = marker.sync_all();
+    eprintln!("test_lookup_epoch_barrier inode={}", ino.0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !Path::new(&format!("{base}.release")).exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn unsupported<T>() -> Result<T> {
     Err(FsError::UnsupportedMode)
 }
@@ -75,9 +109,13 @@ impl State {
             INodeNo(self.inodes.len() as u64)
         }
     }
+    fn stale_inode(&self, ino: INodeNo) -> Result<bool> {
+        let id = self.identity(ino)?;
+        Ok(!self.directories.contains(id) && self.inodes[(ino.0 - 1) as usize].1 != self.epoch)
+    }
     fn entry(&self, req: &Request, ino: INodeNo) -> Result<Entry> {
         let id = self.identity(ino)?;
-        if !self.directories.contains(id) && self.inodes[(ino.0 - 1) as usize].1 != self.epoch {
+        if self.stale_inode(ino)? {
             return Err(FsError::NotFound);
         }
         self.ws(req)?.lookup_identity(id)
@@ -160,14 +198,17 @@ impl State {
                     // Linux may omit fh for fstat/fchmod/fchown after unlink or replacement.
                     // Only a same-UID capability for this exact inode may supply the identity.
                     let id = self.identity(ino)?;
-                    self.handles
-                        .values()
-                        .find(|file| {
-                            file.uid == req.uid()
-                                && file.handle.entry_id() == id
-                                && file.handle.epoch() == self.inodes[(ino.0 - 1) as usize].1
-                        })
-                        .ok_or(FsError::NotFound)?
+                    match self.handles.values().find(|file| {
+                        file.uid == req.uid()
+                            && file.handle.entry_id() == id
+                            && file.handle.epoch() == self.inodes[(ino.0 - 1) as usize].1
+                    }) {
+                        Some(file) => file,
+                        // Path getattr can straddle adoption too. Ask VFS to revalidate,
+                        // while existing exact inode capabilities retain their epoch metadata.
+                        None if self.stale_inode(ino)? => return Err(FsError::StaleHandle),
+                        None => return Err(FsError::NotFound),
+                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -264,7 +305,11 @@ impl Filesystem for Adapter {
             let e = s.ws(req)?.lookup(&path)?;
             s.attr(req, &e)
         }) {
-            Ok(a) => reply.entry(&Duration::ZERO, &a, Generation(1)),
+            Ok(a) => {
+                #[cfg(feature = "test-faults")]
+                lookup_epoch_barrier(name, a.ino);
+                reply.entry(&Duration::ZERO, &a, Generation(1))
+            }
             Err(e) => reply.error(e),
         }
     }
@@ -281,6 +326,12 @@ impl Filesystem for Adapter {
     }
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         match self.with(|s| {
+            // LOOKUP and OPEN are separate kernel requests. An adopted file epoch
+            // invalidates this inode, not the stable pathname. ESTALE lets VFS
+            // repeat lookup; never bind a new handle to an old inode's epoch.
+            if s.stale_inode(ino)? {
+                return Err(FsError::StaleHandle);
+            }
             let e = s.entry(req, ino)?;
             s.open(req, &e.path, flags.0)
         }) {
