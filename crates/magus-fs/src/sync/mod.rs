@@ -1,3 +1,4 @@
+pub(crate) mod conflicts;
 mod controller;
 mod transport;
 pub(crate) use controller::*;

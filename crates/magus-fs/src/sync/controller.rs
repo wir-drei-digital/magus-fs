@@ -132,15 +132,17 @@ impl SyncController {
             .submissions
             .into_iter()
             .find(|p| {
-                matches!(
-                    p.state,
-                    SubmissionState::Queued
-                        | SubmissionState::Preparing
-                        | SubmissionState::Retryable
-                        | SubmissionState::Uncertain
-                ) || p.state == SubmissionState::PrivateRemote
-                    && self.transport.binding.publication == PublicationMode::SharedLive
-                    && !held(p)
+                p.resolved_by.is_none()
+                    && (matches!(
+                        p.state,
+                        SubmissionState::Queued
+                            | SubmissionState::Preparing
+                            | SubmissionState::Retryable
+                            | SubmissionState::Uncertain
+                    ) || p.state == SubmissionState::PrivateRemote
+                        && (p.resolves.is_some()
+                            || self.transport.binding.publication == PublicationMode::SharedLive
+                                && !held(p)))
             })
             .ok_or(FsError::NotFound)?;
         self.target_tick(p, deadline)
@@ -181,7 +183,8 @@ impl SyncController {
                     }
                     let mut next = p.clone();
                     next.error = Some(error.code.into());
-                    next.state = if error.code == "stale_head" && p.integration.is_some() {
+                    let decided = p.integration.is_some() || p.resolution.is_some();
+                    next.state = if decided && DEFINITIVE_OUTCOMES.contains(&error.code) {
                         next.remote_outcome_unknown = false;
                         SubmissionState::Failed
                     } else if ["invalid_credential", "denied"].contains(&error.code) {
@@ -194,6 +197,23 @@ impl SyncController {
                         SubmissionState::Failed
                     };
                     p = self.save(&p, next)?;
+                    // Shared-live publication restarts a definitively stale attempt against the
+                    // current destination head: the service merges against the recorded base.
+                    if error.code == "stale_head"
+                        && p.state == SubmissionState::Failed
+                        && p.resolves.is_none()
+                        && p.superseded.len() < MAX_SUPERSEDED_INTEGRATIONS
+                        && self.transport.binding.publication == PublicationMode::SharedLive
+                    {
+                        if let Some(stale) = p.integration.clone() {
+                            let mut next = p.clone();
+                            next.superseded.push(stale);
+                            next.integration = None;
+                            next.state = SubmissionState::PrivateRemote;
+                            p = self.save(&p, next)?;
+                            continue;
+                        }
+                    }
                     if !error.retryable {
                         break;
                     }
@@ -232,6 +252,9 @@ impl SyncController {
             if p.shared_receipt.is_some() {
                 return Ok(p);
             }
+            if let Some(target) = p.resolves.clone() {
+                return self.resolution(p, target, deadline);
+            }
             if p.integration.is_none() && binding.publication == PublicationMode::Isolated {
                 return Ok(p);
             }
@@ -250,7 +273,13 @@ impl SyncController {
                     }
                     return Ok(p);
                 }
-                p = self.integration(p, binding.view.head.clone())?;
+                // A superseded (stale) attempt is retried against the current head.
+                let head = if p.superseded.is_empty() {
+                    binding.view.head.clone()
+                } else {
+                    self.current_head(deadline)?
+                };
+                p = self.integration(p, head)?;
             }
             let mut next = p.clone();
             next.state = SubmissionState::Uncertain;
@@ -406,16 +435,78 @@ impl SyncController {
         next.remote_outcome_unknown = false;
         Ok(self.save(&p, next)?)
     }
+    fn current_head(&self, deadline: Instant) -> Result<HeadToken, Failure> {
+        let view: ViewBinding = self.transport.json(
+            "POST",
+            "/views",
+            json!({"branch":self.transport.binding.branch}),
+            Self::request_deadline(deadline),
+        )?;
+        Ok(view.head)
+    }
+    /// Explicit resolution replacement: its private receipt is resolved together with every
+    /// named conflict against the target head; the original alternatives stay immutable.
+    fn resolution(
+        &self,
+        mut p: SyncProgress,
+        target: ResolutionTarget,
+        deadline: Instant,
+    ) -> Result<SyncProgress, Failure> {
+        if p.resolution.is_none() {
+            let mut next = p.clone();
+            next.resolution = Some(ResolutionRequest {
+                operation: OperationId::random()?,
+                replica: self.rep.configuration()?.replica,
+                conflicts: target.conflicts,
+                expected_head: target.expected_head,
+                replacement: p
+                    .private_receipt
+                    .as_ref()
+                    .ok_or(FsError::NotFound)?
+                    .receipt
+                    .clone(),
+            });
+            next.state = SubmissionState::Preparing;
+            p = self.save(&p, next)?;
+        }
+        let mut next = p.clone();
+        next.state = SubmissionState::Uncertain;
+        next.remote_outcome_unknown = true;
+        next.error = None;
+        p = self.save(&p, next)?;
+        let value = self.transport.json(
+            "POST",
+            "/resolutions",
+            p.resolution.as_ref().unwrap(),
+            deadline,
+        )?;
+        fault("sync-lost-ack")?;
+        let p = self.receipt(p, value)?;
+        self.rep.mark_resolved(&p.operation)?;
+        Ok(p)
+    }
     fn integration(
         &self,
         p: SyncProgress,
         expected_head: HeadToken,
     ) -> Result<SyncProgress, FsError> {
-        if let Some(old) = &p.integration {
-            if old.expected_head != expected_head {
+        let mut p = p;
+        if let Some(old) = p.integration.clone() {
+            if old.expected_head == expected_head {
+                return Ok(p);
+            }
+            // Only a definitively stale attempt may be replaced, and it stays on record.
+            if p.state != SubmissionState::Failed
+                || p.error.as_deref() != Some("stale_head")
+                || p.superseded.len() >= MAX_SUPERSEDED_INTEGRATIONS
+            {
                 return Err(FsError::OperationMismatch);
             }
-            return Ok(p);
+            let mut next = p.clone();
+            next.superseded.push(old);
+            next.integration = None;
+            next.state = SubmissionState::PrivateRemote;
+            p = self.save(&p, next)?;
         }
         let mut next = p.clone();
         next.integration = Some(IntegrationRequest {
@@ -444,6 +535,25 @@ impl SyncController {
             .acquire(deadline)?
             .ok_or(FsError::Backpressure)?;
         let p = self.integration(self.get(revision)?, expected_head)?;
+        self.target_tick(p, deadline)
+    }
+    /// Runs an explicit resolution replacement record to its shared outcome or a bounded,
+    /// definitive failure under the replica's execution gate.
+    pub fn run_resolution(&self, revision: &RevisionId) -> Result<SyncProgress, FsError> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let _execution = self
+            .execution
+            .acquire(deadline)?
+            .ok_or(FsError::Backpressure)?;
+        let p = self.get(revision)?;
+        if p.resolves.is_none() {
+            return Err(FsError::OperationMismatch);
+        }
+        if p.shared_receipt.is_some() {
+            // A lost local link after the shared outcome is completed idempotently.
+            self.rep.mark_resolved(&p.operation)?;
+            return Ok(p);
+        }
         self.target_tick(p, deadline)
     }
     pub fn drain(
@@ -523,6 +633,7 @@ pub(crate) const UNKNOWN_CAUSALITY: &str = "unknown_causality";
 pub(crate) fn held(p: &SyncProgress) -> bool {
     p.state == SubmissionState::PrivateRemote
         && p.integration.is_none()
+        && p.resolved_by.is_none()
         && p.error.as_deref() == Some(UNKNOWN_CAUSALITY)
 }
 #[cfg(not(feature = "test-faults"))]

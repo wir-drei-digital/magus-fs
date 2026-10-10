@@ -1445,7 +1445,7 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
             .unwrap()
             == 1
     };
-    assert_eq!(version(), 3);
+    assert_eq!(version(), 4);
     // From version 1: every later table is added in place.
     rusqlite::Connection::open(&db_path)
         .unwrap()
@@ -1457,7 +1457,7 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
     assert_eq!(rep.status().unwrap().head, Some(base.clone()));
     assert!(rep.list_native_recovery(actor()).unwrap().is_empty());
     drop(rep);
-    assert_eq!(version(), 3);
+    assert_eq!(version(), 4);
     assert!(table("native_recovery") && table("native_applied"));
     // From version 2 (recovery tables only): the applied-path table is added in place.
     rusqlite::Connection::open(&db_path)
@@ -1465,14 +1465,23 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
         .execute_batch("DROP TABLE native_applied; PRAGMA user_version=2;")
         .unwrap();
     let rep = Replica::reopen(d.path().join("state")).unwrap();
+    assert_eq!(rep.status().unwrap().head, Some(base.clone()));
+    drop(rep);
+    assert_eq!(version(), 4);
+    assert!(table("native_applied"));
+    // From version 3: sync records may now carry collaboration fields; same tables.
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .pragma_update(None, "user_version", 3)
+        .unwrap();
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
     assert_eq!(rep.status().unwrap().head, Some(base));
     drop(rep);
-    assert_eq!(version(), 3);
-    assert!(table("native_applied"));
+    assert_eq!(version(), 4);
     // A newer schema fails closed.
     rusqlite::Connection::open(&db_path)
         .unwrap()
-        .pragma_update(None, "user_version", 4)
+        .pragma_update(None, "user_version", 5)
         .unwrap();
     err(
         Replica::reopen(d.path().join("state")),

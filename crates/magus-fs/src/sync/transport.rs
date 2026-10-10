@@ -395,6 +395,13 @@ impl Transport {
                                         Some("backpressure") => "backpressure",
                                         Some("unsupported_operation") => "unsupported_operation",
                                         Some("expired_upload") => "expired_upload",
+                                        // Collaboration-v1 definitive outcomes (FS2-B Task 2).
+                                        Some("conflicted") => "conflicted",
+                                        Some("already_resolved") => "already_resolved",
+                                        Some("incomplete_resolution") => "incomplete_resolution",
+                                        Some("invalid_resolution") => "invalid_resolution",
+                                        Some("absent_alternative") => "absent_alternative",
+                                        Some("invalid_cursor") => "invalid_cursor",
                                         _ => match status.as_u16() {
                                             401 => "invalid_credential",
                                             404 => "denied",

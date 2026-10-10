@@ -671,3 +671,241 @@ fn identical_content_new_view_keeps_each_epochs_source_identity() {
     assert_eq!(w.read(&fresh, 0, 99).unwrap(), b"fresh-b");
     assert_eq!(*fetch.seen.lock().unwrap(), vec![original, current]);
 }
+
+fn private(rep: &Replica, b: &SyncBinding, p: &mut SyncProgress) {
+    p.private_receipt = Some(PrivateReceipt {
+        receipt: ReceiptId::random().unwrap(),
+        operation: p.operation.clone(),
+        replica: config().replica,
+        submitted_revision: p.local_revision.clone(),
+        original_view: b.view.view.clone(),
+        original_head: b.view.head.clone(),
+    });
+    p.state = SubmissionState::PrivateRemote;
+    rep.record_sync_progress(&p.operation, SubmissionState::Queued, p.clone())
+        .unwrap();
+}
+fn integration(p: &SyncProgress, b: &SyncBinding, head: HeadToken) -> IntegrationRequest {
+    IntegrationRequest {
+        operation: OperationId::random().unwrap(),
+        replica: config().replica,
+        candidate_receipt: p.private_receipt.as_ref().unwrap().receipt.clone(),
+        expected_head: head,
+        branch: b.branch.clone(),
+    }
+}
+
+#[test]
+fn definitive_stale_attempt_is_superseded_in_order_and_conflicted_resolves_uncertainty() {
+    let (_d, rep, _w, base) = setup();
+    let b = binding(base.clone());
+    rep.configure_sync(b.clone()).unwrap();
+    let pending = pending(&rep, &b, base);
+    rep.enqueue_submission(pending.clone()).unwrap();
+    let mut p = rep.sync_status().unwrap().submissions.remove(0);
+    private(&rep, &b, &mut p);
+    let first = integration(&p, &b, b.view.head.clone());
+    p.integration = Some(first.clone());
+    p.state = SubmissionState::Uncertain;
+    p.remote_outcome_unknown = true;
+    rep.record_sync_progress(&p.operation, SubmissionState::PrivateRemote, p.clone())
+        .unwrap();
+    // An attempt cannot be replaced while its outcome is unknown.
+    let mut early = p.clone();
+    early.superseded = vec![first.clone()];
+    early.integration = None;
+    err(
+        rep.record_sync_progress(&p.operation, SubmissionState::Uncertain, early),
+        "operation_mismatch",
+    );
+    p.state = SubmissionState::Failed;
+    p.error = Some("stale_head".into());
+    p.remote_outcome_unknown = false;
+    rep.record_sync_progress(&p.operation, SubmissionState::Uncertain, p.clone())
+        .unwrap();
+    // Replacing without recording the stale attempt, or reordering history, is rejected.
+    let mut silent = p.clone();
+    silent.integration = Some(integration(&p, &b, HeadToken::random().unwrap()));
+    err(
+        rep.record_sync_progress(&p.operation, SubmissionState::Failed, silent),
+        "operation_mismatch",
+    );
+    let mut reused = p.clone();
+    reused.superseded = vec![first.clone()];
+    reused.integration = Some(first.clone());
+    err(
+        rep.record_sync_progress(&p.operation, SubmissionState::Failed, reused),
+        "operation_mismatch",
+    );
+    let mut next = p.clone();
+    next.superseded = vec![first.clone()];
+    next.integration = Some(integration(&p, &b, HeadToken::random().unwrap()));
+    next.state = SubmissionState::Uncertain;
+    next.remote_outcome_unknown = true;
+    next.error = None;
+    rep.record_sync_progress(&p.operation, SubmissionState::Failed, next.clone())
+        .unwrap();
+    // A retained conflict is a definitive service outcome; the history stays immutable.
+    next.state = SubmissionState::Failed;
+    next.error = Some("conflicted".into());
+    next.remote_outcome_unknown = false;
+    rep.record_sync_progress(&p.operation, SubmissionState::Uncertain, next.clone())
+        .unwrap();
+    let mut rewrite = next.clone();
+    rewrite.superseded.clear();
+    err(
+        rep.record_sync_progress(&p.operation, SubmissionState::Failed, rewrite),
+        "operation_mismatch",
+    );
+    let stored = rep.sync_status().unwrap().submissions.remove(0);
+    assert_eq!(stored.superseded, vec![first]);
+    assert_eq!(stored.error.as_deref(), Some("conflicted"));
+    assert_eq!(rep.pending_submissions().unwrap(), vec![pending]);
+}
+
+#[test]
+fn shared_resolution_links_resolved_candidates_and_never_blocks_application() {
+    let (_d, rep, w, base) = setup();
+    let mut b = binding(base.clone());
+    b.publication = PublicationMode::SharedLive;
+    rep.configure_sync(b.clone()).unwrap();
+    // A held candidate and its unpublished parent: both are covered by one resolution.
+    let h = w.create("report", 0o600).unwrap();
+    w.write(&h, 0, b"parent").unwrap();
+    let parent = w
+        .checkpoint(
+            &OperationId::random().unwrap(),
+            w.generation().unwrap(),
+            attr(),
+        )
+        .unwrap();
+    rep.enqueue_submission(pending(&rep, &b, parent.clone()))
+        .unwrap();
+    w.write(&h, 0, b"held!!").unwrap();
+    let held = w
+        .checkpoint(
+            &OperationId::random().unwrap(),
+            w.generation().unwrap(),
+            attr(),
+        )
+        .unwrap();
+    rep.enqueue_submission(pending(&rep, &b, held.clone()))
+        .unwrap();
+    let mut candidate = rep
+        .sync_status()
+        .unwrap()
+        .submissions
+        .into_iter()
+        .find(|p| p.local_revision == held)
+        .unwrap();
+    private(&rep, &b, &mut candidate);
+    assert_eq!(rep.pending_submissions().unwrap().len(), 2);
+    // The newer authorized view of the same branch is a registered incoming source.
+    let mut current = rep.revision(&base).unwrap();
+    current.operation = OperationId::random().unwrap();
+    let current = import(&rep, &current, ChunkSource::Unavailable);
+    let mut view = b.clone();
+    view.source = RemoteSourceId::random().unwrap();
+    view.view = ViewBinding {
+        view: ViewId::random().unwrap(),
+        head: HeadToken::random().unwrap(),
+        revision: current.clone(),
+    };
+    let mut replacement = rep.revision(&held).unwrap();
+    replacement.parents = vec![current.clone()];
+    replacement.operation = OperationId::random().unwrap();
+    replacement.provenance = "explicit".into();
+    let replacement = import(&rep, &replacement, ChunkSource::Unavailable);
+    let target = ResolutionTarget {
+        conflicts: vec![ConflictId::random().unwrap()],
+        expected_head: view.view.head.clone(),
+        receipts: vec![candidate.private_receipt.as_ref().unwrap().receipt.clone()],
+    };
+    let resolving = PendingSubmission {
+        operation: rep.revision(&replacement).unwrap().operation,
+        local_revision: replacement.clone(),
+        original_view: view.view.view.clone(),
+        original_head: view.view.head.clone(),
+        expected_local_generation: rep.status().unwrap().generation,
+    };
+    // Unregistered views, or a target bound to another head, are refused.
+    err(
+        rep.enqueue_resolution(resolving.clone(), view.clone(), target.clone()),
+        "config_mismatch",
+    );
+    rep.register_sync_source(view.clone()).unwrap();
+    let mut wrong = target.clone();
+    wrong.expected_head = HeadToken::random().unwrap();
+    err(
+        rep.enqueue_resolution(resolving.clone(), view.clone(), wrong),
+        "invalid_descriptor",
+    );
+    rep.enqueue_resolution(resolving.clone(), view.clone(), target.clone())
+        .unwrap();
+    rep.enqueue_resolution(resolving.clone(), view.clone(), target.clone())
+        .unwrap();
+    // The working tree, binding and pending set are untouched by the replacement record.
+    assert_eq!(rep.sync_status().unwrap().binding, Some(b.clone()));
+    assert_eq!(rep.pending_submissions().unwrap().len(), 2);
+    let mut r = rep
+        .sync_status()
+        .unwrap()
+        .submissions
+        .into_iter()
+        .find(|p| p.local_revision == replacement)
+        .unwrap();
+    assert_eq!(r.resolves, Some(target.clone()));
+    private(&rep, &view, &mut r);
+    err(rep.mark_resolved(&r.operation), "invalid_descriptor");
+    let mut request = ResolutionRequest {
+        operation: OperationId::random().unwrap(),
+        replica: config().replica,
+        conflicts: target.conflicts.clone(),
+        expected_head: target.expected_head.clone(),
+        replacement: ReceiptId::random().unwrap(),
+    };
+    let mut bad = r.clone();
+    bad.resolution = Some(request.clone());
+    err(
+        rep.record_sync_progress(&r.operation, SubmissionState::PrivateRemote, bad),
+        "operation_mismatch",
+    );
+    request.replacement = r.private_receipt.as_ref().unwrap().receipt.clone();
+    r.resolution = Some(request.clone());
+    r.state = SubmissionState::Uncertain;
+    r.remote_outcome_unknown = true;
+    rep.record_sync_progress(&r.operation, SubmissionState::PrivateRemote, r.clone())
+        .unwrap();
+    r.shared_receipt = Some(SharedReceipt {
+        receipt: ReceiptId::random().unwrap(),
+        operation: request.operation.clone(),
+        replica: config().replica,
+        submitted_revision: replacement.clone(),
+        branch: b.branch.clone(),
+        head: HeadToken::random().unwrap(),
+    });
+    r.state = SubmissionState::Shared;
+    r.remote_outcome_unknown = false;
+    rep.record_sync_progress(&r.operation, SubmissionState::Uncertain, r.clone())
+        .unwrap();
+    let marked = rep.mark_resolved(&r.operation).unwrap();
+    assert_eq!(marked.len(), 2, "the candidate and its unpublished parent");
+    assert!(rep.pending_submissions().unwrap().is_empty());
+    let status = rep.sync_status().unwrap().submissions;
+    for p in status.iter().filter(|p| p.resolves.is_none()) {
+        let link = p.resolved_by.as_ref().unwrap();
+        assert_eq!(link.operation, request.operation);
+        assert_eq!(link.receipt, r.shared_receipt.clone().unwrap());
+    }
+    // The link is immutable and cannot be forged through ordinary progress updates.
+    let mut forged = status
+        .into_iter()
+        .find(|p| p.local_revision == held)
+        .unwrap();
+    forged.resolved_by = None;
+    err(
+        rep.record_sync_progress(&forged.operation, forged.state, forged.clone()),
+        "operation_mismatch",
+    );
+    assert_eq!(rep.mark_resolved(&r.operation).unwrap(), vec![]);
+}

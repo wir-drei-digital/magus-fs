@@ -110,6 +110,43 @@ pub struct SyncProgress {
     pub request: Option<CandidateRequest>,
     pub request_digest: Option<RevisionId>,
     pub integration: Option<IntegrationRequest>,
+    /// Integration attempts that definitively returned `stale_head`, replaced in order by a
+    /// newer attempt against a newer destination head. The candidate itself never changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded: Vec<IntegrationRequest>,
+    /// Immutable intent of an explicit resolution replacement candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolves: Option<ResolutionTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<ResolutionRequest>,
+    /// A shared resolution replaced this candidate's retained conflicts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<ResolvedBy>,
+}
+/// Bound on superseded integration attempts per candidate.
+pub const MAX_SUPERSEDED_INTEGRATIONS: usize = 32;
+/// Definitive service outcomes that end an uncertain integration/resolution attempt.
+pub const DEFINITIVE_OUTCOMES: &[&str] = &[
+    "stale_head",
+    "conflicted",
+    "already_resolved",
+    "incomplete_resolution",
+    "invalid_resolution",
+];
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolutionTarget {
+    pub conflicts: Vec<ConflictId>,
+    pub expected_head: HeadToken,
+    /// Original candidate receipts whose conflicts this replacement resolves.
+    pub receipts: Vec<ReceiptId>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedBy {
+    pub operation: OperationId,
+    pub conflicts: Vec<ConflictId>,
+    pub receipt: SharedReceipt,
 }
 impl SyncProgress {
     pub fn reached(&self, level: DurabilityLevel) -> bool {
@@ -136,6 +173,11 @@ pub(crate) struct Record {
 }
 impl Record {
     pub(crate) fn unresolved(&self) -> bool {
+        // A resolution replacement is not working-tree work, and a resolved candidate's
+        // retained conflicts were replaced by an explicit shared resolution.
+        if self.progress.resolves.is_some() || self.progress.resolved_by.is_some() {
+            return false;
+        }
         match self.progress.state {
             SubmissionState::Shared => false,
             SubmissionState::PrivateRemote => {
@@ -374,6 +416,10 @@ impl Replica {
             request: None,
             request_digest: None,
             integration: None,
+            superseded: vec![],
+            resolves: None,
+            resolution: None,
+            resolved_by: None,
         };
         let record = Record {
             pending: pending.clone(),
@@ -389,6 +435,165 @@ impl Replica {
         tx.commit()?;
         crate::faults::hit("sync-enqueued")?;
         Ok(())
+    }
+    /// Queues an explicit resolution replacement candidate based on a newer authorized view
+    /// of the bound branch. It never changes the working tree or the active binding.
+    pub fn enqueue_resolution(
+        &self,
+        pending: PendingSubmission,
+        binding: SyncBinding,
+        target: ResolutionTarget,
+    ) -> Result<(), FsError> {
+        let core = lock(&self.core)?;
+        if target.conflicts.is_empty()
+            || target.conflicts.len() > MAX_RESOLUTION_CONFLICTS
+            || target.receipts.is_empty()
+            || target.expected_head != binding.view.head
+        {
+            return Err(FsError::InvalidDescriptor);
+        }
+        let digest = RevisionId::digest(&json(&(&pending, &binding, &target))?)?;
+        if let Some(bytes) = core
+            .journal
+            .db
+            .query_row(
+                "SELECT record FROM sync_queue WHERE operation=?",
+                [pending.operation.as_str()],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        {
+            let old: Record = from_json(&bytes)?;
+            return if old.digest == digest {
+                Ok(())
+            } else {
+                Err(FsError::OperationMismatch)
+            };
+        }
+        let active: SyncBinding = from_json(&core.journal.db.query_row(
+            "SELECT value FROM sync_binding WHERE singleton=1",
+            [],
+            |r| r.get::<_, Vec<u8>>(0),
+        )?)?;
+        let registered = core
+            .journal
+            .db
+            .query_row(
+                "SELECT binding FROM sync_sources WHERE id=?",
+                [binding.source.as_str()],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|b| from_json::<SyncBinding>(&b))
+            .transpose()?;
+        if registered.as_ref() != Some(&binding)
+            || binding.id != active.id
+            || binding.branch != active.branch
+            || binding.transport_profile != active.transport_profile
+            || binding.transport_identity != active.transport_identity
+            || pending.original_view != binding.view.view
+            || pending.original_head != binding.view.head
+        {
+            return Err(FsError::ConfigMismatch);
+        }
+        let submitted = core.revision(&pending.local_revision)?;
+        if submitted.operation != pending.operation
+            || submitted.replica != core.config.replica
+            || submitted.parents != vec![binding.view.revision.clone()]
+            || submitted.provenance == crate::UNKNOWN_CAUSALITY_PROVENANCE
+        {
+            return Err(FsError::OperationMismatch);
+        }
+        core.sync_staged_closure(&pending.local_revision, &binding.view.revision)?;
+        let progress = SyncProgress {
+            operation: pending.operation.clone(),
+            local_revision: pending.local_revision.clone(),
+            private_receipt: None,
+            shared_receipt: None,
+            applied_revision: None,
+            remote_outcome_unknown: false,
+            state: SubmissionState::Queued,
+            error: None,
+            request: None,
+            request_digest: None,
+            integration: None,
+            superseded: vec![],
+            resolves: Some(target),
+            resolution: None,
+            resolved_by: None,
+        };
+        let operation = pending.operation.as_str().to_owned();
+        let record = json(&Record {
+            pending,
+            binding,
+            digest,
+            progress,
+        })?;
+        core.journal.db.execute(
+            "INSERT INTO sync_queue VALUES(?,?)",
+            params![operation, record],
+        )?;
+        Ok(())
+    }
+    /// After a shared resolution, links every local candidate whose receipt it resolved, and
+    /// those candidates' unpublished local ancestors (whose content those candidates carried).
+    pub fn mark_resolved(&self, resolution: &OperationId) -> Result<Vec<OperationId>, FsError> {
+        let core = lock(&self.core)?;
+        let records = core.sync_records()?;
+        let source = records
+            .iter()
+            .find(|r| &r.pending.operation == resolution)
+            .ok_or(FsError::NotFound)?;
+        let (Some(target), Some(request), Some(receipt)) = (
+            &source.progress.resolves,
+            &source.progress.resolution,
+            &source.progress.shared_receipt,
+        ) else {
+            return Err(FsError::InvalidDescriptor);
+        };
+        let link = ResolvedBy {
+            operation: request.operation.clone(),
+            conflicts: target.conflicts.clone(),
+            receipt: receipt.clone(),
+        };
+        let mut covered = BTreeSet::new();
+        for r in &records {
+            if r.progress.resolves.is_none()
+                && r.progress
+                    .private_receipt
+                    .as_ref()
+                    .is_some_and(|p| target.receipts.contains(&p.receipt))
+            {
+                let mut current = r.pending.local_revision.clone();
+                let mut seen = 0;
+                while current != r.binding.view.revision && seen < 128 {
+                    covered.insert(current.clone());
+                    let revision = core.revision(&current)?;
+                    let [parent] = revision.parents.as_slice() else {
+                        break;
+                    };
+                    current = parent.clone();
+                    seen += 1;
+                }
+            }
+        }
+        let mut marked = vec![];
+        for mut r in records {
+            if r.progress.resolves.is_some()
+                || r.progress.resolved_by.is_some()
+                || r.progress.shared_receipt.is_some()
+                || !covered.contains(&r.pending.local_revision)
+            {
+                continue;
+            }
+            r.progress.resolved_by = Some(link.clone());
+            core.journal.db.execute(
+                "UPDATE sync_queue SET record=? WHERE operation=?",
+                params![json(&r)?, r.pending.operation.as_str()],
+            )?;
+            marked.push(r.pending.operation.clone());
+        }
+        Ok(marked)
     }
     pub fn pending_submissions(&self) -> Result<Vec<PendingSubmission>, FsError> {
         Ok(lock(&self.core)?
@@ -446,11 +651,38 @@ impl Replica {
             && !update.remote_outcome_unknown
             && update.private_receipt == old.private_receipt
             && update.shared_receipt == old.shared_receipt
-            && !(old.integration.is_some()
+            && !((old.integration.is_some() || old.resolution.is_some())
                 && update.state == SubmissionState::Failed
-                && update.error.as_deref() == Some("stale_head"))
+                && update
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| DEFINITIVE_OUTCOMES.contains(&e)))
         {
             return Err(FsError::InvalidDescriptor);
+        }
+        // Only a definitive stale attempt may be superseded, in order, by a fresh operation.
+        let superseding = old.integration.is_some()
+            && old.integration != update.integration
+            && old.state == SubmissionState::Failed
+            && old.error.as_deref() == Some("stale_head")
+            && !old.remote_outcome_unknown
+            && update.superseded.len() == old.superseded.len() + 1
+            && update.superseded.len() <= MAX_SUPERSEDED_INTEGRATIONS
+            && update.superseded[..old.superseded.len()] == old.superseded[..]
+            && update.superseded.last() == old.integration.as_ref()
+            && update.integration.as_ref().is_none_or(|next| {
+                next.operation != r.pending.operation
+                    && update
+                        .superseded
+                        .iter()
+                        .all(|o| o.operation != next.operation)
+            });
+        if (!superseding && old.superseded != update.superseded)
+            || old.resolves != update.resolves
+            || old.resolved_by != update.resolved_by
+            || old.resolution.is_some() && old.resolution != update.resolution
+        {
+            return Err(FsError::OperationMismatch);
         }
         if update.applied_revision.is_some() {
             return Err(FsError::UnsupportedMode);
@@ -459,7 +691,7 @@ impl Replica {
             || update.local_revision != r.pending.local_revision
             || old.request.is_some() && old.request != update.request
             || old.request_digest.is_some() && old.request_digest != update.request_digest
-            || old.integration.is_some() && old.integration != update.integration
+            || old.integration.is_some() && old.integration != update.integration && !superseding
             || old.private_receipt.is_some() && old.private_receipt != update.private_receipt
             || old.shared_receipt.is_some() && old.shared_receipt != update.shared_receipt
         {
@@ -501,15 +733,32 @@ impl Replica {
                 return Err(FsError::OperationMismatch);
             }
         }
-        if let Some(receipt) = &update.shared_receipt {
-            let req = update
-                .integration
+        if let Some(req) = &update.resolution {
+            let receipt = update
+                .private_receipt
                 .as_ref()
                 .ok_or(FsError::InvalidDescriptor)?;
-            if receipt.operation != req.operation
-                || receipt.replica != req.replica
+            let target = update.resolves.as_ref().ok_or(FsError::InvalidDescriptor)?;
+            if req.operation == r.pending.operation
+                || req.replica != core.config.replica
+                || req.replacement != receipt.receipt
+                || req.conflicts != target.conflicts
+                || req.expected_head != target.expected_head
+                || update.integration.is_some()
+            {
+                return Err(FsError::OperationMismatch);
+            }
+        }
+        if let Some(receipt) = &update.shared_receipt {
+            let (operation, replica) = match (&update.integration, &update.resolution) {
+                (Some(i), None) => (&i.operation, &i.replica),
+                (None, Some(x)) => (&x.operation, &x.replica),
+                _ => return Err(FsError::InvalidDescriptor),
+            };
+            if &receipt.operation != operation
+                || &receipt.replica != replica
                 || receipt.submitted_revision != r.pending.local_revision
-                || receipt.branch != req.branch
+                || receipt.branch != r.binding.branch
             {
                 return Err(FsError::OperationMismatch);
             }

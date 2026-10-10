@@ -21,12 +21,12 @@ fn args(mut argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
         }
         let sub = argv.remove(1);
         argv[0] = format!("sync-{sub}");
-        if sub == "recovery" {
+        if sub == "recovery" || sub == "conflicts" {
             if argv.len() < 2 || argv[1].starts_with("--") {
                 return Err((2, FsError::InvalidPath));
             }
             let action = argv.remove(1);
-            argv[0] = format!("sync-recovery-{action}");
+            argv[0] = format!("sync-{sub}-{action}");
         }
     }
     let command = argv.first().cloned().ok_or((2, FsError::InvalidPath))?;
@@ -40,6 +40,16 @@ fn args(mut argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
         "sync-recovery-capture" => vec!["state", "id", "digest", "operation-id"],
         "sync-recovery-export" => vec!["state", "id", "digest", "destination"],
         "sync-recovery-release" => vec!["state", "operation-id"],
+        "sync-conflicts-list" => vec!["state", "cursor"],
+        "sync-conflicts-show" => vec!["state", "conflict"],
+        "sync-conflicts-export" => vec!["state", "conflict", "alternative", "destination"],
+        "sync-resolve" => vec![
+            "state",
+            "conflicts",
+            "expected-head",
+            "select",
+            "operation-id",
+        ],
         "mount" => vec![
             "state",
             "revision",
@@ -496,6 +506,9 @@ fn sync_control(rep: &Replica, command: &str, options: &BTreeMap<String, String>
     if let Some(action) = command.strip_prefix("sync-recovery-") {
         return recovery_control(rep, action, options);
     }
+    if command.starts_with("sync-conflicts-") || command == "sync-resolve" {
+        return conflicts_control(rep, command, options);
+    }
     if command == "sync-status" {
         let status = rep.sync_status().map_err(|e| (1, e))?;
         return if options.contains_key("revision") {
@@ -624,6 +637,64 @@ fn sync_control(rep: &Replica, command: &str, options: &BTreeMap<String, String>
         _ => return Err((2, FsError::InvalidPath)),
     };
     Ok(json!({"ok":true,"progress":p,"counters":controller.counters()}))
+}
+
+/// Immutable service conflicts: listing, inspection, alternative export and resolution.
+fn conflicts_control(
+    rep: &Replica,
+    command: &str,
+    options: &BTreeMap<String, String>,
+) -> Result<Value> {
+    use crate::sync::conflicts;
+    use magus_fs_core::protocol::*;
+    let conflict = || ConflictId::parse(required(options, "conflict")?).map_err(|e| (2, e));
+    let result = match command {
+        "sync-conflicts-list" => {
+            let cursor = options.get("cursor").map(String::as_str);
+            if cursor.is_some_and(|c| c.len() != 32 || !c.bytes().all(|b| b.is_ascii_hexdigit())) {
+                return Err((2, FsError::InvalidDescriptor));
+            }
+            conflicts::list(rep, cursor)
+        }
+        "sync-conflicts-show" => conflicts::show(rep, &conflict()?),
+        "sync-conflicts-export" => conflicts::export(
+            rep,
+            &conflict()?,
+            &AlternativeId::parse(required(options, "alternative")?).map_err(|e| (2, e))?,
+            absolute(required(options, "destination")?)?,
+        ),
+        "sync-resolve" => {
+            let ids = required(options, "conflicts")?
+                .split(',')
+                .map(|id| ConflictId::parse(id).map_err(|e| (2, e)))
+                .collect::<Result<Vec<_>>>()?;
+            if ids.is_empty()
+                || ids.len() > MAX_RESOLUTION_CONFLICTS
+                || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len()
+            {
+                return Err((2, FsError::InvalidDescriptor));
+            }
+            let prefer = match required(options, "select")? {
+                "base" => Side::Base,
+                "current" => Side::Left,
+                "candidate" => Side::Right,
+                _ => return Err((2, FsError::InvalidDescriptor)),
+            };
+            let operation = options
+                .get("operation-id")
+                .map(|o| OperationId::parse(o.as_str()).map_err(|e| (2, e)))
+                .transpose()?;
+            conflicts::resolve(
+                rep,
+                ids,
+                HeadToken::parse(required(options, "expected-head")?).map_err(|e| (2, e))?,
+                prefer,
+                operation,
+            )
+        }
+        _ => return Err((2, FsError::InvalidPath)),
+    };
+    Ok(result.unwrap_or_else(|failure| json!({"ok":false,"error":failure.code})))
 }
 
 /// Retained native alternatives are selected only by opaque record id and expected digest.
@@ -763,6 +834,49 @@ mod sync_tests {
             result.is_ok(),
             "local retained status must remain accessible: {result:?}"
         );
+    }
+    #[test]
+    fn conflict_commands_select_only_opaque_ids_and_explicit_sides() {
+        let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let id = "0123456789abcdef0123456789abcdef";
+        let (command, options) = args(argv(&[
+            "sync",
+            "conflicts",
+            "export",
+            "--state",
+            "/s",
+            "--conflict",
+            id,
+            "--alternative",
+            id,
+            "--destination",
+            "/out",
+        ]))
+        .unwrap();
+        assert_eq!(command, "sync-conflicts-export");
+        assert_eq!(options["alternative"], id);
+        let (command, _) = args(argv(&[
+            "sync",
+            "resolve",
+            "--state",
+            "/s",
+            "--conflicts",
+            id,
+            "--expected-head",
+            id,
+            "--select",
+            "candidate",
+        ]))
+        .unwrap();
+        assert_eq!(command, "sync-resolve");
+        for bad in [
+            &["sync", "conflicts", "--state", "/s"][..],
+            &["sync", "conflicts", "list", "--path", "/x"],
+            &["sync", "conflicts", "delete", "--state", "/s"],
+            &["sync", "resolve", "--state", "/s", "--content", "/x"],
+        ] {
+            assert!(args(argv(bad)).is_err(), "{bad:?}");
+        }
     }
     #[test]
     fn recovery_commands_select_only_by_opaque_id() {

@@ -16,8 +16,10 @@ use std::{
     time::Duration,
 };
 /// Additive in-place upgrades only: 1 -> 2 adds native recovery tables; 2 -> 3 adds the
-/// durable applied-path table for unknown-causality detection.
-pub(crate) const SCHEMA_VERSION: u32 = 3;
+/// durable applied-path table for unknown-causality detection; 3 -> 4 lets sync records
+/// carry collaboration fields (superseded integrations, resolution targets/requests and
+/// resolved links) that an older binary must not misread as ordinary pending work.
+pub(crate) const SCHEMA_VERSION: u32 = 4;
 pub(crate) struct Journal {
     pub db: Connection,
     control: ObjectStore,
@@ -155,7 +157,7 @@ impl Journal {
   CREATE TABLE IF NOT EXISTS native_recovery (id TEXT PRIMARY KEY, operation TEXT NOT NULL, record BLOB NOT NULL, retained TEXT NOT NULL, UNIQUE(operation, retained));
   CREATE TABLE IF NOT EXISTS native_applied (path TEXT PRIMARY KEY, observation BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS native_recovery_captures (operation TEXT PRIMARY KEY, id TEXT NOT NULL REFERENCES native_recovery(id), digest TEXT NOT NULL, revision TEXT NOT NULL REFERENCES revisions(id));
-  PRAGMA user_version=3;")?;
+  PRAGMA user_version=4;")?;
         let encoded = serde_json::to_vec(&config).map_err(|_| FsError::InvalidDescriptor)?;
         if let Some(existing) = tx
             .query_row(
