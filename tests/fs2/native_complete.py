@@ -36,12 +36,14 @@ def passed(output, names):
     missing = [n for n in names if not any(k.endswith(n) for k in rows)]
     failed = [k for k, v in rows.items() if v.strip() != 'ok']
     assert not missing and not failed and 'test result: ok' in output, {'missing': missing, 'failed': failed}
+    # A privileged environment cannot observe EACCES/EPERM primitives; the gate never accepts that.
+    assert 'PRIVILEGED_' not in output, [l for l in output.splitlines() if 'PRIVILEGED_' in l]
     return rows
 
 def host_matrix(i, record):
     """macOS host: the exact Core native matrix and the watcher rebind on APFS/FSEvents."""
     core = i.run(['cargo', '+stable', 'test', '--locked', '-p', 'magus-fs-core', '--test', 'native_apply',
-                  '--features', 'test-faults'], timeout=900, check=False)
+                  '--features', 'test-faults', '--', '--nocapture'], timeout=900, check=False)
     (i.output / 'macos-core-tests.txt').write_text(core.stdout + core.stderr)
     assert core.returncode == 0, core.stderr[-4000:]
     watch = i.run(['cargo', '+stable', 'test', '--locked', '-p', 'magus-fs', '--', 'sync::watch', '--nocapture'],

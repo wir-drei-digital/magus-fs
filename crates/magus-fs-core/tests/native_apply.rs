@@ -814,6 +814,28 @@ fn apply(rep: &Replica, next: &RevisionId) -> NativeApplyStatus {
     )
     .unwrap()
 }
+/// The process bypasses discretionary access checks (privileged root, e.g. a buildkit step).
+/// Such an environment cannot observe the EACCES primitive; the native gate runs these cases
+/// unprivileged and fails if the marker below ever appears in its output.
+fn dac_override() -> bool {
+    let d = scratch();
+    let sealed = d.path().join("sealed");
+    fs::create_dir(&sealed).unwrap();
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o555)).unwrap();
+    let writable = fs::write(sealed.join("probe"), b"x").is_ok();
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o700)).unwrap();
+    writable
+}
+/// The process may give files away (CAP_CHOWN), so it cannot observe mapping EPERM.
+fn chown_capable() -> bool {
+    let d = scratch();
+    let f = d.path().join("probe");
+    fs::write(&f, b"x").unwrap();
+    std::os::unix::fs::chown(&f, Some(54321), Some(54321)).is_ok()
+}
+fn privileged_skip(test: &str, reason: &str) {
+    println!("PRIVILEGED_{reason}_SKIP {test}");
+}
 fn ready(s: &NativeApplyStatus) -> bool {
     matches!(s, NativeApplyStatus::Ready { .. })
 }
@@ -1041,6 +1063,9 @@ fn ownership_fixture() -> (tempfile::TempDir, Replica, NativeConfig, RevisionId)
 }
 #[test]
 fn mapped_group_ownership_applies_and_unmappable_owner_blocks_without_loss() {
+    if chown_capable() {
+        return privileged_skip("mapped_group_ownership", "CHOWN");
+    }
     let (_d, rep, n, base) = ownership_fixture();
     let mut r = next_of(&rep, &base);
     entry_mut(&mut r, "a").group = group(2);
@@ -1072,6 +1097,9 @@ fn mapped_group_ownership_applies_and_unmappable_owner_blocks_without_loss() {
 
 #[test]
 fn readonly_root_parent_blocks_structural_work_without_loss() {
+    if dac_override() {
+        return privileged_skip("readonly_root_parent", "DAC");
+    }
     let (d, rep, n, base) = fixture();
     let mut r = next_of(&rep, &base);
     put_dir(&mut r, "d", 0o755);
@@ -1145,21 +1173,25 @@ fn capture_excluded_local_entries_survive_and_unsupported_or_colliding_entries_b
     assert_eq!(fs::metadata(&n.root).unwrap().ino(), root_ino);
     fs::remove_file(n.root.join("cache/link")).unwrap();
     // An unreadable local-only subtree blocks instead of being dropped.
-    fs::create_dir(n.root.join("cache/sealed")).unwrap();
-    fs::set_permissions(
-        n.root.join("cache/sealed"),
-        fs::Permissions::from_mode(0o000),
-    )
-    .unwrap();
-    let s = apply(&rep, &unsupported);
-    fs::set_permissions(
-        n.root.join("cache/sealed"),
-        fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
-    assert_eq!(blocked_reason(&s), "unreadable_local_entry");
-    assert_eq!(fs::metadata(&n.root).unwrap().ino(), root_ino);
-    fs::remove_dir(n.root.join("cache/sealed")).unwrap();
+    if dac_override() {
+        privileged_skip("unreadable_local_entry", "DAC");
+    } else {
+        fs::create_dir(n.root.join("cache/sealed")).unwrap();
+        fs::set_permissions(
+            n.root.join("cache/sealed"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let s = apply(&rep, &unsupported);
+        fs::set_permissions(
+            n.root.join("cache/sealed"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        assert_eq!(blocked_reason(&s), "unreadable_local_entry");
+        assert_eq!(fs::metadata(&n.root).unwrap().ino(), root_ino);
+        fs::remove_dir(n.root.join("cache/sealed")).unwrap();
+    }
     // An incoming managed path cannot collide with a preserved local-only entry.
     let mut r = next_of(&rep, &next);
     put_dir(&mut r, "cache", 0o755);
