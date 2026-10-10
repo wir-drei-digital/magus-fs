@@ -165,10 +165,18 @@ impl State {
         }
         match self.ws.lookup_identity(self.identity(id)?) {
             Ok(e) => Ok(e),
-            // Only an already-issued exact capability can supply an unlinked identity.
-            Err(FsError::NotFound) => self
-                .ws
-                .handle_attributes(self.held.get(&id).ok_or(FsError::NotFound)?),
+            // Only an already-issued exact capability can supply an unlinked identity. A
+            // directory identity removed by an adopted epoch is stale, so clients drop
+            // their cached view instead of serving it through an old working directory.
+            Err(FsError::NotFound) => match self.held.get(&id) {
+                Some(handle) => self.ws.handle_attributes(handle),
+                None if self.ids.directories.contains_key(self.identity(id)?)
+                    && self.ids.epoch > 0 =>
+                {
+                    Err(FsError::StaleHandle)
+                }
+                None => Err(FsError::NotFound),
+            },
             Err(e) => Err(e), // no permission-failure fallback
         }
     }
@@ -806,6 +814,8 @@ fn live(rep: Replica, state: Arc<Mutex<State>>, mountpoint: PathBuf, actor: Acto
             })
         });
     let mut pressure = false;
+    let mut deferred: Option<&'static str> = None;
+    let mut polled: Option<&'static str> = None;
     loop {
         let result = incoming.poll(|binding, generation| {
             let mut s = state.lock().map_err(|_| FsError::ReplicaBusy)?;
@@ -823,12 +833,26 @@ fn live(rep: Replica, state: Arc<Mutex<State>>, mountpoint: PathBuf, actor: Acto
                 return Err(FsError::DirtyWorkingState);
             }
             pressure = false;
-            let adoption = rep.adopt_remote_view(binding, generation, actor.clone())?;
+            let adoption = rep
+                .adopt_remote_view(binding, generation, actor.clone())
+                .inspect_err(|e| {
+                    if deferred != Some(e.code()) {
+                        eprintln!("live_adoption_deferred code={}", e.code());
+                    }
+                    deferred = Some(e.code());
+                })?;
+            deferred = None;
             s.adopted(adoption.epoch);
             Ok(adoption)
         });
-        if let Ok(Some(adoption)) = result {
-            pending = Some(adoption);
+        match &result {
+            Ok(Some(adoption)) => pending = Some(adoption.clone()),
+            Err(e) if polled != Some(e.code()) => {
+                eprintln!("live_poll_error code={}", e.code());
+                polled = Some(e.code());
+            }
+            Ok(_) => polled = None,
+            Err(_) => {}
         }
         if let Some(adoption) = &pending {
             let started = Instant::now();

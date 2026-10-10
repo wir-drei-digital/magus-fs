@@ -72,7 +72,7 @@ def linux_matrix(i, record):
 
 class Complete(NativeJourney):
     def __init__(self, i, image, platforms, cases):
-        super().__init__(i, image, platforms, 'full');self.cases = cases;self.mounts = [];self.processes = []
+        super().__init__(i, image, platforms, 'full');self.cases = cases;self.mounts = [];self.processes = [];self.holders = []
     def publish_tree(self, mutate, bodies=()):
         view, r = self.view();mutate(r['tree']);r['tree']['entries'].sort(key=lambda e: e['path'])
         _, private = self.candidate(view, r, 'alice', list(bodies))
@@ -326,11 +326,13 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         if publication == 'shared-live':self.until(lambda: self.mstatus(ep, record)['live']['applied'], 15)
         return record
     def save_mounts(self):self.i.write_json('nfs-ownership.json', [{k: v for k, v in m.items() if k != 'binding'} for m in self.mounts])
+    def mcli(self, ep, m, *args):
+        p = subprocess.run([ep.binary, *args, '--state', m['state']], capture_output=True, text=True, timeout=70);assert p.returncode == 0, (args, p.stdout, p.stderr);return json.loads(p.stdout)
     def mstatus(self, ep, m):
         p = subprocess.run([ep.binary, 'sync', 'status', '--state', m['state']], capture_output=True, text=True, timeout=20);assert p.returncode == 0, (p.stdout, p.stderr);return json.loads(p.stdout)
     def holder(self, code, args, tag):
         p = subprocess.Popen([sys.executable, '-c', code, json.dumps(args)], stdout=open(tag + '-log', 'w'), stderr=subprocess.STDOUT, start_new_session=True)
-        self.processes.append(p);return p
+        self.holders.append(p);return p
     def nfs_epochs(self, ep, m):
         mnt = m['mount'];tag = m['path'] + '/held'
         old = Path(mnt, 'reports/live').read_bytes();old_ino = os.stat(Path(mnt, 'reports/live')).st_ino
@@ -349,11 +351,26 @@ for name,fn in [('write',lambda:os.pwrite(fd,b'stale',0)),('fsync',lambda:os.fsy
 row['after_stale_write_sha256']=hashlib.sha256(open(f,'rb').read()).hexdigest()
 open(s['tag']+'-result','w').write(json.dumps(row))"""
         self.holder(code, {'mount': mnt, 'tag': tag}, tag);self.until(lambda: os.path.exists(tag + '-ready'))
+        # macOS's NFS client creates an AppleDouble sidecar when a file is opened for writing
+        # (qualified FS1 behaviour). That is local dirty work: adoption is deferred until it is
+        # checkpointed and published, never silently overwritten.
+        time.sleep(1.5);local = self.mcli(ep, m, 'status');sidecars = sorted(n for n in os.listdir(Path(mnt, 'reports')) if n.startswith('._'))
+        deferred = None
+        if local['uncaptured'] is True:
+            deferred = {'local': local, 'sidecars': sidecars}
+            op = identity('operation');checkpoint = self.mcli(ep, m, 'checkpoint', '--operation-id', op)
+            published = self.mcli(ep, m, 'sync', 'run', '--revision', checkpoint['revision'], '--operation-id', op)
+            head = published['progress']['shared_receipt']['head']
+            self.until(lambda: self.mstatus(ep, m)['live']['applied'] and self.mstatus(ep, m)['status']['binding']['view']['head'] == head, 15)
+            deferred.update(checkpoint=checkpoint['revision'], published_head=head)
         new = b'accepted remote bytes visible through a fresh NFS lookup';started = time.monotonic();shared = self.publish(new)
         def fresh():
             try:return Path(mnt, 'reports/live').read_bytes() == new
             except OSError:return False
-        self.until(fresh, 15);visible = time.monotonic() - started
+        try:self.until(fresh, 15)
+        finally:
+            self.i.write_json('nfs-visibility-status.json', {'status': self.mstatus(ep, m), 'local': json.loads(subprocess.run([ep.binary, 'status', '--state', m['state']], capture_output=True, text=True, timeout=20).stdout or '{}'), 'listing': sorted(os.listdir(mnt)), 'reports': sorted(os.listdir(Path(mnt, 'reports')))})
+        visible = time.monotonic() - started
         self.until(lambda: self.mstatus(ep, m)['live']['applied'] and self.mstatus(ep, m)['status']['binding']['view']['head'] == shared['head'], 15);applied = time.monotonic() - started
         open(tag + '-go', 'w').close();self.until(lambda: os.path.exists(tag + '-result'))
         held = json.loads(Path(tag + '-result').read_text())
@@ -363,7 +380,7 @@ open(s['tag']+'-result','w').write(json.dumps(row))"""
         assert held['after_stale_write_sha256'] == sha(new), 'a stale write had an effect'
         assert visible <= 15 and applied <= 15
         lines = [l for l in Path(m['path'], 'daemon.log').read_text().splitlines() if l.startswith('live_applied')]
-        return {'held': held, 'visible_seconds': visible, 'applied_seconds': applied, 'old_fileid': old_ino, 'live_applied': lines, 'status': self.mstatus(ep, m)['live'], 'estale': errno.ESTALE}
+        return {'held': held, 'visible_seconds': visible, 'applied_seconds': applied, 'old_fileid': old_ino, 'live_applied': lines, 'status': self.mstatus(ep, m)['live'], 'estale': errno.ESTALE, 'write_open_sidecars': sidecars, 'dirty_deferral': deferred}
     def nfs_structural(self, ep, m):
         mnt = m['mount'];body = b'nfs structural child'
         def change(t):
@@ -377,7 +394,9 @@ while not os.path.exists(s['tag']+'-go'):
  assert time.monotonic()<deadline
  time.sleep(.02)
 row={}
-for name,fn in [('listdir',lambda:sorted(os.listdir('.'))),('open_child',lambda:open('child','rb').read().hex())]:
+def create():
+ f=os.open('from-old-cwd',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600);os.write(f,b'x');os.fsync(f);os.close(f)
+for name,fn in [('listdir',lambda:sorted(os.listdir('.'))),('open_child',lambda:open('child','rb').read().hex()),('create',create)]:
  try:row[name]=fn()
  except OSError as e:row[name+'_errno']=e.errno
 open(s['tag']+'-result','w').write(json.dumps(row))"""
@@ -393,7 +412,11 @@ open(s['tag']+'-result','w').write(json.dumps(row))"""
         self.until(lambda: sorted(os.listdir(Path(mnt, 'nfs-dir'))) == ['other'] and not Path(mnt, 'reports/live').exists() and Path(mnt, 'reports/renamed-live').exists(), 15);replaced_seconds = time.monotonic() - started
         open(tag + '-go', 'w').close();self.until(lambda: os.path.exists(tag + '-result'))
         cwd = json.loads(Path(tag + '-result').read_text())
-        assert 'child' not in cwd.get('listdir', []) and cwd.get('open_child') != body.hex(), cwd
+        # Nothing written through a working directory in the replaced directory reaches the
+        # replacement. NFSv3 has no invalidation callback: the macOS client may still serve its
+        # own cached listing/bytes of the removed directory without asking the server (recorded).
+        assert 'create_errno' in cwd, cwd
+        time.sleep(1.5);assert sorted(os.listdir(Path(mnt, 'nfs-dir'))) == ['other'] and not any(n == 'from-old-cwd' for n in os.listdir(mnt)), cwd
         self.until(lambda: self.mstatus(ep, m)['live']['applied'] and self.mstatus(ep, m)['status']['binding']['view']['head'] == shared['head'], 15)
         self.record('macos', 'nfs-structural-and-parent-replacement', created_seconds=created, replaced_seconds=replaced_seconds, old_cwd=cwd, listing=sorted(os.listdir(mnt)))
     def nfs_authority(self, ep, m):
@@ -401,11 +424,23 @@ open(s['tag']+'-result','w').write(json.dumps(row))"""
         def readable(path):
             try:Path(mnt, path).read_bytes();return 0
             except OSError as e:return e.errno
-        def mode(value):
-            def change(t):next(e for e in t['entries'] if e['path'] == 'reports/renamed-live')['mode'] = value
-            return change
-        self.publish_tree(mode(0));self.until(lambda: readable('reports/renamed-live') == errno.EACCES, 15);narrowed = readable('reports/renamed-live')
-        self.publish_tree(mode(0o600));self.until(lambda: readable('reports/renamed-live') == 0, 15)
+        body = b'file whose mode is narrowed remotely'
+        def add(t):
+            reports = next(e for e in t['entries'] if e['path'] == 'reports');t['entries'].append(file_entry('reports/narrowed', reports['id'], body))
+        self.publish_tree(add, [body]);self.until(lambda: readable('reports/narrowed') == 0, 15)
+        def narrow(t):next(e for e in t['entries'] if e['path'] == 'reports/narrowed')['mode'] = 0
+        self.publish_tree(narrow);seen = [];narrowed_at = time.monotonic()
+        def denied():
+            try:st = os.stat(Path(mnt, 'reports/narrowed'));stat = {'ino': st.st_ino, 'mode': oct(st.st_mode)}
+            except OSError as e:stat = {'stat_errno': e.errno}
+            code = readable('reports/narrowed')
+            seen.append({'t': round(time.monotonic() - narrowed_at, 3), 'errno': code, **stat})
+            # A shared-live adoption of an authorized projection omits an unreadable entry
+            # (ENOENT); authority narrowing without a new view denies with EACCES.
+            return code in (errno.EACCES, errno.ENOENT)
+        try:self.until(denied, 15)
+        finally:self.i.write_json('nfs-mode-narrowing.json', seen[::max(1, len(seen) // 12)] + seen[-3:])
+        narrowed = readable('reports/narrowed');assert readable('reports/renamed-live') == 0
         isolated = self.mount(ep, 'nfsiso', 'isolated');cached = Path(isolated['mount'], 'reports/renamed-live').read_bytes()
         before = self.mstatus(ep, isolated)['live']
         update = b'shared update isolated must not adopt'
@@ -430,13 +465,22 @@ open(s['tag']+'-result','w').write(json.dumps(row))"""
         except subprocess.TimeoutExpired:m['daemon_alive'] = True
         self.save_mounts()
     def cleanup(self):
+        # Holders may pin the mount (cwd/fd); stop them first. A mount daemon is only stopped
+        # after its own mount was normally unmounted; otherwise it is retained and reported.
+        for p in self.holders:
+            if p.poll() is None:p.terminate()
+        for p in self.holders:
+            try:p.wait(10)
+            except subprocess.TimeoutExpired:pass
         for m in self.mounts:
             if m.get('mounted') and mounted(Path(m['mount'])):
-                p = subprocess.run(['/sbin/umount', m['mount']], capture_output=True, text=True, timeout=10);m['cleanup_umount'] = p.returncode
+                p = subprocess.run(['/sbin/umount', m['mount']], capture_output=True, text=True, timeout=30);m['cleanup_umount'] = {'code': p.returncode, 'stderr': p.stderr}
                 if p.returncode == 0:m['mounted'] = False
+        retained = {m['pid'] for m in self.mounts if m.get('mounted') and mounted(Path(m['mount']))}
         for p in self.processes:
-            if p.poll() is None:p.terminate()
+            if p.poll() is None and p.pid not in retained:p.terminate()
         for p in self.processes:
+            if p.pid in retained:continue
             try:p.wait(10)
             except subprocess.TimeoutExpired:pass
         self.save_mounts();super().cleanup()
