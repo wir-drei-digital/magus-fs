@@ -126,6 +126,13 @@ impl SyncController {
             .execution
             .acquire(deadline)?
             .ok_or(FsError::Backpressure)?;
+        // A shared resolution whose local links were interrupted (e.g. owner crash) is
+        // completed idempotently so its resolved candidates stop blocking application.
+        for p in self.rep.sync_status()?.submissions {
+            if p.resolves.is_some() && p.shared_receipt.is_some() {
+                self.rep.mark_resolved(&p.operation)?;
+            }
+        }
         let p = self
             .rep
             .sync_status()?

@@ -437,6 +437,8 @@ struct Reconciler<'a> {
     base: &'a Tree,
     left: &'a Tree,
     right: &'a Tree,
+    // Identity indexes: alternatives and repairs never rescan whole trees.
+    indexes: [BTreeMap<&'a EntryId, &'a Entry>; 3],
     policy: &'a MergePolicy,
     objects: &'a dyn MergeContent,
     prefer: Option<Side>,
@@ -463,6 +465,7 @@ impl<'a> Reconciler<'a> {
             base,
             left,
             right,
+            indexes: [index(base), index(left), index(right)],
             policy,
             objects,
             prefer,
@@ -470,8 +473,11 @@ impl<'a> Reconciler<'a> {
         })
     }
     fn alternatives(&self, id: &EntryId) -> (Option<Entry>, Option<Entry>, Option<Entry>) {
-        let find = |t: &Tree| t.entries.iter().find(|e| &e.id == id).cloned();
-        (find(self.base), find(self.left), find(self.right))
+        (
+            self.side(Side::Base, id),
+            self.side(Side::Left, id),
+            self.side(Side::Right, id),
+        )
     }
     fn conflict(&mut self, id: &EntryId, reason: ConflictReason) {
         if self.conflicts.contains_key(id) {
@@ -502,17 +508,17 @@ impl<'a> Reconciler<'a> {
         );
     }
     fn side(&self, side: Side, id: &EntryId) -> Option<Entry> {
-        let tree = match side {
-            Side::Base => self.base,
-            Side::Left => self.left,
-            Side::Right => self.right,
+        let index = match side {
+            Side::Base => &self.indexes[0],
+            Side::Left => &self.indexes[1],
+            Side::Right => &self.indexes[2],
         };
-        tree.entries.iter().find(|e| &e.id == id).cloned()
+        index.get(id).map(|e| (*e).clone())
     }
     fn run(mut self) -> Result<Merged, FsError> {
         let root = self.root();
         let plan = plan(self.base, self.left, self.right, self.policy);
-        let (bi, li, ri) = (index(self.base), index(self.left), index(self.right));
+        let [bi, li, ri] = self.indexes.clone();
         let ids: BTreeSet<EntryId> = bi
             .keys()
             .chain(li.keys())
@@ -828,9 +834,7 @@ impl<'a> Reconciler<'a> {
         for ids in slots.into_values().filter(|ids| ids.len() > 1) {
             match self.prefer {
                 None => {
-                    let fresh = ids
-                        .iter()
-                        .all(|id| !self.base.entries.iter().any(|e| &e.id == id));
+                    let fresh = ids.iter().all(|id| !self.indexes[0].contains_key(id));
                     for id in &ids {
                         self.conflict(
                             id,

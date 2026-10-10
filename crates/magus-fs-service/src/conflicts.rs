@@ -220,15 +220,10 @@ struct Alternative {
     revision: String,
     entry: Option<EntryId>,
 }
-async fn alternatives(
-    state: &ServiceState,
-    c: &AuthContext,
-    conflict: &str,
-) -> Result<Vec<Alternative>> {
+async fn alternatives(state: &ServiceState, conflict: &str) -> Result<Vec<Alternative>> {
     let rows = state.db.acquire().await?.run(|db| Box::pin(async move {
         Ok(db.query("SELECT id,side,revision,entry FROM conflict_alternatives WHERE conflict=$1 ORDER BY side",&[&conflict]).await?.iter().map(|r| (r.get::<_, String>(0),r.get::<_, String>(1),r.get::<_, String>(2),r.get::<_, Option<String>>(3))).collect::<Vec<_>>())
     })).await?;
-    let _ = c;
     rows.into_iter()
         .map(|(id, side, revision, entry)| {
             Ok(Alternative {
@@ -326,7 +321,7 @@ pub(crate) async fn detail(
     let current = s.current.as_ref().ok_or(Error::not_found())?;
     let mut refs = vec![];
     let mut cache: BTreeMap<String, Revision> = BTreeMap::new();
-    for alt in alternatives(&state, &c, &row.id).await? {
+    for alt in alternatives(&state, &row.id).await? {
         if !cache.contains_key(&alt.revision) {
             let revision = descriptor(&state, &c, &alt.revision).await?;
             cache.insert(alt.revision.clone(), revision);
@@ -357,7 +352,7 @@ pub(crate) async fn alternative(
     let c = state.auth(&headers, &ns, "read").await?;
     let row = load(&state, &c, &id).await?;
     let alternative = AlternativeId::parse(alternative).map_err(|_| Error::not_found())?;
-    let alt = alternatives(&state, &c, &row.id)
+    let alt = alternatives(&state, &row.id)
         .await?
         .into_iter()
         .find(|a| a.id == alternative.as_str())

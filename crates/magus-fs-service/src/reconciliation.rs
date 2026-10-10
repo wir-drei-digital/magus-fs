@@ -351,14 +351,16 @@ pub(crate) fn conflicts_visible(
 
 /// Paths whose identity, location, metadata or content differ; empty string for the root.
 pub(crate) fn changed_paths(old: &Tree, new: &Tree) -> Vec<String> {
+    let before: BTreeMap<&EntryId, &Entry> = old.entries.iter().map(|e| (&e.id, e)).collect();
+    let after: BTreeMap<&EntryId, &Entry> = new.entries.iter().map(|e| (&e.id, e)).collect();
     let mut paths = vec![];
     for e in &new.entries {
-        if old.entries.iter().find(|o| o.id == e.id) != Some(e) {
+        if before.get(&e.id) != Some(&e) {
             paths.push(e.path.clone());
         }
     }
     for o in &old.entries {
-        if new.entries.iter().find(|e| e.id == o.id) != Some(o) {
+        if after.get(&o.id) != Some(&o) {
             paths.push(o.path.clone());
         }
     }
