@@ -50,10 +50,31 @@ pub(crate) fn objects(r: &Revision) -> Result<BTreeMap<String, i64>> {
     }
     Ok(result)
 }
+/// Chunk objects referenced by a tree (object id -> size), without session bounds.
+pub(crate) fn objects_of_tree(tree: &Tree) -> BTreeMap<String, i64> {
+    let mut result = BTreeMap::new();
+    for e in &tree.entries {
+        if let EntryContent::File { version } = &e.content {
+            for extent in &version.extents {
+                if let Extent::Chunk {
+                    object,
+                    object_size,
+                    ..
+                } = extent
+                {
+                    result.insert(object.as_str().to_owned(), *object_size as i64);
+                }
+            }
+        }
+    }
+    result
+}
 pub(crate) struct BoundView {
     pub full: Revision,
     pub projected: Revision,
     pub head: String,
+    /// Conflict alternative export binding (id, narrowed entry), never a candidate base.
+    pub alternative: Option<(String, Option<EntryId>)>,
 }
 pub(crate) struct Snapshot {
     pub context: AuthContext,
@@ -85,6 +106,21 @@ impl Snapshot {
     pub fn validate_view(&self) -> Result<&BoundView> {
         self.context.action("read")?;
         let view = self.view.as_ref().ok_or(Error::not_found())?;
+        if let Some((_, entry)) = &view.alternative {
+            let current = self.current.as_ref().ok_or(Error::not_found())?;
+            let projection = crate::views::alternative(
+                &view.full,
+                &current.tree,
+                self.authority()?,
+                &self.context.prefixes,
+                self.context.action("history").is_ok(),
+                entry.as_ref(),
+            )?;
+            if projection.tree != view.projected.tree {
+                return Err(Error::not_found());
+            }
+            return Ok(view);
+        }
         if self.head.as_deref() != Some(&view.head) {
             self.context.action("history")?;
         }
@@ -115,7 +151,7 @@ pub(crate) async fn snapshot(
   let root=tx.query_opt("SELECT root_policy FROM namespace_policy WHERE namespace=$1",&[&c.namespace]).await?.ok_or(Error::not_found())?.get::<_,String>(0);
   let b=tx.query_opt("SELECT r.descriptor,b.head FROM branches b JOIN revisions r ON r.namespace=b.namespace AND r.revision=b.revision WHERE b.namespace=$1 AND b.name=$2",&[&c.namespace,&branch]).await?;
   let current=b.as_ref().map(|r|r.get::<_,Vec<u8>>(0));let head=b.as_ref().map(|r|r.get::<_,String>(1));
-  let bound=if let Some(view)=view {let r=tx.query_opt("SELECT v.descriptor,r.descriptor,v.head FROM views v JOIN revisions r ON r.namespace=v.namespace AND r.revision=v.full_revision WHERE v.id=$1 AND v.namespace=$2 AND v.branch=$3 AND v.credential=$4 AND v.principal=$5 AND v.replica=$6",&[&view,&c.namespace,&branch,&context.credential,&context.principal,&context.replica]).await?.ok_or(Error::not_found())?;Some((view.to_owned(),r.get::<_,Vec<u8>>(0),r.get::<_,Vec<u8>>(1),r.get::<_,String>(2)))}else{None};
+  let bound=if let Some(view)=view {let r=tx.query_opt("SELECT v.descriptor,r.descriptor,v.head,v.alternative,v.alternative_entry FROM views v JOIN revisions r ON r.namespace=v.namespace AND r.revision=v.full_revision WHERE v.id=$1 AND v.namespace=$2 AND v.branch=$3 AND v.credential=$4 AND v.principal=$5 AND v.replica=$6",&[&view,&c.namespace,&branch,&context.credential,&context.principal,&context.replica]).await?.ok_or(Error::not_found())?;Some((view.to_owned(),r.get::<_,Vec<u8>>(0),r.get::<_,Vec<u8>>(1),r.get::<_,String>(2),r.get::<_,Option<String>>(3),r.get::<_,Option<String>>(4)))}else{None};
   tx.commit().await?;Ok((context,authorities,root,current,head,bound))
  })).await?;
     let authorities = authorities
@@ -130,11 +166,21 @@ pub(crate) async fn snapshot(
         current: current.map(|b| decode(&b)).transpose()?,
         head,
         view: bound
-            .map(|(_id, p, f, head)| {
+            .map(|(_id, p, f, head, alternative, entry)| {
                 Ok::<BoundView, Error>(BoundView {
                     projected: decode(&p)?,
                     full: decode(&f)?,
                     head,
+                    alternative: alternative
+                        .map(|id| {
+                            Ok::<_, Error>((
+                                id,
+                                entry
+                                    .map(|e| EntryId::parse(e).map_err(|_| Error::backend()))
+                                    .transpose()?,
+                            ))
+                        })
+                        .transpose()?,
                 })
             })
             .transpose()?,
@@ -305,6 +351,7 @@ mod tests {
                 full: revision.clone(),
                 projected: revision,
                 head: "head".into(),
+                alternative: None,
             }),
         };
         match snapshot.validate_view() {

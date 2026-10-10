@@ -117,6 +117,7 @@ fn records() -> Vec<auth::Provision> {
     vec![auth::Provision {
         authority: None,
         root_policy: None,
+        merge_policy: None,
         namespace: NamespaceId::parse("1".repeat(32)).unwrap(),
         principal: PrincipalId::parse(format!("principal:{}", "a".repeat(32))).unwrap(),
         replica: ReplicaId::parse(format!("replica:{}", "b".repeat(32))).unwrap(),

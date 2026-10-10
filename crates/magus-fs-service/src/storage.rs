@@ -182,6 +182,90 @@ impl VerifiedObjects {
         Ok(())
         })).await
     }
+    /// Verified bytes of a ready object for service-internal reconciliation input. The
+    /// caller has already authorized the revisions that reference it.
+    pub(crate) async fn read_ready(
+        &self,
+        namespace: &str,
+        id: &ObjectId,
+        size: u64,
+    ) -> Result<Bytes> {
+        let size = i64::try_from(size).map_err(|_| Error::limit())?;
+        let key = self.db.acquire().await?.run(|db| Box::pin(async move {
+            let row = db.query_opt("SELECT storage_key FROM objects WHERE namespace=$1 AND object_id=$2 AND size=$3 AND state='ready'",&[&namespace,&id.as_str(),&size]).await?.ok_or(Error::not_found())?;
+            Ok(row.get::<_, String>(0))
+        })).await?;
+        self.read_verified(&Path::from(key), id, size as usize, "merge_input_body")
+            .await
+    }
+    /// Installs a service-generated (merged text) chunk under a fresh immutable generation,
+    /// verified by readback before it becomes ready. Unreferenced results are left for GC.
+    pub(crate) async fn install_generated(
+        &self,
+        namespace: &str,
+        id: &ObjectId,
+        bytes: Bytes,
+    ) -> Result<()> {
+        if bytes.len() as u64 > MAX_CHUNK || id.as_str() != format!("sha256:{}", digest(&bytes)) {
+            return Err(Error::invalid("corrupt_object"));
+        }
+        let size = bytes.len() as i64;
+        let reserved = self.db.acquire().await?.run(|db| Box::pin(async move {
+            let tx = db.transaction().await?;
+            lock_namespace(&tx, namespace).await?;
+            let row = tx.query_opt("SELECT generation,storage_key,size,state FROM objects WHERE namespace=$1 AND object_id=$2 FOR UPDATE",&[&namespace,&id.as_str()]).await?;
+            let result = match row {
+                Some(row) if row.get::<_, &str>("state") == "ready" && row.get::<_, i64>("size") == size => None,
+                // Someone else's in-flight or retired generation: retryable pressure, no overwrite.
+                Some(_) => return Err(Error::pressure()),
+                None => {
+                    let generation = NamespaceId::random().map_err(|_| Error::backend())?.as_str().to_owned();
+                    let key = format!("{}/{}/{}", namespace, &id.as_str()[7..], generation);
+                    tx.execute("INSERT INTO objects(namespace,object_id,generation,storage_key,size,state,lease_until) VALUES($1,$2,$3,$4,$5,'uploading',clock_timestamp()+interval '900 seconds')",&[&namespace,&id.as_str(),&generation,&key,&size]).await?;
+                    Some((generation, key))
+                }
+            };
+            tx.commit().await?;
+            Ok(result)
+        })).await?;
+        let Some((generation, key)) = reserved else {
+            return Ok(());
+        };
+        let path = Path::from(key);
+        match self
+            .store
+            .put_opts(
+                &path,
+                bytes.clone().into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_)
+            | Err(object_store::Error::AlreadyExists { .. })
+            | Err(object_store::Error::Precondition { .. }) => {}
+            Err(_) => return Err(Error::backend()),
+        }
+        let stored = self
+            .read_verified(&path, id, bytes.len(), "backend_verification_body")
+            .await?;
+        if stored != bytes {
+            return Err(Error::invalid("corrupt_object"));
+        }
+        self.db.acquire().await?.run(|db| Box::pin(async move {
+            let tx = db.transaction().await?;
+            lock_namespace(&tx, namespace).await?;
+            let n = tx.execute("UPDATE objects SET state='ready' WHERE namespace=$1 AND object_id=$2 AND generation=$3 AND state='uploading' AND lease_until>clock_timestamp()",&[&namespace,&id.as_str(),&generation]).await?;
+            if n != 1 {
+                return Err(Error::conflict());
+            }
+            tx.commit().await?;
+            Ok(())
+        })).await
+    }
     pub async fn read_authorized(
         &self,
         context: &AuthContext,

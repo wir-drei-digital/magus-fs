@@ -276,7 +276,8 @@ pub(crate) async fn candidate(
     let branch = r::branch_for_view(&state.db, &c, request.original_view.as_str()).await?;
     let s = r::snapshot(&state.db, &c, &branch, Some(request.original_view.as_str())).await?;
     let view = s.validate_view()?;
-    if request.original_head.as_str() != view.head {
+    // An alternative export binding is read-only evidence, never a candidate base.
+    if request.original_head.as_str() != view.head || view.alternative.is_some() {
         return Err(Error::not_found());
     }
     let descriptors = staged(&state, &c, &request.upload).await?;
@@ -327,6 +328,11 @@ pub(crate) async fn candidate(
     if required.values().sum::<i64>() > MAX_SESSION_BYTES {
         return Err(Error::limit());
     }
+    // Rulings R1/R6/R10: unknown native causality anywhere in the unpublished chain is
+    // recorded with the receipt so integration never merges or fast-forwards it.
+    let unknown = chain
+        .iter()
+        .any(|(_, r)| r.provenance == UNKNOWN_CAUSALITY_PROVENANCE);
     let derived = views::lift(&view.full, &view.projected, submitted)?;
     let derived_id = r::rid(&derived)?;
     let derived_bytes = r::encode(&derived)?;
@@ -353,6 +359,7 @@ pub(crate) async fn candidate(
   let generations=r::ready(&tx,&current,&derived_objects,Some(&request.upload),&full_objects).await?;
   r::save_revision(&tx,&ns,&derived_id,&derived_bytes,&generations).await?;
   save_operation(&tx,&current,NewOperation{operation:&request.operation,kind:"candidate",request:&serialized,result:&result,status:200,branch:&branch,view:Some(request.original_view.as_str()),receipt:&receipt.receipt,submitted:&request.revision,derived:&derived_id}).await?;
+  tx.execute("INSERT INTO candidate_causality(namespace,receipt,unknown) VALUES($1,$2,$3)",&[&ns,&receipt.receipt.as_str(),&unknown]).await?;
   tx.commit().await?;Ok(([("content-type","application/json")],result).into_response())
  })).await
 }
@@ -444,6 +451,7 @@ mod tests {
                     full,
                     projected,
                     head: "original-head".into(),
+                    alternative: None,
                 }),
             },
             derived,

@@ -2,9 +2,11 @@
 pub mod auth;
 mod changes;
 pub mod config;
+mod conflicts;
 pub mod db;
 pub mod policy;
 mod publication;
+pub mod reconciliation;
 mod revisions;
 pub mod storage;
 mod submission;
@@ -155,9 +157,16 @@ async fn bounded(State(state): State<ServiceState>, req: Request, next: Next) ->
     let expensive = path.contains("/revisions/")
         || path.contains("/views/")
         || path.contains("/operations/")
-        || ["/seed", "/views", "/candidates", "/integrations"]
-            .iter()
-            .any(|suffix| path.ends_with(suffix));
+        || path.contains("/conflicts")
+        || [
+            "/seed",
+            "/views",
+            "/candidates",
+            "/integrations",
+            "/resolutions",
+        ]
+        .iter()
+        .any(|suffix| path.ends_with(suffix));
     let _revision_permit = if expensive {
         match state.revision_permit() {
             Ok(p) => Some(p),
@@ -168,6 +177,7 @@ async fn bounded(State(state): State<ServiceState>, req: Request, next: Next) ->
     };
     let seconds = if req.uri().path().ends_with("/candidates")
         || req.uri().path().ends_with("/integrations")
+        || req.uri().path().ends_with("/resolutions")
         || req.uri().path().ends_with("/seed")
     {
         60
@@ -206,6 +216,25 @@ pub fn router(state: ServiceState) -> Router {
             "/v1/n/{namespace}/views/{view}/objects/{object}",
             get(views::object),
         )
+        .route(
+            "/capabilities",
+            get(|| async {
+                Json(magus_fs_core::Capabilities {
+                    protocol: SERVICE_PROTOCOL.into(),
+                    capabilities: vec![magus_fs_core::COLLABORATION_CAPABILITY.into()],
+                })
+            }),
+        )
+        .route("/v1/n/{namespace}/conflicts", get(conflicts::list))
+        .route(
+            "/v1/n/{namespace}/conflicts/{conflict}",
+            get(conflicts::detail),
+        )
+        .route(
+            "/v1/n/{namespace}/conflicts/{conflict}/alternatives/{alternative}",
+            get(conflicts::alternative),
+        )
+        .route("/v1/n/{namespace}/resolutions", post(conflicts::resolve))
         .route("/v1/n/{namespace}/candidates", post(submission::candidate))
         .route(
             "/v1/n/{namespace}/integrations",
@@ -397,7 +426,7 @@ async fn grants(
             getrandom::fill(&mut bytes).map_err(|_| Error::backend())?;
             let token = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
             let r = auth::Provision {
-                authority: None, root_policy: None,
+                authority: None, root_policy: None, merge_policy: None,
                 namespace: NamespaceId::parse(namespace.clone()).map_err(|_| Error::not_found())?,
                 principal: magus_fs_core::PrincipalId::parse(current.principal.clone())
                     .map_err(|_| Error::not_found())?,

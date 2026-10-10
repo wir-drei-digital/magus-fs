@@ -52,6 +52,57 @@ pub fn project(
     validate_tree(&result.tree).map_err(core_error)?;
     Ok(result)
 }
+/// Authorized projection of an immutable conflict alternative. Current metadata governs
+/// identities that still exist (a historic owner/mode never reopens access); identities
+/// absent from the current head need the explicit `history` action. `entry` narrows the
+/// projection to that identity and its structural ancestors.
+pub fn alternative(
+    side: &Revision,
+    current: &Tree,
+    a: &Authority,
+    prefixes: &[String],
+    history: bool,
+    entry: Option<&EntryId>,
+) -> Result<Revision> {
+    let now = current
+        .entries
+        .iter()
+        .map(|e| (&e.id, e))
+        .collect::<BTreeMap<_, _>>();
+    let mut authority = side.tree.clone();
+    authority.root = current.root.clone();
+    authority.root.id = side.tree.root.id.clone();
+    if side.tree.root.id != current.root.id {
+        return Err(Error::not_found());
+    }
+    authority
+        .entries
+        .retain(|e| history || now.contains_key(&e.id));
+    for e in &mut authority.entries {
+        if let Some(present) = now.get(&e.id) {
+            e.owner = present.owner.clone();
+            e.group = present.group.clone();
+            e.mode = present.mode;
+        }
+    }
+    let mut result = project(side, &authority, a, prefixes)?;
+    if let Some(id) = entry {
+        let ids = result
+            .tree
+            .entries
+            .iter()
+            .map(|e| (e.id.clone(), e.parent.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut keep = BTreeSet::new();
+        let mut cursor = ids.get(id).map(|_| id.clone()).ok_or(Error::not_found())?;
+        while let Some(parent) = ids.get(&cursor) {
+            keep.insert(cursor.clone());
+            cursor = parent.clone();
+        }
+        result.tree.entries.retain(|e| keep.contains(&e.id));
+    }
+    Ok(result)
+}
 /// Only visible identities are replaced; omission never deletes unseen entries.
 pub fn lift(full: &Revision, visible: &Revision, submitted: &Revision) -> Result<Revision> {
     if submitted.format != FORMAT || visible.format != FORMAT {
@@ -147,7 +198,7 @@ pub(crate) async fn create(
             &c.generation, &c.actions, &c.branches, &c.prefixes,
         ];
         let existing = tx.query_opt(
-            "SELECT id FROM views WHERE namespace=$1 AND branch=$2 AND credential=$3 AND principal=$4 AND replica=$5 AND full_revision=$6 AND head=$7 AND projected_revision=$8 AND descriptor=$9 AND credential_generation=$10 AND grant_actions=$11 AND grant_branches=$12 AND grant_prefixes=$13 ORDER BY id LIMIT 1",
+            "SELECT id FROM views WHERE namespace=$1 AND branch=$2 AND credential=$3 AND principal=$4 AND replica=$5 AND full_revision=$6 AND head=$7 AND projected_revision=$8 AND descriptor=$9 AND credential_generation=$10 AND grant_actions=$11 AND grant_branches=$12 AND grant_prefixes=$13 AND alternative IS NULL ORDER BY id LIMIT 1",
             fields,
         ).await?;
         let view = if let Some(row) = existing {

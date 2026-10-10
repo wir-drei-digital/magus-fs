@@ -110,6 +110,9 @@ pub async fn authenticate<C: GenericClient + Sync>(
 pub struct Provision {
     pub authority: Option<crate::policy::AuthorityConfig>,
     pub root_policy: Option<crate::policy::RootPolicy>,
+    /// Optional trusted branch merge policy (FS2-B); absent means opaque.
+    #[serde(default)]
+    pub merge_policy: Option<crate::policy::BranchMergePolicy>,
     pub namespace: NamespaceId,
     pub principal: PrincipalId,
     pub replica: ReplicaId,

@@ -14,6 +14,10 @@ async fn main() {
 }
 async fn run() -> magus_fs_service::Result<()> {
     let args: Vec<_> = std::env::args().collect();
+    // Bounded, configuration-free text merge worker spawned (and killed) by the service.
+    if args.len() == 2 && args[1] == magus_fs_service::reconciliation::WORKER_ARG {
+        std::process::exit(magus_fs_service::reconciliation::worker_main());
+    }
     if args.len() < 3 {
         return Err(magus_fs_service::Error::invalid("usage"));
     }

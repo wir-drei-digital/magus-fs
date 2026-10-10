@@ -43,7 +43,49 @@ impl RootPolicy {
         }
     }
 }
+/// Trusted, normalized per-branch text allowlist; the default (no row) is fully opaque.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BranchMergePolicy {
+    pub branch: magus_fs_core::protocol::BranchName,
+    pub text_extensions: Vec<String>,
+}
+impl BranchMergePolicy {
+    pub fn policy(&self) -> Result<MergePolicy> {
+        let policy = MergePolicy::text(self.text_extensions.clone())
+            .map_err(|_| Error::invalid("invalid_policy"))?;
+        if policy.text_extensions != self.text_extensions {
+            return Err(Error::invalid("invalid_policy"));
+        }
+        Ok(policy)
+    }
+}
+/// Current merge policy of a branch, read inside the caller's snapshot transaction.
+pub async fn merge_policy<C: tokio_postgres::GenericClient + Sync>(
+    db: &C,
+    namespace: &str,
+    branch: &str,
+) -> Result<MergePolicy> {
+    match db
+        .query_opt(
+            "SELECT policy FROM branch_merge_policy WHERE namespace=$1 AND branch=$2",
+            &[&namespace, &branch],
+        )
+        .await?
+    {
+        None => Ok(MergePolicy::opaque()),
+        Some(row) => {
+            let policy: MergePolicy =
+                serde_json::from_str(&row.get::<_, String>(0)).map_err(|_| Error::backend())?;
+            policy.validate().map_err(|_| Error::backend())?;
+            Ok(policy)
+        }
+    }
+}
 pub fn validate(r: &Provision) -> Result<()> {
+    if let Some(m) = &r.merge_policy {
+        m.policy()?;
+    }
     if let Some(a) = &r.authority {
         if a.principal != r.principal
             || a.groups.is_empty()
@@ -92,6 +134,20 @@ pub async fn install(tx: &tokio_postgres::Transaction<'_>, r: &Provision) -> Res
             .await?;
             tx.execute("INSERT INTO group_members(namespace,group_id,principal) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",&[&ns,&group.as_str(),&r.principal.as_str()]).await?;
         }
+    }
+    if let Some(m) = &r.merge_policy {
+        let value =
+            serde_json::to_string(&m.policy()?).map_err(|_| Error::invalid("invalid_policy"))?;
+        let previous = tx
+            .query_opt(
+                "SELECT policy FROM branch_merge_policy WHERE namespace=$1 AND branch=$2",
+                &[&ns, &m.branch.as_str()],
+            )
+            .await?;
+        if previous.is_some_and(|p| p.get::<_, String>(0) != value) {
+            return Err(Error::invalid("policy_conflict"));
+        }
+        tx.execute("INSERT INTO branch_merge_policy(namespace,branch,policy) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",&[&ns,&m.branch.as_str(),&value]).await?;
     }
     if let Some(root) = &r.root_policy {
         let value = serde_json::to_string(root).map_err(|_| Error::invalid("invalid_policy"))?;
