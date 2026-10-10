@@ -232,13 +232,18 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         assert stale['provenance'] == UNKNOWN, stale['provenance']
         self.record(ep.platform, 'stale-ram-save-unknown-causality', progress=progress, provenance=stale['provenance'], parents=stale['parents'], ram_sha256=sha(self.base_body))
         ep.stop(c)
-        c = ep.create('readonly-parent');ep.start(c);self.until(lambda: ep.ready(c));before = self.native(ep, c, ['reports/live'])
-        ep.run("os.chmod(s,0o555);print('{}')", c['path'])
+        # The root's own parent becomes readonly; the private profile directory stays 0700.
+        c = ep.create('readonly-parent', nest=True);ep.start(c);self.until(lambda: ep.ready(c));before = self.native(ep, c, ['reports/live'])
+        ep.run("os.chmod(s,0o555);print('{}')", c['path'] + '/native')
         try:
             def add(t):t['entries'].append({'path': 'blocked-dir', 'id': identity('entry'), 'parent': self.tree_root['id'], 'owner': ALICE, 'group': GROUP, 'mode': 493, 'content': {'kind': 'directory'}})
-            self.publish_tree(add);self.until(lambda: 'readonly_parent' in json.dumps(ep.status(c)['native']['status']), 15)
+            self.publish_tree(add);seen = []
+            def blocked():
+                s = ep.status(c);seen.append({'native': s['native'], 'live': s['live']});return 'readonly_parent' in json.dumps(s['native']['status'])
+            try:self.until(blocked, 15)
+            finally:self.i.write_json(ep.platform + '-readonly-parent-statuses.json', seen[-5:])
             status = ep.status(c);after = self.native(ep, c, ['reports/live', 'blocked-dir'])
-        finally:ep.run("os.chmod(s,0o700);print('{}')", c['path'])
+        finally:ep.run("os.chmod(s,0o755);print('{}')", c['path'] + '/native')
         assert after['blocked-dir'] is None and after['']['ino'] == before['']['ino'] and after['reports/live'] == before['reports/live']
         self.record(ep.platform, 'readonly-root-parent', status=status, before=before, after=after);ep.stop(c)
 

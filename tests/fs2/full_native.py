@@ -28,7 +28,7 @@ class Endpoint:
     def cli(self,c,*args):
         return self.run("deadline=time.monotonic()+3\nwhile True:\n p=subprocess.run([s[0],*s[1]],capture_output=True,text=True,timeout=12)\n if p.returncode==0:break\n if json.loads(p.stdout).get('error')!='replica_busy' or time.monotonic()>=deadline:raise AssertionError((s[1],p.stdout,p.stderr))\n time.sleep(.03)\nprint(p.stdout)",[self.binary,[*args,'--state',c['state']]])
     def status(self,c):return self.cli(c,'sync','status')
-    def create(self,name):
+    def create(self,name,nest=False):
         replica=identity('replica')
         code,grant=self.j.request('POST',self.j.root+'/grants',body={'delegate':{'replica':replica,'expires':int(time.time())+1800,'actions':['read','write','history','integrate'],'branches':['main'],'prefixes':['']}});assert code==200,grant
         view,r=self.j.view();bodies={}
@@ -41,7 +41,9 @@ class Endpoint:
                     conn=http.client.HTTPSConnection('127.0.0.1',self.i.port,context=self.j.ca,timeout=10);conn.request('GET',self.j.root+'/views/'+view['view']+'/objects/'+x['object'],headers={'Authorization':'Bearer '+self.j.tokens['alice']});response=conn.getresponse();part=response.read();assert response.status==200;conn.close();body+=part[x['offset']:x['offset']+x['length']]
                 bodies[e['path']]=body.hex()
         path=self.base+'/'+name;self.clients.append({'path':path,'creating':True});self.save()
-        c=self.run('''p=s['path'];os.mkdir(p,0o700);root=p+'/tree';os.mkdir(root,s['revision']['tree']['root']['mode']);os.chmod(root,s['revision']['tree']['root']['mode'])
+        c=self.run('''p=s['path'];os.mkdir(p,0o700);base=p+'/native' if s['nest'] else p
+if s['nest']:os.mkdir(base,0o755)
+root=base+'/tree';os.mkdir(root,s['revision']['tree']['root']['mode']);os.chmod(root,s['revision']['tree']['root']['mode'])
 for e in sorted(s['revision']['tree']['entries'],key=lambda e:e['path'].count('/')):
  f=root+'/'+e['path']
  if e['content']['kind']=='directory':os.mkdir(f,0o700)
@@ -60,7 +62,7 @@ def cli(*args):
 cli('init','--state',state,'--config',private('config',config))
 profile=private('profile',{'endpoint':s['endpoint'],'namespace':s['namespace'],'replica':s['replica'],'ca_file':private('ca',s['ca']),'token_file':private('token',s['token']),'publication_principal':s['principal']})
 binding=cli('sync','attach','--state',state,'--profile',profile,'--branch','main','--publication','shared-live')['binding']
-print(json.dumps({'path':p,'root':root,'state':state,'binding':binding,'replica':s['replica']}))''',{'path':path,'revision':r,'bodies':bodies,'replica':replica,'principal':ALICE,'group':GROUP,'binary':self.binary,'endpoint':'https://service:8443' if self.container else 'https://localhost:'+str(self.i.port),'namespace':NS,'ca':(self.i.control/'ca.crt').read_text(),'token':grant['token']})
+print(json.dumps({'path':p,'root':root,'state':state,'binding':binding,'replica':s['replica']}))''',{'path':path,'revision':r,'bodies':bodies,'replica':replica,'principal':ALICE,'group':GROUP,'binary':self.binary,'endpoint':'https://service:8443' if self.container else 'https://localhost:'+str(self.i.port),'namespace':NS,'ca':(self.i.control/'ca.crt').read_text(),'token':grant['token'],'nest':nest})
         self.clients[-1]=c;self.save();return c
     def save(self):self.i.write_json(self.platform+'-native-ownership.json',{'container':self.container,'clients':self.clients,'children':self.children})
     def start(self,c,fault=None,drop_hints=False):
