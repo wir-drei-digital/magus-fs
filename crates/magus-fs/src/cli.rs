@@ -48,6 +48,8 @@ fn args(mut argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
             "conflicts",
             "expected-head",
             "select",
+            "choices",
+            "replacement",
             "operation-id",
         ],
         "mount" => vec![
@@ -674,12 +676,34 @@ fn conflicts_control(
             {
                 return Err((2, FsError::InvalidDescriptor));
             }
-            let prefer = match required(options, "select")? {
-                "base" => Side::Base,
-                "current" => Side::Left,
-                "candidate" => Side::Right,
-                _ => return Err((2, FsError::InvalidDescriptor)),
+            let side = |v: &str| match v {
+                "base" => Ok(Side::Base),
+                "current" => Ok(Side::Left),
+                "candidate" => Ok(Side::Right),
+                _ => Err((2, FsError::InvalidDescriptor)),
             };
+            let default = options.get("select").map(|v| side(v)).transpose()?;
+            let mut choices = BTreeMap::new();
+            for pair in options
+                .get("choices")
+                .map(|c| c.split(',').collect::<Vec<_>>())
+                .unwrap_or_default()
+            {
+                let (id, value) = pair
+                    .split_once(':')
+                    .ok_or((2, FsError::InvalidDescriptor))?;
+                let id = ConflictId::parse(id).map_err(|e| (2, e))?;
+                if !ids.contains(&id) || choices.insert(id, side(value)?).is_some() {
+                    return Err((2, FsError::InvalidDescriptor));
+                }
+            }
+            if default.is_none() && choices.len() != ids.len() {
+                return Err((2, FsError::InvalidDescriptor));
+            }
+            let replacement = options
+                .get("replacement")
+                .map(|r| RevisionId::parse(r.as_str()).map_err(|e| (2, e)))
+                .transpose()?;
             let operation = options
                 .get("operation-id")
                 .map(|o| OperationId::parse(o.as_str()).map_err(|e| (2, e)))
@@ -688,7 +712,11 @@ fn conflicts_control(
                 rep,
                 ids,
                 HeadToken::parse(required(options, "expected-head")?).map_err(|e| (2, e))?,
-                prefer,
+                conflicts::Selection {
+                    default,
+                    choices,
+                    replacement,
+                },
                 operation,
             )
         }
@@ -869,6 +897,22 @@ mod sync_tests {
         ]))
         .unwrap();
         assert_eq!(command, "sync-resolve");
+        let (_, options) = args(argv(&[
+            "sync",
+            "resolve",
+            "--state",
+            "/s",
+            "--conflicts",
+            id,
+            "--expected-head",
+            id,
+            "--choices",
+            &format!("{id}:current"),
+            "--replacement",
+            "sha256:00",
+        ]))
+        .unwrap();
+        assert_eq!(options["choices"], format!("{id}:current"));
         for bad in [
             &["sync", "conflicts", "--state", "/s"][..],
             &["sync", "conflicts", "list", "--path", "/x"],

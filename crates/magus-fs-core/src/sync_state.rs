@@ -140,6 +140,11 @@ pub struct ResolutionTarget {
     pub expected_head: HeadToken,
     /// Original candidate receipts whose conflicts this replacement resolves.
     pub receipts: Vec<ReceiptId>,
+    /// A later local revision (descending from those candidates) whose content, paths and
+    /// metadata were used as the candidate side; it and its unpublished ancestors are
+    /// covered by the resolution too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<RevisionId>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -452,6 +457,9 @@ impl Replica {
         {
             return Err(FsError::InvalidDescriptor);
         }
+        if let Some(source) = &target.source {
+            core.revision(source)?;
+        }
         let digest = RevisionId::digest(&json(&(&pending, &binding, &target))?)?;
         if let Some(bytes) = core
             .journal
@@ -557,6 +565,7 @@ impl Replica {
             receipt: receipt.clone(),
         };
         let mut covered = BTreeSet::new();
+        let mut bases = BTreeSet::new();
         for r in &records {
             if r.progress.resolves.is_none()
                 && r.progress
@@ -564,6 +573,7 @@ impl Replica {
                     .as_ref()
                     .is_some_and(|p| target.receipts.contains(&p.receipt))
             {
+                bases.insert(r.binding.view.revision.clone());
                 let mut current = r.pending.local_revision.clone();
                 let mut seen = 0;
                 while current != r.binding.view.revision && seen < 128 {
@@ -577,7 +587,22 @@ impl Replica {
                 }
             }
         }
+        if let Some(source) = &target.source {
+            let mut current = source.clone();
+            for _ in 0..128 {
+                if bases.contains(&current) {
+                    break;
+                }
+                covered.insert(current.clone());
+                let revision = core.revision(&current)?;
+                let [parent] = revision.parents.as_slice() else {
+                    break;
+                };
+                current = parent.clone();
+            }
+        }
         let mut marked = vec![];
+        let mut updates = vec![];
         for mut r in records {
             if r.progress.resolves.is_some()
                 || r.progress.resolved_by.is_some()
@@ -587,12 +612,18 @@ impl Replica {
                 continue;
             }
             r.progress.resolved_by = Some(link.clone());
-            core.journal.db.execute(
-                "UPDATE sync_queue SET record=? WHERE operation=?",
-                params![json(&r)?, r.pending.operation.as_str()],
-            )?;
-            marked.push(r.pending.operation.clone());
+            updates.push((json(&r)?, r.pending.operation.clone()));
         }
+        // All links of one resolution commit together.
+        let tx = core.journal.db.unchecked_transaction()?;
+        for (record, operation) in updates {
+            tx.execute(
+                "UPDATE sync_queue SET record=? WHERE operation=?",
+                params![record, operation.as_str()],
+            )?;
+            marked.push(operation);
+        }
+        tx.commit()?;
         Ok(marked)
     }
     pub fn pending_submissions(&self) -> Result<Vec<PendingSubmission>, FsError> {

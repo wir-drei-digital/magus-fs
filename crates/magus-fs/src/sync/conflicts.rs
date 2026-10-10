@@ -165,13 +165,66 @@ impl MergeContent for NoContent {
     }
 }
 
-/// `sync resolve`: select base/current/candidate for every retained conflict of one local
-/// candidate, as a complete replacement based on the expected (current) head.
+/// Explicit choices of `sync resolve`: a default side, per-conflict sides, and an optional
+/// later local revision whose content/paths/metadata replace the candidate side.
+pub(crate) struct Selection {
+    pub default: Option<Side>,
+    pub choices: BTreeMap<ConflictId, Side>,
+    pub replacement: Option<RevisionId>,
+}
+fn invalid() -> Failure {
+    Failure {
+        code: "invalid_resolution",
+        retryable: false,
+    }
+}
+/// The newest record of one unpublished local chain sharing one original base, if `ids`
+/// all lie on it (bounded walk).
+fn chain_tip<'a>(rep: &Replica, records: &[&'a SyncProgress]) -> Result<&'a SyncProgress> {
+    for tip in records {
+        let mut ancestors = BTreeSet::new();
+        let mut current = tip.local_revision.clone();
+        for _ in 0..128 {
+            ancestors.insert(current.clone());
+            let parents = rep.revision(&current)?.parents;
+            let [parent] = parents.as_slice() else {
+                break;
+            };
+            current = parent.clone();
+        }
+        if records
+            .iter()
+            .all(|r| ancestors.contains(&r.local_revision))
+        {
+            return Ok(tip);
+        }
+    }
+    Err(invalid())
+}
+/// Whether `descendant` reaches `ancestor` through single parents (bounded).
+fn descends(rep: &Replica, descendant: &RevisionId, ancestor: &RevisionId) -> Result<bool> {
+    let mut current = descendant.clone();
+    for _ in 0..128 {
+        if &current == ancestor {
+            return Ok(true);
+        }
+        let parents = rep.revision(&current)?.parents;
+        let [parent] = parents.as_slice() else {
+            return Ok(false);
+        };
+        current = parent.clone();
+    }
+    Ok(false)
+}
+
+/// `sync resolve`: every named conflict gets an explicit side (per conflict, or the
+/// default); the candidate side may be replaced by a later local revision (edited content,
+/// renames, metadata). The result is a complete replacement based on the expected head.
 pub(crate) fn resolve(
     rep: &Replica,
     conflicts: Vec<ConflictId>,
     expected_head: HeadToken,
-    prefer: Side,
+    selection: Selection,
     operation: Option<OperationId>,
 ) -> Result<Value> {
     let status = rep.sync_status()?;
@@ -191,7 +244,12 @@ pub(crate) fn resolve(
         }
     }
     let (t, active, config) = transport(rep)?;
+    if selection.choices.keys().any(|id| !conflicts.contains(id)) {
+        return Err(invalid());
+    }
     let mut receipts = BTreeSet::new();
+    let mut entry_choices: BTreeMap<EntryId, Side> = BTreeMap::new();
+    let mut whole: Option<Side> = None;
     for id in &conflicts {
         let detail: ConflictDetail = t.json(
             "GET",
@@ -213,24 +271,70 @@ pub(crate) fn resolve(
             });
         }
         receipts.insert(detail.summary.receipt);
+        let side = selection
+            .choices
+            .get(id)
+            .copied()
+            .or(selection.default)
+            .ok_or_else(invalid)?;
+        match detail.alternatives.iter().find_map(|a| a.entry.clone()) {
+            Some(entry) => {
+                if entry_choices
+                    .insert(entry, side)
+                    .is_some_and(|old| old != side)
+                {
+                    return Err(invalid());
+                }
+            }
+            // A whole-candidate conflict (unknown causality, budget) chooses for all entries.
+            None => {
+                if whole.is_some_and(|old| old != side) {
+                    return Err(invalid());
+                }
+                whole = Some(side);
+            }
+        }
     }
-    if receipts.len() != 1 {
-        // One original candidate per resolution; its conflicts are resolved together.
-        return Err(FsError::UnsupportedMode.into());
-    }
-    let receipt = receipts.into_iter().next().ok_or(FsError::NotFound)?;
-    let record = status
-        .submissions
+    let default = match (whole, selection.default) {
+        (Some(w), Some(d)) if w != d => return Err(invalid()),
+        (Some(w), _) => w,
+        (None, Some(d)) => d,
+        // Every conflict was chosen explicitly; structural repairs follow the candidate.
+        (None, None) => Side::Right,
+    };
+    // Candidates of one unpublished local chain (same original base) resolve together.
+    let records = receipts
         .iter()
-        .find(|p| {
-            p.resolves.is_none()
-                && p.private_receipt
-                    .as_ref()
-                    .is_some_and(|r| r.receipt == receipt)
+        .map(|receipt| {
+            status
+                .submissions
+                .iter()
+                .find(|p| {
+                    p.resolves.is_none()
+                        && p.private_receipt
+                            .as_ref()
+                            .is_some_and(|r| &r.receipt == receipt)
+                })
+                .ok_or(Failure::from(FsError::NotFound))
         })
-        .ok_or(FsError::NotFound)?;
-    let candidate = rep.revision(&record.local_revision)?;
-    let base = rep.revision(&rep.submission_binding(&record.operation)?.view.revision)?;
+        .collect::<Result<Vec<_>>>()?;
+    let bases = records
+        .iter()
+        .map(|r| Ok(rep.submission_binding(&r.operation)?.view.revision))
+        .collect::<Result<BTreeSet<_>>>()?;
+    if bases.len() != 1 {
+        return Err(invalid());
+    }
+    let record = chain_tip(rep, &records)?;
+    let source = match &selection.replacement {
+        Some(revision) if descends(rep, revision, &record.local_revision)? => {
+            Some(revision.clone())
+        }
+        Some(_) => return Err(invalid()),
+        None => None,
+    };
+    let candidate = rep.revision(source.as_ref().unwrap_or(&record.local_revision))?;
+    let base = rep.revision(bases.iter().next().ok_or(FsError::NotFound)?)?;
     let view: ViewBinding = t.json(
         "POST",
         "/views",
@@ -269,13 +373,14 @@ pub(crate) fn resolve(
     )?;
     super::live::install_sources(rep, None)?;
     let current = rep.revision(&next.view.revision)?;
-    let tree = resolve_trees(
+    let tree = resolve_trees_with(
         &base.tree,
         &current.tree,
         &candidate.tree,
         &MergePolicy::opaque(),
         &NoContent,
-        prefer,
+        default,
+        &entry_choices,
     )
     .map_err(|_| Failure {
         code: "invalid_resolution",
@@ -323,7 +428,8 @@ pub(crate) fn resolve(
         ResolutionTarget {
             conflicts,
             expected_head,
-            receipts: vec![receipt],
+            receipts: receipts.into_iter().collect(),
+            source,
         },
     )?;
     let controller = SyncController::new(rep)?;

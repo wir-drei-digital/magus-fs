@@ -791,6 +791,17 @@ fn shared_resolution_links_resolved_candidates_and_never_blocks_application() {
         .unwrap();
     rep.enqueue_submission(pending(&rep, &b, held.clone()))
         .unwrap();
+    // A later local edit used as the replacement source (content/path/metadata).
+    w.write(&h, 0, b"later!").unwrap();
+    let later = w
+        .checkpoint(
+            &OperationId::random().unwrap(),
+            w.generation().unwrap(),
+            attr(),
+        )
+        .unwrap();
+    rep.enqueue_submission(pending(&rep, &b, later.clone()))
+        .unwrap();
     let mut candidate = rep
         .sync_status()
         .unwrap()
@@ -799,7 +810,7 @@ fn shared_resolution_links_resolved_candidates_and_never_blocks_application() {
         .find(|p| p.local_revision == held)
         .unwrap();
     private(&rep, &b, &mut candidate);
-    assert_eq!(rep.pending_submissions().unwrap().len(), 2);
+    assert_eq!(rep.pending_submissions().unwrap().len(), 3);
     // The newer authorized view of the same branch is a registered incoming source.
     let mut current = rep.revision(&base).unwrap();
     current.operation = OperationId::random().unwrap();
@@ -820,6 +831,7 @@ fn shared_resolution_links_resolved_candidates_and_never_blocks_application() {
         conflicts: vec![ConflictId::random().unwrap()],
         expected_head: view.view.head.clone(),
         receipts: vec![candidate.private_receipt.as_ref().unwrap().receipt.clone()],
+        source: Some(later.clone()),
     };
     let resolving = PendingSubmission {
         operation: rep.revision(&replacement).unwrap().operation,
@@ -846,7 +858,7 @@ fn shared_resolution_links_resolved_candidates_and_never_blocks_application() {
         .unwrap();
     // The working tree, binding and pending set are untouched by the replacement record.
     assert_eq!(rep.sync_status().unwrap().binding, Some(b.clone()));
-    assert_eq!(rep.pending_submissions().unwrap().len(), 2);
+    assert_eq!(rep.pending_submissions().unwrap().len(), 3);
     let mut r = rep
         .sync_status()
         .unwrap()
@@ -889,7 +901,11 @@ fn shared_resolution_links_resolved_candidates_and_never_blocks_application() {
     rep.record_sync_progress(&r.operation, SubmissionState::Uncertain, r.clone())
         .unwrap();
     let marked = rep.mark_resolved(&r.operation).unwrap();
-    assert_eq!(marked.len(), 2, "the candidate and its unpublished parent");
+    assert_eq!(
+        marked.len(),
+        3,
+        "the candidate, its unpublished parent and the replacement source"
+    );
     assert!(rep.pending_submissions().unwrap().is_empty());
     let status = rep.sync_status().unwrap().submissions;
     for p in status.iter().filter(|p| p.resolves.is_none()) {
