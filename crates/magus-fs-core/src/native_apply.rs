@@ -1,7 +1,9 @@
 //! Full-folder application. Every displaced writable generation remains separate from content.
 use crate::{
     capture::{directory, Observation, Scan, ScanRecord},
-    engine::{from_json, json, lock, Core},
+    engine::{from_json, json, lock, Core, Working},
+    native_recovery::{record, RecoveryCausality, Retained},
+    native_root::{RootIntent, RootPhase},
     objects::{name, open_at},
     permissions as perm, *,
 };
@@ -19,8 +21,8 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
-const RETAIN_BYTES: u64 = 512 * 1024 * 1024;
-const RETAIN_GENERATIONS: usize = 128;
+pub(crate) const RETAIN_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const RETAIN_GENERATIONS: usize = 128;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeApplyStatus {
     Ready { revision: RevisionId },
@@ -43,7 +45,7 @@ pub struct NativeStatus {
     pub displacements: Vec<NativeDisplacement>,
 }
 #[derive(Clone, Serialize, Deserialize)]
-struct FileIntent {
+pub(crate) struct FileIntent {
     path: String,
     stage: String,
     expected: Option<Observation>,
@@ -57,18 +59,58 @@ struct FileIntent {
     ambiguous: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
-struct Intent {
-    operation: OperationId,
-    revision: RevisionId,
-    generation: u64,
-    base: RevisionId,
-    binding: Option<SyncBinding>,
-    actor: Actor,
-    stage: PathBuf,
-    stage_identity: Option<Observation>,
-    before: ScanRecord,
-    files: Vec<FileIntent>,
-    status: NativeApplyStatus,
+pub(crate) struct Intent {
+    pub(crate) operation: OperationId,
+    pub(crate) revision: RevisionId,
+    pub(crate) generation: u64,
+    pub(crate) base: RevisionId,
+    pub(crate) binding: Option<SyncBinding>,
+    pub(crate) actor: Actor,
+    pub(crate) stage: PathBuf,
+    pub(crate) stage_identity: Option<Observation>,
+    pub(crate) before: ScanRecord,
+    pub(crate) files: Vec<FileIntent>,
+    pub(crate) status: NativeApplyStatus,
+    /// Structural application by verified root exchange (journal schema 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) root: Option<RootIntent>,
+}
+impl Intent {
+    /// The intent holds an applied or possibly applied native mutation.
+    fn mutating(&self) -> bool {
+        !self.files.is_empty()
+            || self
+                .root
+                .as_ref()
+                .is_some_and(|r| r.phase != RootPhase::Abandoned)
+    }
+    fn ambiguous(&self) -> bool {
+        self.files.iter().any(|f| f.ambiguous) || self.root.as_ref().is_some_and(|r| r.ambiguous)
+    }
+}
+/// Retained bytes and generations charged by one intent (A file generations plus any root).
+pub(crate) fn usage(r: &Intent) -> (u64, usize) {
+    let mut bytes = 0u64;
+    let mut generations = 0usize;
+    for f in &r.files {
+        if f.expected.is_some() {
+            generations += 1 + f.versions.len();
+            if let Ok(m) = std::fs::symlink_metadata(r.stage.join(&f.stage)) {
+                bytes = bytes.saturating_add(m.len());
+            }
+            for p in &f.versions {
+                if let Ok(m) = std::fs::symlink_metadata(p) {
+                    bytes = bytes.saturating_add(m.len());
+                }
+            }
+        }
+    }
+    if let Some(root) = &r.root {
+        let (b, g) = root.usage();
+        bytes = bytes.saturating_add(b);
+        generations += g;
+    }
+    (bytes, generations)
 }
 pub(crate) fn authority_revision(core: &Core) -> Result<Option<RevisionId>, FsError> {
     match core
@@ -108,14 +150,14 @@ pub(crate) fn authorize_native_capture(
     }
     crate::capture::authorize_capture(&core.config, actor, Some(&old), new)
 }
-fn configuration(core: &Core) -> Result<NativeConfig, FsError> {
+pub(crate) fn configuration(core: &Core) -> Result<NativeConfig, FsError> {
     from_json(&core.journal.db.query_row(
         "SELECT configuration FROM native WHERE singleton=1",
         [],
         |r| r.get::<_, Vec<u8>>(0),
     )?)
 }
-fn baseline(core: &Core) -> Result<ScanRecord, FsError> {
+pub(crate) fn baseline(core: &Core) -> Result<ScanRecord, FsError> {
     from_json(
         &core
             .journal
@@ -125,7 +167,7 @@ fn baseline(core: &Core) -> Result<ScanRecord, FsError> {
             })?,
     )
 }
-fn records(core: &Core) -> Result<Vec<Intent>, FsError> {
+pub(crate) fn records(core: &Core) -> Result<Vec<Intent>, FsError> {
     core.journal
         .db
         .prepare("SELECT record FROM native_apply ORDER BY rowid")?
@@ -133,7 +175,7 @@ fn records(core: &Core) -> Result<Vec<Intent>, FsError> {
         .map(|r| from_json(&r?))
         .collect()
 }
-fn save(core: &Core, r: &Intent) -> Result<(), FsError> {
+pub(crate) fn save(core: &Core, r: &Intent) -> Result<(), FsError> {
     core.journal.guard()?;
     core.journal.db.execute(
         "INSERT OR REPLACE INTO native_apply VALUES(?,?)",
@@ -154,6 +196,16 @@ fn displacements(rows: &[Intent]) -> Vec<NativeDisplacement> {
                     versions: f.versions.clone(),
                     ambiguous: f.ambiguous,
                 })
+                .chain(r.root.iter().filter(|x| x.exchanged()).map(|x| {
+                    // The displaced root is a whole retained generation at the empty path.
+                    NativeDisplacement {
+                        operation: r.operation.clone(),
+                        path: String::new(),
+                        retained_path: x.retained_path(),
+                        versions: x.versions.iter().map(|v| v.version.clone()).collect(),
+                        ambiguous: x.ambiguous,
+                    }
+                }))
         })
         .collect()
 }
@@ -167,12 +219,12 @@ fn status_save(core: &Core, s: &NativeStatus) -> Result<(), FsError> {
     )?;
     Ok(())
 }
-fn blocked(reason: &str) -> NativeApplyStatus {
+pub(crate) fn blocked(reason: &str) -> NativeApplyStatus {
     NativeApplyStatus::ApplyBlocked {
         reason: reason.into(),
     }
 }
-fn pending(reason: &str) -> NativeApplyStatus {
+pub(crate) fn pending(reason: &str) -> NativeApplyStatus {
     NativeApplyStatus::Pending {
         reason: reason.into(),
     }
@@ -180,7 +232,7 @@ fn pending(reason: &str) -> NativeApplyStatus {
 fn observation(file: &File) -> Result<Observation, FsError> {
     Ok(Observation::metadata(&file.metadata()?))
 }
-fn native_hash(file: &mut File) -> Result<String, FsError> {
+pub(crate) fn native_hash(file: &mut File) -> Result<String, FsError> {
     let before = observation(file)?;
     if before.size > RETAIN_BYTES || !file.metadata()?.is_file() {
         return Err(FsError::Backpressure);
@@ -204,7 +256,7 @@ fn native_hash(file: &mut File) -> Result<String, FsError> {
     }
     Ok(crate::model::hex(&hash.finalize()))
 }
-fn same_generation(a: &Observation, b: &Observation) -> bool {
+pub(crate) fn same_generation(a: &Observation, b: &Observation) -> bool {
     a.same_identity(b)
         && a.size == b.size
         && a.mtime == b.mtime
@@ -250,7 +302,7 @@ fn metadata_matches(core: &Core, file: &File, entry: &Entry) -> Result<(), FsErr
     }
     Ok(())
 }
-fn verify_file(core: &Core, file: &mut File, entry: &Entry) -> Result<(), FsError> {
+pub(crate) fn verify_file(core: &Core, file: &mut File, entry: &Entry) -> Result<(), FsError> {
     verify_file_generation(core, file, entry).map(|_| ())
 }
 fn verify_file_generation(
@@ -314,7 +366,7 @@ fn verify_file_generation(
     }
     Ok((before, crate::model::hex(&hash.finalize())))
 }
-fn scan_tree(core: &Core, n: &NativeConfig, tree: &Tree) -> Result<ScanRecord, FsError> {
+pub(crate) fn scan_tree(core: &Core, n: &NativeConfig, tree: &Tree) -> Result<ScanRecord, FsError> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut scan = Scan::observe(&n.root, &n.policy, deadline)?;
     if !scan.unsupported.is_empty() || scan.nodes.len() != tree.entries.len() + 1 {
@@ -379,7 +431,7 @@ fn verify_ancestry(n: &NativeConfig, before: &ScanRecord, path: &str) -> Result<
     }
     Ok(dir)
 }
-fn rename_atomic(
+pub(crate) fn rename_atomic(
     stage: &File,
     from: &str,
     parent: &File,
@@ -424,7 +476,7 @@ fn rename_atomic(
     stage.sync_all()?;
     Ok(())
 }
-fn stage_open(r: &Intent) -> Result<File, FsError> {
+pub(crate) fn stage_open(r: &Intent) -> Result<File, FsError> {
     let d = directory(&r.stage)?;
     let actual = observation(&d)?;
     if !r
@@ -534,6 +586,9 @@ impl Replica {
                     !matches!(r.status, NativeApplyStatus::Ready { .. })
                         && r.stage_identity.is_some()
                         && r.actor == actor
+                        && r.root
+                            .as_ref()
+                            .is_none_or(|x| x.phase != RootPhase::Abandoned)
                 })
                 .collect::<Vec<_>>()
         };
@@ -595,9 +650,10 @@ impl Replica {
             {
                 return Ok(None);
             }
-            if records(&core)?.iter().any(|r| {
-                !matches!(r.status, NativeApplyStatus::Ready { .. }) && !r.files.is_empty()
-            }) {
+            if records(&core)?
+                .iter()
+                .any(|r| !matches!(r.status, NativeApplyStatus::Ready { .. }) && r.mutating())
+            {
                 return Err(FsError::DirtyWorkingState);
             }
         }
@@ -680,24 +736,35 @@ impl Replica {
         let mut bytes = 0u64;
         let mut generations = 0usize;
         for r in &rows {
-            for f in &r.files {
-                if f.expected.is_some() {
-                    generations += 1 + f.versions.len();
-                    if let Ok(m) = std::fs::symlink_metadata(r.stage.join(&f.stage)) {
-                        bytes = bytes.saturating_add(m.len());
-                    }
-                    for p in &f.versions {
-                        if let Ok(m) = std::fs::symlink_metadata(p) {
-                            bytes = bytes.saturating_add(m.len());
-                        }
-                    }
-                }
-            }
+            let (b, g) = usage(r);
+            bytes = bytes.saturating_add(b);
+            generations += g;
         }
         for r in &mut rows {
             if bytes > RETAIN_BYTES || generations > RETAIN_GENERATIONS {
                 status.status = blocked("displacement_backpressure");
                 continue;
+            }
+            if r.root.as_ref().is_some_and(RootIntent::exchanged) {
+                match crate::native_root::rescan(&core, r)? {
+                    crate::native_root::Rescan::Unchanged => {}
+                    crate::native_root::Rescan::Changed => {
+                        if !matches!(status.status, NativeApplyStatus::ApplyBlocked { .. }) {
+                            status.status = pending("late_displaced_write");
+                        }
+                    }
+                    crate::native_root::Rescan::Missing => {
+                        status.status = blocked("retained_generation_missing")
+                    }
+                    crate::native_root::Rescan::Backpressure => {
+                        status.status = blocked("displacement_backpressure")
+                    }
+                    crate::native_root::Rescan::Unstable => {
+                        status.status = NativeApplyStatus::Unstable {
+                            reason: "displaced_write_unstable".into(),
+                        }
+                    }
+                }
             }
             if r.stage_identity.is_none() && r.files.is_empty() {
                 continue;
@@ -749,6 +816,20 @@ impl Replica {
                     std::io::copy(&mut (&mut displaced).take(observed.size), &mut copy)?;
                     copy.sync_all()?;
                     stage.sync_all()?;
+                    let copied =
+                        open_file(&stage, &version).and_then(|mut c| native_hash(&mut c))?;
+                    record(
+                        &core,
+                        Retained {
+                            operation: &r.operation,
+                            original_base: &r.base,
+                            source_path: &f.path,
+                            observed_generation: r.generation,
+                            digest_hex: &copied,
+                            copy: &r.stage.join(&version),
+                            causal_coverage: RecoveryCausality::Unknown,
+                        },
+                    )?;
                     f.versions.push(r.stage.join(version));
                     generations += 1;
                     bytes = bytes.saturating_add(observed.size);
@@ -875,7 +956,7 @@ impl Replica {
             return Ok(status.status);
         }
         status_save(&core, &status)?;
-        let preflight = (|| -> Result<(), FsError> {
+        let preflight = (|| -> Result<bool, FsError> {
             if authority_revision(&core)?.is_some_and(|id| id != *revision) {
                 return Err(FsError::PermissionDenied);
             }
@@ -886,8 +967,8 @@ impl Replica {
                 return Err(FsError::DirtyWorkingState);
             }
             if all.iter().any(|r| {
-                (!matches!(r.status, NativeApplyStatus::Ready { .. }) && !r.files.is_empty())
-                    || r.files.iter().any(|f| f.ambiguous)
+                (!matches!(r.status, NativeApplyStatus::Ready { .. }) && r.mutating())
+                    || r.ambiguous()
             }) {
                 return Err(FsError::DirtyWorkingState);
             }
@@ -906,6 +987,7 @@ impl Replica {
                     .collect::<std::collections::BTreeSet<_>>();
                 let mut allowed = std::collections::BTreeSet::new();
                 let mut required = std::collections::BTreeSet::new();
+                use std::os::unix::ffi::OsStrExt;
                 for file in &retained.files {
                     allowed.insert(file.stage.as_bytes().to_vec());
                     if file.expected.is_some() && file.exchanged {
@@ -913,10 +995,14 @@ impl Replica {
                     }
                     for version in &file.versions {
                         let leaf = version.file_name().ok_or(FsError::UnsafeStorage)?;
-                        use std::os::unix::ffi::OsStrExt;
                         allowed.insert(leaf.as_bytes().to_vec());
                         required.insert(leaf.as_bytes().to_vec());
                     }
+                }
+                for version in retained.root.iter().flat_map(|x| &x.versions) {
+                    let leaf = version.version.file_name().ok_or(FsError::UnsafeStorage)?;
+                    allowed.insert(leaf.as_bytes().to_vec());
+                    required.insert(leaf.as_bytes().to_vec());
                 }
                 if !actual.is_subset(&allowed) || !required.is_subset(&actual) {
                     return Err(FsError::Backpressure);
@@ -971,39 +1057,42 @@ impl Replica {
                 (None, None) => {}
                 _ => return Err(FsError::ConfigMismatch),
             }
-            if target.tree.root != old.tree.root {
+            if target.tree.root.id != old.tree.root.id {
                 return Err(FsError::UnsupportedMode);
             }
-            for e in &old.tree.entries {
-                let new = target
-                    .tree
-                    .entries
-                    .iter()
-                    .find(|v| v.path == e.path)
-                    .ok_or(FsError::UnsupportedMode)?;
-                if new.id != e.id
-                    || new.parent != e.parent
-                    || new.owner != e.owner
-                    || new.group != e.group
-                    || new.mode != e.mode
-                    || matches!(e.content, EntryContent::Directory) && new.content != e.content
-                {
-                    return Err(FsError::UnsupportedMode);
-                }
-            }
-            for e in &target.tree.entries {
-                if !old.tree.entries.iter().any(|v| v.path == e.path)
-                    && (e.content == EntryContent::Directory
-                        || !before.observations.contains_key(perm::parent(&e.path)))
-                {
-                    return Err(FsError::UnsupportedMode);
-                }
-            }
-            for entry in &target.tree.entries {
-                if old.tree.entries.iter().find(|e| e.path == entry.path) != Some(entry) {
-                    let parent = verify_ancestry(&n, &before, &entry.path)?;
-                    if parent.metadata()?.mode() & 0o222 == 0 {
-                        return Err(FsError::ReadOnly);
+            // Regular-file creation/exchange keeps A's per-file path; any namespace, directory,
+            // deletion, identity, type or metadata change uses the verified root exchange.
+            let structural = target.tree.root != old.tree.root
+                || old.tree.entries.iter().any(|e| {
+                    target
+                        .tree
+                        .entries
+                        .iter()
+                        .find(|v| v.path == e.path)
+                        .is_none_or(|new| {
+                            new.id != e.id
+                                || new.parent != e.parent
+                                || new.owner != e.owner
+                                || new.group != e.group
+                                || new.mode != e.mode
+                                || (e.content == EntryContent::Directory)
+                                    != (new.content == EntryContent::Directory)
+                                || matches!(e.content, EntryContent::Directory)
+                                    && new.content != e.content
+                        })
+                })
+                || target.tree.entries.iter().any(|e| {
+                    !old.tree.entries.iter().any(|v| v.path == e.path)
+                        && (e.content == EntryContent::Directory
+                            || !before.observations.contains_key(perm::parent(&e.path)))
+                });
+            if !structural {
+                for entry in &target.tree.entries {
+                    if old.tree.entries.iter().find(|e| e.path == entry.path) != Some(entry) {
+                        let parent = verify_ancestry(&n, &before, &entry.path)?;
+                        if parent.metadata()?.mode() & 0o222 == 0 {
+                            return Err(FsError::ReadOnly);
+                        }
                     }
                 }
             }
@@ -1015,16 +1104,19 @@ impl Replica {
                 return Err(FsError::DirtyWorkingState);
             }
             crate::capture::authorize_capture(&core.config, &actor, Some(&old.tree), &target.tree)?;
-            Ok(())
+            Ok(structural)
         })();
-        if let Err(e) = preflight {
-            status.status = match e {
-                FsError::DirtyWorkingState | FsError::GenerationMismatch => pending(e.code()),
-                _ => blocked(e.code()),
-            };
-            status_save(&core, &status)?;
-            return Ok(status.status);
-        }
+        let structural = match preflight {
+            Ok(structural) => structural,
+            Err(e) => {
+                status.status = match e {
+                    FsError::DirtyWorkingState | FsError::GenerationMismatch => pending(e.code()),
+                    _ => blocked(e.code()),
+                };
+                status_save(&core, &status)?;
+                return Ok(status.status);
+            }
+        };
         // The immutable revision/source is selected while owned; HTTP runs without Core's mutex.
         drop(core);
         self.prefetch_native(
@@ -1058,8 +1150,13 @@ impl Replica {
             before,
             files: vec![],
             status: pending("staging"),
+            root: None,
         };
         let result = (|| -> Result<NativeApplyStatus, FsError> {
+            let retained = all
+                .iter()
+                .map(usage)
+                .fold((0u64, 0usize), |a, b| (a.0.saturating_add(b.0), a.1 + b.1));
             let count: usize = all
                 .iter()
                 .map(|r| r.files.len() + r.files.iter().map(|f| f.versions.len()).sum::<usize>())
@@ -1091,8 +1188,9 @@ impl Replica {
                     _ => 0,
                 })
                 .sum();
-            if count + changed.len() > RETAIN_GENERATIONS
-                || existing.saturating_add(needed) > RETAIN_BYTES
+            if !structural
+                && (count + changed.len() > RETAIN_GENERATIONS
+                    || existing.saturating_add(needed) > RETAIN_BYTES)
             {
                 return Ok(blocked("displacement_backpressure"));
             }
@@ -1106,6 +1204,9 @@ impl Replica {
             let stage = directory(&r.stage)?;
             r.stage_identity = Some(observation(&stage)?);
             save(&core, &r)?;
+            if structural {
+                return crate::native_root::prepare(&mut core, &n, &mut r, &target, retained);
+            }
             for (i, e) in changed.into_iter().enumerate() {
                 let parent = verify_ancestry(&n, &r.before, &e.path)?;
                 let m = parent.metadata()?;
@@ -1199,7 +1300,7 @@ fn finish(core: &mut Core, n: &NativeConfig, r: &mut Intent) -> Result<NativeApp
     if authority_revision(core)?.is_some_and(|id| id != r.revision) {
         return Ok(blocked("permission_denied"));
     }
-    if matches!(r.status, NativeApplyStatus::Ready { .. }) && r.files.iter().any(|f| f.ambiguous) {
+    if matches!(r.status, NativeApplyStatus::Ready { .. }) && r.ambiguous() {
         return Ok(pending("retained_candidate"));
     }
     if matches!(r.status, NativeApplyStatus::Ready { .. }) {
@@ -1215,6 +1316,9 @@ fn finish(core: &mut Core, n: &NativeConfig, r: &mut Intent) -> Result<NativeApp
     let old = core.working()?.clone();
     if old.generation != r.generation || old.head != r.base {
         return Ok(pending("generation_mismatch"));
+    }
+    if r.root.is_some() {
+        return crate::native_root::finish(core, n, r);
     }
     let stage = stage_open(r)?;
     for i in 0..r.files.len() {
@@ -1311,8 +1415,20 @@ fn finish(core: &mut Core, n: &NativeConfig, r: &mut Intent) -> Result<NativeApp
             return Ok(blocked("native_identity_changed"));
         }
     }
+    commit(core, n, r, old, remote.tree, scan)
+}
+/// Commit a verified application: native baseline, working revision, binding and any matching
+/// applied receipt in one SQLite transaction.
+pub(crate) fn commit(
+    core: &mut Core,
+    n: &NativeConfig,
+    r: &mut Intent,
+    old: Working,
+    tree: Tree,
+    scan: ScanRecord,
+) -> Result<NativeApplyStatus, FsError> {
     let mut next = old.clone();
-    next.tree = remote.tree;
+    next.tree = tree;
     next.head = r.revision.clone();
     next.base = r.revision.clone();
     next.generation = old
@@ -1385,8 +1501,44 @@ impl Core {
         for r in records(self)? {
             out.extend(crate::cache::object_set(&self.revision(&r.base)?.tree));
         }
+        // Retained recovery bases and explicitly captured recovery revisions.
+        for id in crate::native_recovery::roots(self)? {
+            out.extend(crate::cache::object_set(&self.revision(&id)?.tree));
+        }
         Ok(out)
     }
+}
+/// Paths installed by the native application that produced the current head, when no local
+/// capture has happened since. A later native change to one of them has unknown causality:
+/// an editor may have saved bytes read before the application.
+pub(crate) fn applied_paths(core: &Core) -> Result<Vec<String>, FsError> {
+    let Some(w) = &core.working else {
+        return Ok(vec![]);
+    };
+    if w.base != w.head {
+        return Ok(vec![]);
+    }
+    let Some(r) = records(core)?
+        .into_iter()
+        .rev()
+        .find(|r| r.revision == w.head && matches!(r.status, NativeApplyStatus::Ready { .. }))
+    else {
+        return Ok(vec![]);
+    };
+    let old = core.revision(&r.base)?.tree;
+    let new = core.revision(&r.revision)?.tree;
+    let mut out = vec![];
+    // Regular files only: stale application RAM concerns content, not directory listings.
+    for e in new
+        .entries
+        .iter()
+        .filter(|e| e.content != EntryContent::Directory)
+    {
+        if old.entries.iter().find(|o| o.id == e.id) != Some(e) {
+            out.push(e.path.clone());
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

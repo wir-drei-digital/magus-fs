@@ -21,6 +21,13 @@ fn args(mut argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
         }
         let sub = argv.remove(1);
         argv[0] = format!("sync-{sub}");
+        if sub == "recovery" {
+            if argv.len() < 2 || argv[1].starts_with("--") {
+                return Err((2, FsError::InvalidPath));
+            }
+            let action = argv.remove(1);
+            argv[0] = format!("sync-recovery-{action}");
+        }
     }
     let command = argv.first().cloned().ok_or((2, FsError::InvalidPath))?;
     let allowed = match command.as_str() {
@@ -29,6 +36,9 @@ fn args(mut argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
         "sync-status" => vec!["state", "revision"],
         "sync-drain" => vec!["state", "revision", "level", "deadline-ms"],
         "sync-integrate" => vec!["state", "revision", "expected-head"],
+        "sync-recovery-list" => vec!["state"],
+        "sync-recovery-capture" => vec!["state", "id", "digest", "operation-id"],
+        "sync-recovery-export" => vec!["state", "id", "digest", "destination"],
         "mount" => vec![
             "state",
             "revision",
@@ -482,6 +492,9 @@ fn sync_control(rep: &Replica, command: &str, options: &BTreeMap<String, String>
         )
         .map_err(|e| (1, e));
     }
+    if let Some(action) = command.strip_prefix("sync-recovery-") {
+        return recovery_control(rep, action, options);
+    }
     if command == "sync-status" {
         let status = rep.sync_status().map_err(|e| (1, e))?;
         return if options.contains_key("revision") {
@@ -611,6 +624,40 @@ fn sync_control(rep: &Replica, command: &str, options: &BTreeMap<String, String>
     Ok(json!({"ok":true,"progress":p,"counters":controller.counters()}))
 }
 
+/// Retained native alternatives are selected only by opaque record id and expected digest.
+fn recovery_control(
+    rep: &Replica,
+    action: &str,
+    options: &BTreeMap<String, String>,
+) -> Result<Value> {
+    let actor = rep
+        .actor_for_uid(unsafe { libc::geteuid() })
+        .map_err(|e| (2, e))?;
+    let id = || NativeRecoveryId::parse(required(options, "id")?).map_err(|e| (2, e));
+    let digest = || ObjectId::parse(required(options, "digest")?).map_err(|e| (2, e));
+    match action {
+        "list" => Ok(
+            json!({"ok":true,"records":rep.list_native_recovery(actor).map_err(|e|(1,e))?,"limit":MAX_RECOVERY_LISTING}),
+        ),
+        "capture" => {
+            let revision = rep
+                .capture_native_recovery(id()?, digest()?, operation(options)?, actor)
+                .map_err(|e| (1, e))?;
+            let descriptor = rep.revision(&revision).map_err(|e| (1, e))?;
+            Ok(
+                json!({"ok":true,"revision":revision,"parents":descriptor.parents,"provenance":descriptor.provenance,"published":false}),
+            )
+        }
+        "export" => {
+            let destination = absolute(required(options, "destination")?)?;
+            rep.export_native_recovery(id()?, digest()?, destination, actor)
+                .map_err(|e| (1, e))?;
+            Ok(json!({"ok":true,"destination":destination}))
+        }
+        _ => Err((2, FsError::InvalidPath)),
+    }
+}
+
 #[cfg(test)]
 mod sync_tests {
     use super::*;
@@ -708,5 +755,40 @@ mod sync_tests {
             result.is_ok(),
             "local retained status must remain accessible: {result:?}"
         );
+    }
+    #[test]
+    fn recovery_commands_select_only_by_opaque_id() {
+        let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (command, options) =
+            args(argv(&["sync", "recovery", "list", "--state", "/s"])).unwrap();
+        assert_eq!(command, "sync-recovery-list");
+        assert_eq!(options["state"], "/s");
+        let (command, _) = args(argv(&[
+            "sync",
+            "recovery",
+            "export",
+            "--state",
+            "/s",
+            "--id",
+            "0123456789abcdef0123456789abcdef",
+            "--digest",
+            "sha256:00",
+            "--destination",
+            "/out",
+        ]))
+        .unwrap();
+        assert_eq!(command, "sync-recovery-export");
+        for bad in [
+            &["sync", "recovery", "--state", "/s"][..],
+            &["sync", "recovery", "list", "--path", "/retained"],
+            &["sync", "recovery", "capture", "--retained", "/x"],
+            &["sync", "recovery", "delete", "--state", "/s"],
+        ] {
+            let parsed = args(argv(bad));
+            assert!(
+                parsed.is_err() || run(argv(bad)).is_err_and(|e| e.0 == 2),
+                "{bad:?}"
+            );
+        }
     }
 }

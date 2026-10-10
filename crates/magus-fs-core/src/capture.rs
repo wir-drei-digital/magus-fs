@@ -58,7 +58,7 @@ impl CapturePolicy {
         }
         Ok(())
     }
-    fn selected(&self, p: &str) -> bool {
+    pub(crate) fn selected(&self, p: &str) -> bool {
         self.included_roots
             .iter()
             .any(|r| r == "." || beneath(p, r) || beneath(r, p))
@@ -530,6 +530,30 @@ fn mapped(config: &ReplicaConfig, info: &Observation) -> Result<(PrincipalId, Gr
         .ok_or(FsError::MappingBlocked)?;
     Ok((owner.principal.clone(), group.primary_group.clone()))
 }
+fn leaf(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+/// Current write+search authority on a destination parent identified by its stable identity.
+fn destination_write(
+    old: &Tree,
+    parent: &EntryId,
+    path: &str,
+    a: &perm::Authority,
+) -> Result<(), FsError> {
+    let base = if *parent == old.root.id {
+        String::new()
+    } else if let Some(p) = old.entries.iter().find(|e| &e.id == parent) {
+        p.path.clone()
+    } else {
+        return Ok(());
+    };
+    let at = if base.is_empty() {
+        leaf(path).to_string()
+    } else {
+        format!("{base}/{}", leaf(path))
+    };
+    perm::parent_write(old, &at, a).map(|_| ())
+}
 pub(crate) fn authorize_capture(
     config: &ReplicaConfig,
     actor: &Actor,
@@ -558,11 +582,15 @@ pub(crate) fn authorize_capture(
             )?;
             let replacement = new.entries.iter().find(|e| e.id == entry.id);
             if replacement != Some(entry) {
-                // Parent write controls namespace changes, not bytes or owner metadata.
-                if replacement.is_none_or(|next| next.path != entry.path) {
+                // Parent write controls namespace changes, not bytes or owner metadata. A path
+                // that changed only because an ancestor moved is authorized at that ancestor.
+                let moved = replacement.is_none_or(|next| {
+                    next.parent != entry.parent || leaf(&next.path) != leaf(&entry.path)
+                });
+                if moved {
                     perm::parent_write(old, &entry.path, a)?;
                     if let Some(next) = replacement {
-                        perm::parent_write(old, &next.path, a)?;
+                        destination_write(old, &next.parent, &next.path, a)?;
                     }
                 }
                 if let Some(replacement) = replacement {
@@ -586,10 +614,8 @@ pub(crate) fn authorize_capture(
         }
         for entry in &new.entries {
             if !old.entries.iter().any(|e| e.id == entry.id) {
-                let parent = perm::parent(&entry.path);
-                if perm::entry(old, parent).is_ok() {
-                    perm::parent_write(old, &entry.path, a)?;
-                }
+                // A parent created by the same change is authorized by its own creation.
+                destination_write(old, &entry.parent, &entry.path, a)?;
             }
         }
     }
@@ -926,6 +952,19 @@ impl Replica {
                 &tree,
             )?;
             crate::native_apply::authorize_native_capture(&core, &actor, &tree)?;
+            // Identify engine-applied paths by operation record, never by name or time.
+            let unknown_causality = prior.as_ref().is_some_and(|p| {
+                crate::native_apply::applied_paths(&core)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|path| {
+                        p.observations.get(path).is_some_and(|before| {
+                            observations.get(path).is_none_or(|after| {
+                                !crate::native_apply::same_generation(before, after)
+                            })
+                        })
+                    })
+            });
             let digest =
                 RevisionId::digest(&json(&(root, &policy, &actor, &tree, &observations))?)?;
             let existing = core
@@ -972,7 +1011,12 @@ impl Replica {
                     .try_into()
                     .map_err(|_| FsError::LimitExceeded)?,
                 coverage: policy.coverage(&tree),
-                provenance: "native_scan_delete_create".into(),
+                provenance: if unknown_causality {
+                    crate::UNKNOWN_CAUSALITY_PROVENANCE
+                } else {
+                    "native_scan_delete_create"
+                }
+                .into(),
                 restoration: None,
                 tree,
             };

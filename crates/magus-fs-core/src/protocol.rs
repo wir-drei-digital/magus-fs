@@ -27,6 +27,7 @@ macro_rules! opaque_id {
         impl From<$name> for String {fn from(id:$name)->Self {id.0}}
     )*}
 }
+pub(crate) use opaque_id;
 opaque_id!(
     NamespaceId,
     UploadId,

@@ -15,6 +15,8 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+/// Additive in-place upgrades only: 1 -> 2 adds native recovery tables.
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 pub(crate) struct Journal {
     pub db: Connection,
     control: ObjectStore,
@@ -102,7 +104,9 @@ impl Journal {
         };
         db.busy_timeout(Duration::from_millis(5000))?;
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 1 {
+        // Version 2 adds retained native recovery records/captures (GC roots). An older binary
+        // must fail closed instead of ignoring them, so every schema addition bumps the version.
+        if version > SCHEMA_VERSION {
             return Err(FsError::UnsupportedSchema);
         }
         db.pragma_update(None, "journal_mode", "WAL")?;
@@ -147,7 +151,9 @@ impl Journal {
   CREATE TABLE IF NOT EXISTS sync_sources (id TEXT PRIMARY KEY, binding BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS revision_sources (revision TEXT PRIMARY KEY, source BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS sync_queue (operation TEXT PRIMARY KEY, record BLOB NOT NULL);
-  PRAGMA user_version=1;")?;
+  CREATE TABLE IF NOT EXISTS native_recovery (id TEXT PRIMARY KEY, operation TEXT NOT NULL, record BLOB NOT NULL, retained TEXT NOT NULL, UNIQUE(operation, retained));
+  CREATE TABLE IF NOT EXISTS native_recovery_captures (operation TEXT PRIMARY KEY, id TEXT NOT NULL REFERENCES native_recovery(id), digest TEXT NOT NULL, revision TEXT NOT NULL REFERENCES revisions(id));
+  PRAGMA user_version=2;")?;
         let encoded = serde_json::to_vec(&config).map_err(|_| FsError::InvalidDescriptor)?;
         if let Some(existing) = tx
             .query_row(

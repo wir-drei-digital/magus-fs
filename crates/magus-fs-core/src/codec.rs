@@ -38,7 +38,10 @@ fn validate_revision(r: &Revision) -> Result<(), FsError> {
         || r.coverage.is_empty()
         || !matches!(
             r.provenance.as_str(),
-            "explicit" | "native_scan_delete_create" | "engine_observed"
+            "explicit"
+                | "native_scan_delete_create"
+                | "engine_observed"
+                | crate::UNKNOWN_CAUSALITY_PROVENANCE
         )
     {
         return Err(FsError::InvalidDescriptor);

@@ -210,6 +210,9 @@ impl Server {
                                     | "sync-status"
                                     | "sync-drain"
                                     | "sync-integrate"
+                                    | "sync-recovery-list"
+                                    | "sync-recovery-capture"
+                                    | "sync-recovery-export"
                             ) {
                                 return Err((2, FsError::InvalidPath));
                             }
@@ -224,6 +227,7 @@ impl Server {
                                             | "sync-run"
                                             | "sync-integrate"
                                             | "sync-drain"
+                                            | "sync-recovery-capture"
                                     ))
                             {
                                 return Err((1, FsError::ReadOnly));

@@ -208,7 +208,8 @@ class NativeJourney(Journey):
         try:self.until(lambda:bool(ep.status(c).get('native') and 'ApplyBlocked' in ep.status(c)['native']['status']))
         finally:self.i.write_json(platform+'-permissions-last-status.json',ep.status(c))
         assert ep.read(c)==before;self.record(platform,'readonly-parent',status=ep.status(c),bytes=before);ep.stop(c);self.directory_mode(0o755)
-        c=ep.create('unsupported');ep.start(c);self.until(lambda:ep.ready(c));shared=self.publish(path=platform+'-new-directory',directory=True);self.until(lambda:'ApplyBlocked' in ep.status(c)['native']['status']);assert not ep.exists(c['root']+'/'+platform+'-new-directory');self.record(platform,'unsupported-directory',status=ep.status(c),shared=shared);ep.stop(c)
+        # FS2-B: directory creation is applied by verified root exchange instead of blocking.
+        c=ep.create('directory');ep.start(c);self.until(lambda:ep.ready(c));shared=self.publish(path=platform+'-new-directory',directory=True);self.until(lambda:ep.ready(c,shared['head']));assert ep.run("print(json.dumps(os.path.isdir(s)))",c['root']+'/'+platform+'-new-directory');self.record(platform,'directory-creation-applied',status=ep.status(c),shared=shared);ep.stop(c)
     def cleanup(self):
         for ep in self.endpoints:ep.cleanup()
 

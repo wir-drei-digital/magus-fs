@@ -3,6 +3,8 @@ use super::SyncExecution;
 use magus_fs_core::*;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -15,9 +17,44 @@ pub(crate) struct NativeWatch {
     execution: Arc<SyncExecution>,
     hint: Arc<AtomicBool>,
     overflow: Arc<AtomicBool>,
-    _watcher: RecommendedWatcher,
+    watcher: RecommendedWatcher,
+    /// Verified root identity (dev, inode) the watcher was armed on.
+    armed: Option<(u64, u64)>,
+    root: PathBuf,
     next_scan: Instant,
     hinted_at: Option<Instant>,
+}
+/// No-follow identity of the configured root pathname.
+fn path_identity(root: &Path) -> Option<(u64, u64)> {
+    std::fs::symlink_metadata(root)
+        .ok()
+        .filter(|m| m.is_dir())
+        .map(|m| (m.dev(), m.ino()))
+}
+fn arm(
+    root: &Path,
+    hint: &Arc<AtomicBool>,
+    overflow: &Arc<AtomicBool>,
+) -> Result<RecommendedWatcher, FsError> {
+    let h = hint.clone();
+    let o = overflow.clone();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        // Fault builds qualify complete hint omission while retaining the real watcher.
+        #[cfg(feature = "test-faults")]
+        if std::env::var_os("MAGUS_TEST_DROP_NATIVE_HINTS").is_some() {
+            eprintln!("test_drop_native_hint");
+            return;
+        }
+        if event.as_ref().is_err() || event.as_ref().is_ok_and(|e| e.need_rescan()) {
+            o.store(true, Ordering::Release);
+        }
+        h.store(true, Ordering::Release);
+    })
+    .map_err(|_| FsError::InvalidSource)?;
+    watcher
+        .watch(root, RecursiveMode::Recursive)
+        .map_err(|_| FsError::InvalidSource)?;
+    Ok(watcher)
 }
 impl NativeWatch {
     pub fn new(rep: &Replica, actor: Actor) -> Result<Self, FsError> {
@@ -25,37 +62,44 @@ impl NativeWatch {
         rep.verify_native_baseline(actor.clone())?;
         let hint = Arc::new(AtomicBool::new(true));
         let overflow = Arc::new(AtomicBool::new(false));
-        let h = hint.clone();
-        let o = overflow.clone();
-        let mut watcher =
-            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                // Fault builds qualify complete hint omission while retaining the real watcher.
-                #[cfg(feature = "test-faults")]
-                if std::env::var_os("MAGUS_TEST_DROP_NATIVE_HINTS").is_some() {
-                    eprintln!("test_drop_native_hint");
-                    return;
-                }
-                if event.as_ref().is_err() || event.as_ref().is_ok_and(|e| e.need_rescan()) {
-                    o.store(true, Ordering::Release);
-                }
-                h.store(true, Ordering::Release);
-            })
-            .map_err(|_| FsError::InvalidSource)?;
-        watcher
-            .watch(&native.root, RecursiveMode::Recursive)
-            .map_err(|_| FsError::InvalidSource)?;
+        let armed = rep.native_root_identity()?;
+        let watcher = arm(&native.root, &hint, &overflow)?;
         Ok(Self {
             rep: rep.clone(),
             actor,
             execution: SyncExecution::for_replica(&rep.configuration()?.replica)?,
             hint,
             overflow,
-            _watcher: watcher,
+            watcher,
+            armed,
+            root: native.root,
             next_scan: Instant::now(),
             hinted_at: None,
         })
     }
+    /// After Core commits a verified root exchange, re-arm on the installed root and rescan.
+    /// A pathname whose identity is not the verified root is never adopted by the watcher;
+    /// periodic scans keep observing it until Core verifies a root.
+    fn rebind(&mut self) -> Result<bool, FsError> {
+        let verified = self.rep.native_root_identity()?;
+        if verified == self.armed || verified.is_none() || path_identity(&self.root) != verified {
+            return Ok(false);
+        }
+        let watcher = arm(&self.root, &self.hint, &self.overflow)?;
+        if path_identity(&self.root) != verified {
+            return Ok(false);
+        }
+        eprintln!(
+            "native_watch_rebound old={:?} new={:?}",
+            self.armed, verified
+        );
+        self.watcher = watcher;
+        self.armed = verified;
+        self.overflow.store(true, Ordering::Release);
+        Ok(true)
+    }
     pub fn tick(&mut self) -> Result<(), FsError> {
+        self.rebind()?;
         let now = Instant::now();
         if self.hint.swap(false, Ordering::AcqRel) && self.hinted_at.is_none() {
             self.hinted_at = Some(now);
@@ -73,13 +117,12 @@ impl NativeWatch {
         Ok(())
     }
     pub fn scan(&mut self) -> Result<Option<RevisionId>, FsError> {
-        let Some(_gate) = self
-            .execution
-            .acquire(Instant::now() + Duration::from_millis(50))?
-        else {
+        let execution = self.execution.clone();
+        let Some(_gate) = execution.acquire(Instant::now() + Duration::from_millis(50))? else {
             return Ok(None);
         };
         self.rep.recover_native_application(self.actor.clone())?;
+        self.rebind()?;
         self.rep.scan_native_status()?;
         // Admit the exact previous capture before observing another generation. A crash between
         // capture and enqueue must not lose its operation or silently move it onto a new base.
@@ -143,7 +186,7 @@ pub(crate) fn serve(rep: &Replica) -> Result<(), FsError> {
 mod tests {
     use super::*;
     use magus_fs_core::protocol::*;
-    use std::{fs, os::unix::fs::MetadataExt, path::PathBuf};
+    use std::fs;
     #[test]
     fn omitted_events_and_restart_admit_original_capture_without_echo() {
         let root = PathBuf::from(if cfg!(target_os = "macos") {
@@ -244,6 +287,141 @@ mod tests {
             rep.native_status().unwrap().unwrap().status,
             NativeApplyStatus::Unstable { .. }
         ));
+        drop(watch);
+        drop(rep);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn verified_root_exchange_rebinds_watcher_and_rescans_installed_root() {
+        let root = PathBuf::from(if cfg!(target_os = "macos") {
+            "/private/tmp"
+        } else {
+            "/tmp"
+        })
+        .join(format!(
+            "fs2-rebind-{}",
+            RemoteSourceId::random().unwrap().as_str()
+        ));
+        fs::create_dir(&root).unwrap();
+        let tree = root.join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("a"), b"old").unwrap();
+        let principal = PrincipalId::random().unwrap();
+        let group = GroupId::random().unwrap();
+        let actor = Actor::new(principal.clone());
+        let rep = Replica::open(
+            root.join("state"),
+            ReplicaConfig {
+                replica: ReplicaId::random().unwrap(),
+                authorities: vec![Authority {
+                    principal: principal.clone(),
+                    uid: unsafe { libc::geteuid() },
+                    gid: fs::metadata(&tree).unwrap().gid(),
+                    primary_group: group.clone(),
+                    groups: vec![group.clone()],
+                    dac_override: false,
+                    ownership_transfer: false,
+                }],
+                content_roots: vec![tree.clone()],
+                cache_bytes: 1024 * 1024,
+                history_administrators: vec![],
+                retained_history_grants: vec![],
+            },
+        )
+        .unwrap();
+        let policy = CapturePolicy {
+            included_roots: vec![".".into()],
+            excluded_prefixes: vec![],
+        };
+        rep.configure_native(NativeConfig {
+            root: tree.clone(),
+            policy: policy.clone(),
+            creation_umask: 0o022,
+        })
+        .unwrap();
+        let base = rep
+            .capture(&tree, policy, OperationId::random().unwrap(), actor.clone())
+            .unwrap();
+        let binding = SyncBinding {
+            id: NamespaceId::random().unwrap(),
+            branch: BranchName::parse("main".into()).unwrap(),
+            publication: PublicationMode::SharedLive,
+            source: RemoteSourceId::random().unwrap(),
+            view: ViewBinding {
+                view: ViewId::random().unwrap(),
+                head: HeadToken::random().unwrap(),
+                revision: base.clone(),
+            },
+            transport_profile: root.join("profile"),
+            transport_identity: TransportIdentity::for_bytes(b"profile").unwrap(),
+        };
+        rep.configure_sync(binding.clone()).unwrap();
+        let mut watch = NativeWatch::new(&rep, actor.clone()).unwrap();
+        assert!(watch.scan().unwrap().is_none());
+        let original = watch.armed;
+        assert_eq!(original, path_identity(&tree));
+        // A structural incoming revision: a new directory, applied by verified root exchange.
+        let mut r = rep.revision(&base).unwrap();
+        r.parents = vec![base.clone()];
+        r.operation = OperationId::random().unwrap();
+        r.tree.entries.push(Entry {
+            path: "incoming".into(),
+            id: EntryId::random().unwrap(),
+            parent: r.tree.root.id.clone(),
+            owner: principal.clone(),
+            group: group.clone(),
+            mode: 0o755,
+            content: EntryContent::Directory,
+        });
+        r.tree.entries.sort_by(|a, b| a.path.cmp(&b.path));
+        let next = rep
+            .import_revision(
+                ImportDescriptor {
+                    expected: revision_id(&r).unwrap(),
+                    bytes: encode_revision(&r).unwrap(),
+                },
+                ChunkSource::Unavailable,
+            )
+            .unwrap();
+        let mut incoming = binding.clone();
+        incoming.source = RemoteSourceId::random().unwrap();
+        incoming.view = ViewBinding {
+            view: ViewId::random().unwrap(),
+            head: HeadToken::random().unwrap(),
+            revision: next,
+        };
+        let status = rep
+            .apply_native_view(
+                incoming,
+                rep.status().unwrap().generation,
+                OperationId::random().unwrap(),
+                actor,
+            )
+            .unwrap();
+        assert!(
+            matches!(status, NativeApplyStatus::Ready { .. }),
+            "{status:?}"
+        );
+        let installed = path_identity(&tree);
+        assert_ne!(installed, original);
+        assert_eq!(rep.native_root_identity().unwrap(), installed);
+        watch.tick().unwrap();
+        assert_eq!(
+            watch.armed, installed,
+            "watcher must re-arm on the installed root"
+        );
+        // Events from the installed root are delivered after rebinding.
+        std::thread::sleep(Duration::from_millis(300));
+        watch.hint.store(false, Ordering::Release);
+        fs::write(tree.join("incoming/after-rebind"), b"hint").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !watch.hint.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            watch.hint.load(Ordering::Acquire),
+            "installed-root write produced no watcher hint"
+        );
         drop(watch);
         drop(rep);
         fs::remove_dir_all(root).unwrap();

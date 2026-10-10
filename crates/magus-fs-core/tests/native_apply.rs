@@ -507,7 +507,7 @@ fn retention_budget_charges_the_displaced_size() {
     );
 }
 #[test]
-fn unsupported_directory_creation_is_retained_without_modification() {
+fn directory_creation_applies_by_verified_root_exchange() {
     let (_d, rep, n, base) = fixture();
     let mut r = rep.revision(&base).unwrap();
     r.operation = OperationId::random().unwrap();
@@ -529,8 +529,8 @@ fn unsupported_directory_creation_is_retained_without_modification() {
             actor(),
         )
         .unwrap();
-    assert!(matches!(s, NativeApplyStatus::ApplyBlocked { .. }));
-    assert!(!n.root.join("directory").exists());
+    assert!(matches!(s, NativeApplyStatus::Ready { .. }), "{s:?}");
+    assert!(n.root.join("directory").is_dir());
     assert_eq!(
         rep.scan_native_status().unwrap().incoming_revision,
         Some(next)
@@ -705,4 +705,938 @@ fn interrupted_unrecorded_stage_bytes_force_backpressure() {
         "{result:?}"
     );
     assert_eq!(fs::read(orphan).unwrap(), b"unclassified-retained-bytes");
+}
+
+// ---- FS2-B Task 1: structural root exchange, retained recovery and causality ----
+
+fn content(bytes: &[u8]) -> EntryContent {
+    EntryContent::File {
+        version: FileVersion {
+            size: bytes.len() as u64,
+            extents: if bytes.is_empty() {
+                vec![]
+            } else {
+                vec![Extent::Chunk {
+                    object: ObjectId::for_bytes(bytes).unwrap(),
+                    object_size: bytes.len() as u64,
+                    offset: 0,
+                    length: bytes.len() as u64,
+                }]
+            },
+        },
+    }
+}
+fn sources(d: &std::path::Path, bodies: &[&[u8]]) -> ChunkSource {
+    let path = d.join(format!(
+        "source-{}",
+        &OperationId::random().unwrap().as_str()[10..]
+    ));
+    let store = ObjectStore::open(&path, ObjectLimits::default()).unwrap();
+    for b in bodies {
+        store.install(b).unwrap();
+    }
+    ChunkSource::Local { path }
+}
+fn next_of(rep: &Replica, from: &RevisionId) -> Revision {
+    let mut r = rep.revision(from).unwrap();
+    r.parents = vec![from.clone()];
+    r.operation = OperationId::random().unwrap();
+    r
+}
+fn put_dir(r: &mut Revision, path: &str, mode: u16) -> EntryId {
+    let parent = parent_id(r, path);
+    let id = EntryId::random().unwrap();
+    r.tree.entries.push(Entry {
+        path: path.into(),
+        id: id.clone(),
+        parent,
+        owner: principal(1),
+        group: group(1),
+        mode,
+        content: EntryContent::Directory,
+    });
+    id
+}
+fn put_file(r: &mut Revision, path: &str, bytes: &[u8]) -> EntryId {
+    let parent = parent_id(r, path);
+    let id = EntryId::random().unwrap();
+    r.tree.entries.push(Entry {
+        path: path.into(),
+        id: id.clone(),
+        parent,
+        owner: principal(1),
+        group: group(1),
+        mode: 0o640,
+        content: content(bytes),
+    });
+    id
+}
+fn parent_id(r: &Revision, path: &str) -> EntryId {
+    match path.rsplit_once('/') {
+        None => r.tree.root.id.clone(),
+        Some((p, _)) => r
+            .tree
+            .entries
+            .iter()
+            .find(|e| e.path == p)
+            .unwrap()
+            .id
+            .clone(),
+    }
+}
+fn entry_mut<'a>(r: &'a mut Revision, path: &str) -> &'a mut Entry {
+    r.tree.entries.iter_mut().find(|e| e.path == path).unwrap()
+}
+fn sorted(mut r: Revision) -> Revision {
+    r.tree.entries.sort_by(|a, b| a.path.cmp(&b.path));
+    r
+}
+fn apply(rep: &Replica, next: &RevisionId) -> NativeApplyStatus {
+    rep.apply_native_revision(
+        next,
+        rep.status().unwrap().generation,
+        OperationId::random().unwrap(),
+        actor(),
+    )
+    .unwrap()
+}
+fn ready(s: &NativeApplyStatus) -> bool {
+    matches!(s, NativeApplyStatus::Ready { .. })
+}
+fn blocked_reason(s: &NativeApplyStatus) -> &str {
+    match s {
+        NativeApplyStatus::ApplyBlocked { reason } => reason,
+        other => panic!("expected ApplyBlocked, got {other:?}"),
+    }
+}
+fn mode_of(p: &std::path::Path) -> u32 {
+    fs::symlink_metadata(p).unwrap().mode() & 0o7777
+}
+fn no_echo(rep: &Replica) {
+    assert_eq!(
+        rep.capture_native_changes(OperationId::random().unwrap(), actor())
+            .unwrap(),
+        None,
+        "a verified structural application must not echo as a local capture"
+    );
+}
+fn sha(bytes: &[u8]) -> ObjectId {
+    use sha2::Digest;
+    ObjectId::parse(format!(
+        "sha256:{}",
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    ))
+    .unwrap()
+}
+
+#[test]
+fn structural_directory_and_namespace_matrix_uses_verified_root_exchange() {
+    let (d, rep, n, base) = fixture();
+    let root_ino = fs::metadata(&n.root).unwrap().ino();
+    // Directory creation, nested file creation and a new sibling file.
+    let mut r = next_of(&rep, &base);
+    put_dir(&mut r, "d", 0o750);
+    put_file(&mut r, "d/x", b"nested-x");
+    put_file(&mut r, "b", b"bee");
+    let first = import(&rep, &sorted(r), sources(d.path(), &[b"nested-x", b"bee"]));
+    let s = apply(&rep, &first);
+    assert!(ready(&s), "{s:?}");
+    assert_eq!(fs::read(n.root.join("d/x")).unwrap(), b"nested-x");
+    assert_eq!(fs::read(n.root.join("b")).unwrap(), b"bee");
+    assert_eq!(fs::read(n.root.join("a")).unwrap(), b"before");
+    assert_eq!(mode_of(&n.root.join("d")), 0o750);
+    assert_ne!(fs::metadata(&n.root).unwrap().ino(), root_ino);
+    let status = rep.scan_native_status().unwrap();
+    assert!(ready(&status.status), "{status:?}");
+    let root_displacement = status
+        .displacements
+        .iter()
+        .find(|v| v.path.is_empty())
+        .expect("displaced root is a retained, enumerated generation");
+    assert_eq!(
+        fs::metadata(&root_displacement.retained_path)
+            .unwrap()
+            .ino(),
+        root_ino
+    );
+    assert_eq!(
+        fs::read(root_displacement.retained_path.join("a")).unwrap(),
+        b"before"
+    );
+    assert!(!root_displacement.retained_path.join("d").exists());
+    no_echo(&rep);
+    // Directory move with stable identities, file rename, deletion.
+    let mut r = next_of(&rep, &first);
+    let d_id = entry_mut(&mut r, "d").id.clone();
+    let x_id = entry_mut(&mut r, "d/x").id.clone();
+    let b_id = entry_mut(&mut r, "b").id.clone();
+    entry_mut(&mut r, "d").path = "e".into();
+    entry_mut(&mut r, "d/x").path = "e/x".into();
+    entry_mut(&mut r, "b").path = "c".into();
+    r.tree.entries.retain(|e| e.path != "a");
+    let second = import(&rep, &sorted(r), ChunkSource::Unavailable);
+    let s = apply(&rep, &second);
+    assert!(ready(&s), "{s:?}");
+    assert!(!n.root.join("d").exists() && !n.root.join("a").exists() && !n.root.join("b").exists());
+    assert_eq!(fs::read(n.root.join("e/x")).unwrap(), b"nested-x");
+    assert_eq!(fs::read(n.root.join("c")).unwrap(), b"bee");
+    no_echo(&rep);
+    let head = rep.revision(&rep.status().unwrap().head.unwrap()).unwrap();
+    let id_of = |p: &str| {
+        head.tree
+            .entries
+            .iter()
+            .find(|e| e.path == p)
+            .unwrap()
+            .id
+            .clone()
+    };
+    assert_eq!((id_of("e"), id_of("e/x"), id_of("c")), (d_id, x_id, b_id));
+    // Type replacement (file -> directory) and same-path new identity.
+    let mut r = next_of(&rep, &second);
+    let old_c = entry_mut(&mut r, "c").id.clone();
+    r.tree.entries.retain(|e| e.path != "e/x" && e.path != "c");
+    put_dir(&mut r, "e/x", 0o755);
+    let new_c = put_file(&mut r, "c", b"replacement identity");
+    let third = import(
+        &rep,
+        &sorted(r),
+        sources(d.path(), &[b"replacement identity"]),
+    );
+    let s = apply(&rep, &third);
+    assert!(ready(&s), "{s:?}");
+    assert!(fs::metadata(n.root.join("e/x")).unwrap().is_dir());
+    assert_eq!(fs::read(n.root.join("c")).unwrap(), b"replacement identity");
+    no_echo(&rep);
+    // Entry identity is preserved for later in-place native edits.
+    fs::write(n.root.join("c"), b"later in-place edit").unwrap();
+    let edit = rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .unwrap()
+        .unwrap();
+    let edited = rep.revision(&edit).unwrap();
+    let c = edited.tree.entries.iter().find(|e| e.path == "c").unwrap();
+    assert_eq!(c.id, new_c);
+    assert_ne!(c.id, old_c);
+    // The first native edit of a path the application just installed cannot prove its base.
+    assert_eq!(edited.provenance, UNKNOWN_CAUSALITY_PROVENANCE);
+    assert!(
+        rep.scan_native_status()
+            .unwrap()
+            .displacements
+            .iter()
+            .filter(|v| v.path.is_empty())
+            .count()
+            >= 3
+    );
+}
+
+#[test]
+fn root_and_directory_modes_apply_and_verify() {
+    let (d, rep, n, base) = fixture();
+    let mut r = next_of(&rep, &base);
+    put_dir(&mut r, "ro", 0o755);
+    put_file(&mut r, "ro/f", b"inside readonly");
+    let first = import(&rep, &sorted(r), sources(d.path(), &[b"inside readonly"]));
+    assert!(ready(&apply(&rep, &first)));
+    let mut r = next_of(&rep, &first);
+    r.tree.root.mode = 0o750;
+    entry_mut(&mut r, "ro").mode = 0o555;
+    entry_mut(&mut r, "a").mode = 0o600;
+    let second = import(&rep, &sorted(r), ChunkSource::Unavailable);
+    let s = apply(&rep, &second);
+    assert!(ready(&s), "{s:?}");
+    assert_eq!(mode_of(&n.root), 0o750);
+    assert_eq!(mode_of(&n.root.join("ro")), 0o555);
+    assert_eq!(mode_of(&n.root.join("a")), 0o600);
+    assert_eq!(fs::read(n.root.join("ro/f")).unwrap(), b"inside readonly");
+    no_echo(&rep);
+    fs::set_permissions(n.root.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn alternate_gid() -> u32 {
+    let mut groups = vec![0 as libc::gid_t; 256];
+    let n = unsafe { libc::getgroups(256, groups.as_mut_ptr()) };
+    assert!(n >= 0);
+    let egid = unsafe { libc::getegid() };
+    *groups[..n as usize]
+        .iter()
+        .find(|g| **g != egid)
+        .expect("the qualification user must belong to a second group")
+}
+fn ownership_fixture() -> (tempfile::TempDir, Replica, NativeConfig, RevisionId) {
+    let d = scratch();
+    let root = d.path().join("tree");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a"), b"before").unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let gid = fs::metadata(&root).unwrap().gid();
+    let mut c = config();
+    c.authorities = vec![
+        Authority {
+            principal: principal(1),
+            uid,
+            primary_group: group(1),
+            gid,
+            groups: vec![group(1), group(2), group(3)],
+            dac_override: false,
+            ownership_transfer: true,
+        },
+        Authority {
+            principal: principal(2),
+            uid: 54322,
+            primary_group: group(2),
+            gid: alternate_gid(),
+            groups: vec![group(2)],
+            dac_override: false,
+            ownership_transfer: false,
+        },
+        Authority {
+            principal: principal(3),
+            uid: 54321,
+            primary_group: group(3),
+            gid: 54321,
+            groups: vec![group(3)],
+            dac_override: false,
+            ownership_transfer: false,
+        },
+    ];
+    c.content_roots = vec![root.clone()];
+    let rep = Replica::open(d.path().join("state"), c).unwrap();
+    let n = NativeConfig {
+        root,
+        policy: CapturePolicy {
+            included_roots: vec![".".into()],
+            excluded_prefixes: vec![],
+        },
+        creation_umask: 0o022,
+    };
+    rep.configure_native(n.clone()).unwrap();
+    let base = rep
+        .capture(
+            &n.root,
+            n.policy.clone(),
+            OperationId::random().unwrap(),
+            actor(),
+        )
+        .unwrap();
+    (d, rep, n, base)
+}
+#[test]
+fn mapped_group_ownership_applies_and_unmappable_owner_blocks_without_loss() {
+    let (_d, rep, n, base) = ownership_fixture();
+    let mut r = next_of(&rep, &base);
+    entry_mut(&mut r, "a").group = group(2);
+    let regrouped = import(&rep, &sorted(r), ChunkSource::Unavailable);
+    let s = apply(&rep, &regrouped);
+    assert!(ready(&s), "{s:?}");
+    assert_eq!(
+        fs::metadata(n.root.join("a")).unwrap().gid(),
+        alternate_gid()
+    );
+    no_echo(&rep);
+    let root_ino = fs::metadata(&n.root).unwrap().ino();
+    let mut r = next_of(&rep, &regrouped);
+    let e = entry_mut(&mut r, "a");
+    e.owner = principal(3);
+    e.group = group(3);
+    let foreign = import(&rep, &sorted(r), ChunkSource::Unavailable);
+    let s = apply(&rep, &foreign);
+    assert_eq!(blocked_reason(&s), "mapping_blocked");
+    assert_eq!(fs::metadata(&n.root).unwrap().ino(), root_ino);
+    assert_eq!(fs::read(n.root.join("a")).unwrap(), b"before");
+    assert_eq!(rep.status().unwrap().head, Some(regrouped));
+    assert_eq!(
+        rep.scan_native_status().unwrap().incoming_revision,
+        Some(foreign)
+    );
+    no_echo(&rep);
+}
+
+#[test]
+fn readonly_root_parent_blocks_structural_work_without_loss() {
+    let (d, rep, n, base) = fixture();
+    let mut r = next_of(&rep, &base);
+    put_dir(&mut r, "d", 0o755);
+    let next = import(&rep, &sorted(r), ChunkSource::Unavailable);
+    fs::set_permissions(d.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    let s = apply(&rep, &next);
+    fs::set_permissions(d.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(blocked_reason(&s), "readonly_parent");
+    assert!(!n.root.join("d").exists());
+    assert_eq!(fs::read(n.root.join("a")).unwrap(), b"before");
+    // A later attempt after the parent becomes writable is not blocked by the refused one.
+    let s = apply(&rep, &next);
+    assert!(ready(&s), "{s:?}");
+}
+
+fn excluded_fixture() -> (tempfile::TempDir, Replica, NativeConfig, RevisionId) {
+    let d = scratch();
+    let root = d.path().join("tree");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a"), b"before").unwrap();
+    fs::create_dir(root.join("cache")).unwrap();
+    fs::write(root.join("cache/blob"), b"local-only opaque bytes").unwrap();
+    fs::set_permissions(root.join("cache/blob"), fs::Permissions::from_mode(0o604)).unwrap();
+    let mut c = config();
+    c.authorities.truncate(1);
+    c.authorities[0].uid = unsafe { libc::geteuid() };
+    c.authorities[0].gid = fs::metadata(&root).unwrap().gid();
+    c.content_roots = vec![root.clone()];
+    let rep = Replica::open(d.path().join("state"), c).unwrap();
+    let n = NativeConfig {
+        root,
+        policy: CapturePolicy {
+            included_roots: vec![".".into()],
+            excluded_prefixes: vec!["cache".into()],
+        },
+        creation_umask: 0o022,
+    };
+    rep.configure_native(n.clone()).unwrap();
+    let base = rep
+        .capture(
+            &n.root,
+            n.policy.clone(),
+            OperationId::random().unwrap(),
+            actor(),
+        )
+        .unwrap();
+    (d, rep, n, base)
+}
+#[test]
+fn capture_excluded_local_entries_survive_and_unsupported_or_colliding_entries_block() {
+    let (d, rep, n, base) = excluded_fixture();
+    let mut r = next_of(&rep, &base);
+    put_dir(&mut r, "d", 0o755);
+    let next = import(&rep, &sorted(r), ChunkSource::Unavailable);
+    let s = apply(&rep, &next);
+    assert!(ready(&s), "{s:?}");
+    assert_eq!(
+        fs::read(n.root.join("cache/blob")).unwrap(),
+        b"local-only opaque bytes"
+    );
+    assert_eq!(mode_of(&n.root.join("cache/blob")), 0o604);
+    no_echo(&rep);
+    // A symlink in the opaque local area is never followed or copied.
+    std::os::unix::fs::symlink("/etc", n.root.join("cache/link")).unwrap();
+    let root_ino = fs::metadata(&n.root).unwrap().ino();
+    let mut r = next_of(&rep, &next);
+    put_dir(&mut r, "e", 0o755);
+    let unsupported = import(&rep, &sorted(r), ChunkSource::Unavailable);
+    let s = apply(&rep, &unsupported);
+    assert_eq!(blocked_reason(&s), "unsupported_local_entry");
+    assert_eq!(fs::metadata(&n.root).unwrap().ino(), root_ino);
+    fs::remove_file(n.root.join("cache/link")).unwrap();
+    // An unreadable local-only subtree blocks instead of being dropped.
+    fs::create_dir(n.root.join("cache/sealed")).unwrap();
+    fs::set_permissions(
+        n.root.join("cache/sealed"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let s = apply(&rep, &unsupported);
+    fs::set_permissions(
+        n.root.join("cache/sealed"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert_eq!(blocked_reason(&s), "unreadable_local_entry");
+    assert_eq!(fs::metadata(&n.root).unwrap().ino(), root_ino);
+    fs::remove_dir(n.root.join("cache/sealed")).unwrap();
+    // An incoming managed path cannot collide with a preserved local-only entry.
+    let mut r = next_of(&rep, &next);
+    put_dir(&mut r, "cache", 0o755);
+    let colliding = import(&rep, &sorted(r), ChunkSource::Unavailable);
+    let s = apply(&rep, &colliding);
+    assert_eq!(blocked_reason(&s), "local_entry_collision");
+    assert_eq!(fs::metadata(&n.root).unwrap().ino(), root_ino);
+    assert_eq!(
+        fs::read(n.root.join("cache/blob")).unwrap(),
+        b"local-only opaque bytes"
+    );
+    let _ = d;
+}
+
+#[test]
+fn held_descriptor_and_cwd_writes_land_in_retained_root_and_become_recovery_records() {
+    use std::ffi::CString;
+    let (d, rep, n, base) = fixture();
+    let mut held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(n.root.join("a"))
+        .unwrap();
+    let cwd = fs::File::open(&n.root).unwrap();
+    let mut r = next_of(&rep, &base);
+    put_dir(&mut r, "d", 0o755);
+    entry_mut(&mut r, "a").content = content(b"incoming");
+    let next = import(&rep, &sorted(r), sources(d.path(), &[b"incoming"]));
+    let s = apply(&rep, &next);
+    assert!(ready(&s), "{s:?}");
+    assert!(rep.list_native_recovery(actor()).unwrap().is_empty());
+    held.seek(SeekFrom::Start(0)).unwrap();
+    held.write_all(b"stale RAM write").unwrap();
+    held.sync_all().unwrap();
+    let leaf = CString::new("cwd-created").unwrap();
+    let fd = unsafe {
+        libc::openat(
+            std::os::fd::AsRawFd::as_raw_fd(&cwd),
+            leaf.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o640,
+        )
+    };
+    assert!(fd >= 0);
+    let mut created = unsafe { <fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    created.write_all(b"written through old cwd").unwrap();
+    created.sync_all().unwrap();
+    drop(created);
+    // The installed root is unaffected by old-root descriptors.
+    assert_eq!(fs::read(n.root.join("a")).unwrap(), b"incoming");
+    assert!(!n.root.join("cwd-created").exists());
+    let status = rep.scan_native_status().unwrap();
+    assert!(
+        matches!(&status.status, NativeApplyStatus::Pending { reason } if reason == "late_displaced_write"),
+        "{status:?}"
+    );
+    assert!(!rep.live_status().unwrap().applied);
+    let root = status
+        .displacements
+        .iter()
+        .find(|v| v.path.is_empty())
+        .unwrap();
+    assert!(root.ambiguous);
+    let records = rep.list_native_recovery(actor()).unwrap();
+    assert_eq!(records.len(), 2, "{records:?}");
+    let by_path = |p: &str| records.iter().find(|r| r.source_path == p).unwrap().clone();
+    let stale = by_path("a");
+    let cwd_record = by_path("cwd-created");
+    assert_eq!(stale.observed_digest, sha(b"stale RAM write"));
+    assert_eq!(cwd_record.observed_digest, sha(b"written through old cwd"));
+    for record in [&stale, &cwd_record] {
+        assert_eq!(record.original_base, base);
+        assert_eq!(record.causal_coverage, RecoveryCausality::Unknown);
+    }
+    // Restart preserves the records; a changed retained version becomes a new immutable record.
+    drop(rep);
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    assert_eq!(
+        serde_json::to_value(rep.list_native_recovery(actor()).unwrap()).unwrap(),
+        serde_json::to_value(&records).unwrap()
+    );
+    assert!(!ready(&rep.native_status().unwrap().unwrap().status));
+    held.seek(SeekFrom::Start(0)).unwrap();
+    held.write_all(b"STALE RAM WRITE").unwrap();
+    held.sync_all().unwrap();
+    rep.scan_native_status().unwrap();
+    let after = rep.list_native_recovery(actor()).unwrap();
+    assert_eq!(after.len(), 3);
+    for old in &records {
+        assert!(after
+            .iter()
+            .any(|r| serde_json::to_value(r).unwrap() == serde_json::to_value(old).unwrap()));
+    }
+    assert!(after
+        .iter()
+        .any(|r| r.source_path == "a" && r.observed_digest == sha(b"STALE RAM WRITE")));
+    // Explicit capture creates an attributed, unpublished revision linked to the original base.
+    let head = rep.status().unwrap().head;
+    let generation = rep.status().unwrap().generation;
+    err(
+        rep.capture_native_recovery(
+            stale.id.clone(),
+            sha(b"other bytes"),
+            OperationId::random().unwrap(),
+            actor(),
+        ),
+        "operation_mismatch",
+    );
+    let op = OperationId::random().unwrap();
+    let captured = rep
+        .capture_native_recovery(
+            stale.id.clone(),
+            stale.observed_digest.clone(),
+            op.clone(),
+            actor(),
+        )
+        .unwrap();
+    assert_eq!(
+        rep.capture_native_recovery(stale.id.clone(), stale.observed_digest.clone(), op, actor())
+            .unwrap(),
+        captured
+    );
+    let revision = rep.revision(&captured).unwrap();
+    assert_eq!(revision.parents, vec![base.clone()]);
+    assert_eq!(revision.provenance, UNKNOWN_CAUSALITY_PROVENANCE);
+    assert_eq!(revision.coverage, vec!["a".to_string()]);
+    let a = revision
+        .tree
+        .entries
+        .iter()
+        .find(|e| e.path == "a")
+        .unwrap();
+    assert_eq!(
+        a.id,
+        rep.revision(&base).unwrap().tree.entries[0].id,
+        "recovery keeps the displaced entry identity"
+    );
+    assert_eq!(a.content, content(b"stale RAM write"));
+    assert_eq!(rep.status().unwrap().head, head, "never auto-adopted");
+    assert_eq!(rep.status().unwrap().generation, generation);
+    assert!(rep.pending_submissions().unwrap().is_empty());
+    assert_eq!(
+        serde_json::to_value(rep.list_native_recovery(actor()).unwrap()).unwrap(),
+        serde_json::to_value(&after).unwrap(),
+        "capture never rewrites source records"
+    );
+    // Export writes a fresh explicit destination only.
+    let out = d.path().join("exported-alternative");
+    rep.export_native_recovery(
+        cwd_record.id.clone(),
+        cwd_record.observed_digest.clone(),
+        &out,
+        actor(),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&out).unwrap(), b"written through old cwd");
+    err(
+        rep.export_native_recovery(
+            cwd_record.id.clone(),
+            cwd_record.observed_digest.clone(),
+            &out,
+            actor(),
+        ),
+        "already_exists",
+    );
+    drop(held);
+}
+
+#[test]
+fn tampered_retained_version_requires_a_new_record() {
+    let (d, rep, n, base) = fixture();
+    let mut held = fs::OpenOptions::new()
+        .write(true)
+        .open(n.root.join("a"))
+        .unwrap();
+    let next = incoming(d.path(), &rep, &base, false);
+    assert!(ready(&apply(&rep, &next)));
+    held.write_all(b"late!!").unwrap();
+    held.sync_all().unwrap();
+    rep.scan_native_status().unwrap();
+    let record = rep.list_native_recovery(actor()).unwrap().remove(0);
+    assert_eq!(record.source_path, "a");
+    assert_eq!(record.causal_coverage, RecoveryCausality::Unknown);
+    let version = rep.scan_native_status().unwrap().displacements[0].versions[0].clone();
+    fs::write(&version, b"tampered").unwrap();
+    err(
+        rep.capture_native_recovery(
+            record.id.clone(),
+            record.observed_digest.clone(),
+            OperationId::random().unwrap(),
+            actor(),
+        ),
+        "generation_mismatch",
+    );
+}
+
+#[test]
+fn stale_ram_save_after_application_is_unknown_causality() {
+    let (d, rep, n, _) = fixture();
+    fs::write(n.root.join("untouched"), b"u").unwrap();
+    let base = rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .unwrap()
+        .unwrap();
+    let mut r = next_of(&rep, &base);
+    entry_mut(&mut r, "a").content = content(b"incoming");
+    let next = import(&rep, &sorted(r), sources(d.path(), &[b"incoming"]));
+    assert!(ready(&apply(&rep, &next)));
+    // An editor that loaded the old bytes saves them back atomically.
+    fs::write(n.root.join(".a.swp"), b"before").unwrap();
+    fs::rename(n.root.join(".a.swp"), n.root.join("a")).unwrap();
+    let stale = rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rep.revision(&stale).unwrap().provenance,
+        UNKNOWN_CAUSALITY_PROVENANCE
+    );
+    // A subsequent edit after a local capture, or of an untouched path, keeps native provenance.
+    fs::write(n.root.join("untouched"), b"edited later").unwrap();
+    let later = rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rep.revision(&later).unwrap().provenance,
+        "native_scan_delete_create"
+    );
+}
+
+#[test]
+fn journal_upgrades_additively_and_newer_schema_fails_closed() {
+    let (d, rep, _n, base) = fixture();
+    drop(rep);
+    let db = rusqlite::Connection::open(d.path().join("state/journal.sqlite")).unwrap();
+    db.execute_batch(
+        "DROP TABLE native_recovery_captures; DROP TABLE native_recovery; PRAGMA user_version=1;",
+    )
+    .unwrap();
+    drop(db);
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    assert_eq!(rep.status().unwrap().head, Some(base));
+    assert!(rep.list_native_recovery(actor()).unwrap().is_empty());
+    drop(rep);
+    let db = rusqlite::Connection::open(d.path().join("state/journal.sqlite")).unwrap();
+    let version: u32 = db
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    db.pragma_update(None, "user_version", 3).unwrap();
+    drop(db);
+    err(
+        Replica::reopen(d.path().join("state")),
+        "unsupported_schema",
+    );
+}
+
+fn nested_fixture() -> (tempfile::TempDir, Replica, NativeConfig, RevisionId) {
+    let d = scratch();
+    let parent = d.path().join("p");
+    fs::create_dir(&parent).unwrap();
+    let root = parent.join("tree");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a"), b"before").unwrap();
+    let mut c = config();
+    c.authorities.truncate(1);
+    c.authorities[0].uid = unsafe { libc::geteuid() };
+    c.authorities[0].gid = fs::metadata(&root).unwrap().gid();
+    c.content_roots = vec![root.clone()];
+    let rep = Replica::open(d.path().join("state"), c).unwrap();
+    let n = NativeConfig {
+        root,
+        policy: CapturePolicy {
+            included_roots: vec![".".into()],
+            excluded_prefixes: vec![],
+        },
+        creation_umask: 0o022,
+    };
+    rep.configure_native(n.clone()).unwrap();
+    let base = rep
+        .capture(
+            &n.root,
+            n.policy.clone(),
+            OperationId::random().unwrap(),
+            actor(),
+        )
+        .unwrap();
+    (d, rep, n, base)
+}
+
+#[cfg(feature = "test-faults")]
+fn structural_interrupted(point: &str, race: Option<&str>) {
+    use std::{
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    let (d, rep, n, base) = nested_fixture();
+    let mut r = next_of(&rep, &base);
+    put_dir(&mut r, "d", 0o755);
+    put_file(&mut r, "d/x", b"structural incoming");
+    let next = import(
+        &rep,
+        &sorted(r),
+        sources(d.path(), &[b"structural incoming"]),
+    );
+    let generation = rep.status().unwrap().generation;
+    let root_ino = fs::metadata(&n.root).unwrap().ino();
+    let op = OperationId::random().unwrap();
+    let mut held = fs::OpenOptions::new()
+        .write(true)
+        .open(n.root.join("a"))
+        .unwrap();
+    drop(rep);
+    let marker = d.path().join("barrier");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "native_apply_child", "--nocapture"])
+        .env("FS2_NATIVE_CHILD_STATE", d.path().join("state"))
+        .env("FS2_NATIVE_CHILD_REV", next.as_str())
+        .env("FS2_NATIVE_CHILD_OP", op.as_str())
+        .env("MAGUS_TEST_FAULT_POINT", point)
+        .env("MAGUS_TEST_FAULT_ACTION", "barrier")
+        .env("MAGUS_TEST_FAULT_MARKER", &marker)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ready_marker = marker.with_extension("1");
+    while !ready_marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !ready_marker.exists() {
+        child.kill().ok();
+        panic!(
+            "no barrier {point}: {:?}",
+            child.wait_with_output().unwrap()
+        );
+    }
+    let parent = n.root.parent().unwrap().to_path_buf();
+    match race {
+        None => {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let rep = Replica::reopen(d.path().join("state")).unwrap();
+            let recovered = rep.recover_native_application(actor()).unwrap();
+            assert!(recovered.iter().any(ready), "{point}: {recovered:?}");
+            let s = rep
+                .apply_native_revision(&next, generation, op, actor())
+                .unwrap();
+            assert!(ready(&s), "{point}: {s:?}");
+            assert_eq!(rep.status().unwrap().head, Some(next));
+            assert_eq!(
+                fs::read(n.root.join("d/x")).unwrap(),
+                b"structural incoming"
+            );
+            let status = rep.scan_native_status().unwrap();
+            assert!(ready(&status.status), "{point}: {status:?}");
+            drop(held);
+            let root = status
+                .displacements
+                .iter()
+                .find(|v| v.path.is_empty())
+                .unwrap();
+            assert_eq!(fs::metadata(&root.retained_path).unwrap().ino(), root_ino);
+            no_echo(&rep);
+        }
+        Some(race) => {
+            match race {
+                "root-moved" => {
+                    fs::rename(&n.root, parent.join("moved")).unwrap();
+                    fs::create_dir(&n.root).unwrap();
+                    fs::write(n.root.join("a"), b"unowned").unwrap();
+                }
+                "root-symlink" => {
+                    fs::rename(&n.root, parent.join("moved")).unwrap();
+                    std::os::unix::fs::symlink(parent.join("moved"), &n.root).unwrap();
+                }
+                "parent-moved" => {
+                    fs::rename(&parent, d.path().join("p-moved")).unwrap();
+                    fs::create_dir(&parent).unwrap();
+                    fs::create_dir(&n.root).unwrap();
+                    fs::write(n.root.join("a"), b"unowned").unwrap();
+                }
+                "held-write" => {
+                    held.write_all(b"racing held-descriptor write").unwrap();
+                    held.sync_all().unwrap();
+                }
+                "installed-write" => {
+                    fs::write(n.root.join("d/x"), b"racing pathname write").unwrap();
+                }
+                _ => panic!("bad race"),
+            }
+            fs::write(marker.with_extension("1.release"), b"go").unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+            let printed: NativeApplyStatus = serde_json::from_str(
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .find(|l| l.starts_with('{'))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(!ready(&printed), "{race}: {printed:?}");
+            match race {
+                "root-moved" => {
+                    assert_eq!(fs::read(n.root.join("a")).unwrap(), b"unowned");
+                    assert!(!n.root.join("d").exists());
+                    assert_eq!(fs::read(parent.join("moved/a")).unwrap(), b"before");
+                }
+                "root-symlink" => {
+                    assert_eq!(fs::read(parent.join("moved/a")).unwrap(), b"before");
+                    assert!(!parent.join("moved/d").exists());
+                }
+                "parent-moved" => {
+                    assert_eq!(fs::read(n.root.join("a")).unwrap(), b"unowned");
+                    assert!(!n.root.join("d").exists());
+                    assert_eq!(
+                        fs::read(d.path().join("p-moved/tree/a")).unwrap(),
+                        b"before"
+                    );
+                }
+                "held-write" => {
+                    // The racing write is retained in the displaced root and becomes ambiguous.
+                    let rep = Replica::reopen(d.path().join("state")).unwrap();
+                    let status = rep.scan_native_status().unwrap();
+                    assert!(!ready(&status.status));
+                    let root = status
+                        .displacements
+                        .iter()
+                        .find(|v| v.path.is_empty())
+                        .unwrap();
+                    assert!(root.ambiguous);
+                    assert_eq!(
+                        fs::read(root.retained_path.join("a")).unwrap(),
+                        b"racing held-descriptor write"
+                    );
+                    assert!(rep
+                        .list_native_recovery(actor())
+                        .unwrap()
+                        .iter()
+                        .any(|r| r.observed_digest == sha(b"racing held-descriptor write")));
+                    assert_ne!(rep.status().unwrap().head, Some(next));
+                    assert_eq!(
+                        fs::read(n.root.join("d/x")).unwrap(),
+                        b"structural incoming"
+                    );
+                }
+                "installed-write" => {
+                    let rep = Replica::reopen(d.path().join("state")).unwrap();
+                    assert!(!ready(&rep.scan_native_status().unwrap().status));
+                    assert_ne!(rep.status().unwrap().head, Some(next));
+                    assert_eq!(
+                        fs::read(n.root.join("d/x")).unwrap(),
+                        b"racing pathname write"
+                    );
+                    let status = rep.scan_native_status().unwrap();
+                    let root = status
+                        .displacements
+                        .iter()
+                        .find(|v| v.path.is_empty())
+                        .unwrap();
+                    assert_eq!(fs::read(root.retained_path.join("a")).unwrap(), b"before");
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+#[cfg(feature = "test-faults")]
+#[test]
+fn structural_crash_recovery_uses_durable_phases_and_inode_identities() {
+    for point in [
+        "native-root-before-exchange",
+        "native-root-exchanged",
+        "native-root-verified",
+        "native-before-commit",
+    ] {
+        structural_interrupted(point, None);
+    }
+}
+#[cfg(feature = "test-faults")]
+#[test]
+fn structural_nofollow_root_and_parent_races_fail_closed() {
+    structural_interrupted("native-root-before-exchange", Some("root-moved"));
+    structural_interrupted("native-root-before-exchange", Some("root-symlink"));
+    structural_interrupted("native-root-before-exchange", Some("parent-moved"));
+}
+#[cfg(feature = "test-faults")]
+#[test]
+fn structural_racing_write_after_exchange_retains_both_roots() {
+    structural_interrupted("native-root-exchanged", Some("held-write"));
+    structural_interrupted("native-root-exchanged", Some("installed-write"));
 }
