@@ -1427,23 +1427,53 @@ fn stale_ram_save_after_application_is_unknown_causality() {
 fn journal_upgrades_additively_and_newer_schema_fails_closed() {
     let (d, rep, _n, base) = fixture();
     drop(rep);
-    let db = rusqlite::Connection::open(d.path().join("state/journal.sqlite")).unwrap();
-    db.execute_batch(
-        "DROP TABLE native_recovery_captures; DROP TABLE native_recovery; PRAGMA user_version=1;",
-    )
-    .unwrap();
-    drop(db);
+    let db_path = d.path().join("state/journal.sqlite");
+    let version = || -> u32 {
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    };
+    let table = |name: &str| -> bool {
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?",
+                [name],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 1
+    };
+    assert_eq!(version(), 3);
+    // From version 1: every later table is added in place.
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE native_applied; DROP TABLE native_recovery_captures; DROP TABLE native_recovery; PRAGMA user_version=1;",
+        )
+        .unwrap();
     let rep = Replica::reopen(d.path().join("state")).unwrap();
-    assert_eq!(rep.status().unwrap().head, Some(base));
+    assert_eq!(rep.status().unwrap().head, Some(base.clone()));
     assert!(rep.list_native_recovery(actor()).unwrap().is_empty());
     drop(rep);
-    let db = rusqlite::Connection::open(d.path().join("state/journal.sqlite")).unwrap();
-    let version: u32 = db
-        .pragma_query_value(None, "user_version", |r| r.get(0))
+    assert_eq!(version(), 3);
+    assert!(table("native_recovery") && table("native_applied"));
+    // From version 2 (recovery tables only): the applied-path table is added in place.
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch("DROP TABLE native_applied; PRAGMA user_version=2;")
         .unwrap();
-    assert_eq!(version, 2);
-    db.pragma_update(None, "user_version", 3).unwrap();
-    drop(db);
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    assert_eq!(rep.status().unwrap().head, Some(base));
+    drop(rep);
+    assert_eq!(version(), 3);
+    assert!(table("native_applied"));
+    // A newer schema fails closed.
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .pragma_update(None, "user_version", 4)
+        .unwrap();
     err(
         Replica::reopen(d.path().join("state")),
         "unsupported_schema",
