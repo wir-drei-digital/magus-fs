@@ -88,6 +88,42 @@ impl Intent {
         self.files.iter().any(|f| f.ambiguous) || self.root.as_ref().is_some_and(|r| r.ambiguous)
     }
 }
+/// The configured root pathname no longer names the verified bound root (or a no-follow walk
+/// fails). Nothing at such a pathname is captured or mutated until a verified rebind or an
+/// explicit operator capture (`magus-fs capture`) establishes a new baseline.
+pub(crate) fn root_replaced(core: &Core, n: &NativeConfig) -> Result<bool, FsError> {
+    let Ok(previous) = baseline(core) else {
+        return Ok(false);
+    };
+    let Some(verified) = previous.observations.get("") else {
+        return Ok(false);
+    };
+    Ok(match directory(&n.root) {
+        Ok(dir) => !verified.same_identity(&observation(&dir)?),
+        Err(FsError::Io(e)) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        Err(_) => true,
+    })
+}
+fn mark_root_replaced(core: &Core) -> Result<(), FsError> {
+    let mut status: NativeStatus = core
+        .journal
+        .db
+        .query_row(
+            "SELECT record FROM native_status WHERE singleton=1",
+            [],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .map(|b| from_json(&b))
+        .transpose()?
+        .unwrap_or(NativeStatus {
+            status: pending("unverified"),
+            incoming_revision: None,
+            displacements: vec![],
+        });
+    status.status = blocked("bound_root_changed");
+    status_save(core, &status)
+}
 /// Immutable records for every journaled retained version, created only after the version
 /// itself is durable in the intent. Idempotent, so an interruption between the two repairs.
 pub(crate) fn records_for_versions(core: &Core, r: &Intent) -> Result<(), FsError> {
@@ -129,6 +165,19 @@ pub(crate) fn records_for_versions(core: &Core, r: &Intent) -> Result<(), FsErro
                 causal_coverage: RecoveryCausality::Unknown,
             },
         )?;
+    }
+    Ok(())
+}
+fn clear_applied(core: &mut Core) -> Result<(), FsError> {
+    if let Some(w) = &core.working {
+        if w.applied {
+            let mut w = w.clone();
+            w.applied = false;
+            core.journal
+                .db
+                .execute("UPDATE working SET value=? WHERE singleton=1", [json(&w)?])?;
+            core.working = Some(w);
+        }
     }
     Ok(())
 }
@@ -683,8 +732,13 @@ impl Replica {
     ) -> Result<Option<RevisionId>, FsError> {
         let n = self.native_config()?.ok_or(FsError::ConfigMismatch)?;
         {
-            let core = lock(&self.core)?;
+            let mut core = lock(&self.core)?;
             authority_revision(&core)?;
+            if root_replaced(&core, &n)? {
+                mark_root_replaced(&core)?;
+                clear_applied(&mut core)?;
+                return Ok(None);
+            }
             let previous = baseline(&core)?;
             let observed =
                 Scan::observe(&n.root, &n.policy, Instant::now() + Duration::from_secs(30))?;
@@ -900,6 +954,9 @@ impl Replica {
         if authority_revision(&core).is_err() {
             status.status = blocked("permission_denied")
         }
+        if root_replaced(&core, &n)? {
+            status.status = blocked("bound_root_changed");
+        }
         status.displacements = displacements(&rows);
         if !matches!(status.status, NativeApplyStatus::Ready { .. }) {
             if let Some(w) = &core.working {
@@ -991,6 +1048,9 @@ impl Replica {
         }
         status_save(&core, &status)?;
         let preflight = (|| -> Result<bool, FsError> {
+            if root_replaced(&core, &n)? {
+                return Err(FsError::UnsafeStorage);
+            }
             if authority_revision(&core)?.is_some_and(|id| id != *revision) {
                 return Err(FsError::PermissionDenied);
             }
@@ -1149,6 +1209,11 @@ impl Replica {
         })();
         let structural = match preflight {
             Ok(structural) => structural,
+            Err(FsError::UnsafeStorage) if root_replaced(&core, &n)? => {
+                status.status = blocked("bound_root_changed");
+                status_save(&core, &status)?;
+                return Ok(status.status);
+            }
             Err(e) => {
                 status.status = match e {
                     FsError::DirtyWorkingState | FsError::GenerationMismatch => pending(e.code()),

@@ -1760,3 +1760,38 @@ fn crash_between_version_copy_and_intent_save_recovers() {
     killed_between_version_copy_and_save(false);
     killed_between_version_copy_and_save(true);
 }
+
+#[test]
+fn replaced_unverified_root_is_never_captured_or_applied() {
+    let (d, rep, n, base) = fixture();
+    let next = incoming(d.path(), &rep, &base, false);
+    let generation = rep.status().unwrap().generation;
+    fs::rename(&n.root, d.path().join("moved")).unwrap();
+    fs::create_dir(&n.root).unwrap();
+    fs::write(n.root.join("unowned"), b"unowned replacement").unwrap();
+    assert_eq!(
+        rep.capture_native_changes(OperationId::random().unwrap(), actor())
+            .unwrap(),
+        None,
+        "a replaced root pathname must not become a mass delete/create capture"
+    );
+    assert_eq!(rep.status().unwrap().head, Some(base.clone()));
+    assert_eq!(rep.status().unwrap().generation, generation);
+    let status = rep.scan_native_status().unwrap();
+    assert_eq!(blocked_reason(&status.status), "bound_root_changed");
+    assert_eq!(blocked_reason(&apply(&rep, &next)), "bound_root_changed");
+    assert_eq!(
+        fs::read(n.root.join("unowned")).unwrap(),
+        b"unowned replacement"
+    );
+    assert_eq!(fs::read(d.path().join("moved/a")).unwrap(), b"before");
+    // Restoring the verified root resumes ordinary capture.
+    fs::remove_file(n.root.join("unowned")).unwrap();
+    fs::remove_dir(&n.root).unwrap();
+    fs::rename(d.path().join("moved"), &n.root).unwrap();
+    fs::write(n.root.join("a"), b"after restore").unwrap();
+    assert!(rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .unwrap()
+        .is_some());
+}

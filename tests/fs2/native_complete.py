@@ -272,10 +272,14 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
             s = ep.status(c);seen.append(s['native']);return 'bound_root_changed' in json.dumps(s['native']['status'])
         try:self.until(observed, 15)
         finally:self.i.write_json(ep.platform + '-root-race-statuses.json', seen)
-        status = ep.status(c);ep.stop(c)
+        time.sleep(4.5);status = ep.status(c);head = self.view()[0]['head']
+        assert 'bound_root_changed' in json.dumps(status['native']['status']), status['native']
+        assert head == shared['head'], 'a replaced root pathname reached the shared branch'
+        assert not status['status']['submissions'], 'a replaced root pathname was captured for publication'
+        ep.stop(c)
         unowned = ep.run("print(json.dumps(sorted(os.listdir(s))))", c['root']);moved = ep.read(c, '../tree-moved/reports/live')
         assert unowned == ['unowned'] and moved == self.base_body.hex() and not ep.exists(c['root'] + '/race-dir')
-        self.record(ep.platform, 'root-replaced-before-exchange', status=status, unowned_listing=unowned, original_preserved=True)
+        self.record(ep.platform, 'root-replaced-before-exchange', status=status, unowned_listing=unowned, original_preserved=True, shared_head_unchanged=head, submissions=status['status']['submissions'])
         c = ep.create('root-crash');ep.start(c);self.until(lambda: ep.ready(c));ep.stop(c)
         shared = self.publish_tree(add('crash-dir'));ep.start(c, 'native-root-exchanged');ep.barrier(c);ep.stop(c, kill=True)
         interrupted = self.native(ep, c, ['crash-dir'])
