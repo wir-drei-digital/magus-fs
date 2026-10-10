@@ -1684,3 +1684,79 @@ fn unrelated_capture_after_application_keeps_stale_save_unknown() {
         "native_scan_delete_create"
     );
 }
+
+#[cfg(feature = "test-faults")]
+#[test]
+fn native_scan_child() {
+    let Ok(state) = std::env::var("FS2_NATIVE_SCAN_CHILD_STATE") else {
+        return;
+    };
+    let rep = Replica::reopen(state).unwrap();
+    println!("{:?}", rep.scan_native_status().map(|s| s.status));
+}
+#[cfg(feature = "test-faults")]
+fn killed_between_version_copy_and_save(structural: bool) {
+    use std::{
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    let (d, rep, n, base) = fixture();
+    let mut held = fs::OpenOptions::new()
+        .write(true)
+        .open(n.root.join("a"))
+        .unwrap();
+    let mut r = next_of(&rep, &base);
+    entry_mut(&mut r, "a").content = content(b"incoming");
+    if structural {
+        put_dir(&mut r, "d", 0o755);
+    }
+    let next = import(&rep, &sorted(r), sources(d.path(), &[b"incoming"]));
+    assert!(ready(&apply(&rep, &next)));
+    held.write_all(b"late!!").unwrap();
+    held.sync_all().unwrap();
+    drop(rep);
+    let marker = d.path().join("barrier");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "native_scan_child", "--nocapture"])
+        .env("FS2_NATIVE_SCAN_CHILD_STATE", d.path().join("state"))
+        .env("MAGUS_TEST_FAULT_POINT", "native-version-copied")
+        .env("MAGUS_TEST_FAULT_ACTION", "barrier")
+        .env("MAGUS_TEST_FAULT_MARKER", &marker)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.with_extension("1").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(marker.with_extension("1").exists(), "no copy barrier");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    // The restarted owner must neither wedge on the orphaned copy nor lose the record.
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    let status = rep.scan_native_status().unwrap();
+    assert!(!ready(&status.status), "{status:?}");
+    let records = rep.list_native_recovery(actor()).unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].observed_digest, sha(b"late!!"));
+    rep.scan_native_status().unwrap();
+    assert_eq!(rep.list_native_recovery(actor()).unwrap().len(), 1);
+    rep.capture_native_recovery(
+        records[0].id.clone(),
+        records[0].observed_digest.clone(),
+        OperationId::random().unwrap(),
+        actor(),
+    )
+    .unwrap();
+    assert!(rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .is_ok());
+    drop(held);
+}
+#[cfg(feature = "test-faults")]
+#[test]
+fn crash_between_version_copy_and_intent_save_recovers() {
+    killed_between_version_copy_and_save(false);
+    killed_between_version_copy_and_save(true);
+}

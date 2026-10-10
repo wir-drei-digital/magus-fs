@@ -12,7 +12,6 @@ use crate::{
     native_apply::{
         self as na, blocked, pending, Intent, NativeApplyStatus, RETAIN_BYTES, RETAIN_GENERATIONS,
     },
-    native_recovery::{record, RecoveryCausality, Retained},
     objects::{name, open_at},
     *,
 };
@@ -938,11 +937,12 @@ pub(crate) fn rescan(core: &Core, r: &mut Intent) -> Result<Rescan, FsError> {
         let mut copy = open_at(
             stage.as_raw_fd(),
             &name(OsStr::new(&leaf_name))?,
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
         )?;
         std::io::copy(&mut (&mut source).take(now.observation.size), &mut copy)?;
         copy.sync_all()?;
         stage.sync_all()?;
+        crate::faults::capture_barrier("native-version-copied", 1)?;
         let copied = na::native_hash(&mut copy)?;
         let version = r.stage.join(&leaf_name);
         next.versions.push(RootVersion {
@@ -953,18 +953,6 @@ pub(crate) fn rescan(core: &Core, r: &mut Intent) -> Result<Rescan, FsError> {
         });
         generations += 1;
         bytes = bytes.saturating_add(now.observation.size);
-        record(
-            core,
-            Retained {
-                operation: &r.operation,
-                original_base: &r.base,
-                source_path: path,
-                observed_generation: r.generation,
-                digest_hex: &copied,
-                copy: &version,
-                causal_coverage: RecoveryCausality::Unknown,
-            },
-        )?;
         if &copied != digest
             || !na::same_generation(
                 &Observation::metadata(&source.metadata()?),
@@ -992,6 +980,7 @@ pub(crate) fn rescan(core: &Core, r: &mut Intent) -> Result<Rescan, FsError> {
     }
     r.root = Some(next);
     na::save(core, r)?;
+    na::records_for_versions(core, r)?;
     Ok(if changed {
         Rescan::Changed
     } else {

@@ -88,6 +88,50 @@ impl Intent {
         self.files.iter().any(|f| f.ambiguous) || self.root.as_ref().is_some_and(|r| r.ambiguous)
     }
 }
+/// Immutable records for every journaled retained version, created only after the version
+/// itself is durable in the intent. Idempotent, so an interruption between the two repairs.
+pub(crate) fn records_for_versions(core: &Core, r: &Intent) -> Result<(), FsError> {
+    let mut versions: Vec<(&str, &std::path::Path)> = r
+        .files
+        .iter()
+        .flat_map(|f| {
+            f.versions
+                .iter()
+                .map(move |v| (f.path.as_str(), v.as_path()))
+        })
+        .collect();
+    if let Some(root) = &r.root {
+        versions.extend(
+            root.versions
+                .iter()
+                .map(|v| (v.path.as_str(), v.version.as_path())),
+        );
+    }
+    if versions.is_empty() {
+        return Ok(());
+    }
+    let stage = stage_open(r)?;
+    for (path, version) in versions {
+        let leaf = version
+            .file_name()
+            .and_then(|l| l.to_str())
+            .ok_or(FsError::UnsafeStorage)?;
+        let digest = native_hash(&mut open_file(&stage, leaf)?)?;
+        record(
+            core,
+            Retained {
+                operation: &r.operation,
+                original_base: &r.base,
+                source_path: path,
+                observed_generation: r.generation,
+                digest_hex: &digest,
+                copy: version,
+                causal_coverage: RecoveryCausality::Unknown,
+            },
+        )?;
+    }
+    Ok(())
+}
 /// Retained bytes and generations charged by one intent (A file generations plus any root).
 pub(crate) fn usage(r: &Intent) -> (u64, usize) {
     let mut bytes = 0u64;
@@ -807,29 +851,18 @@ impl Replica {
                         continue;
                     }
                     let version = format!("{}-version-{}", f.stage, f.versions.len());
+                    // The next version leaf is owner-private; an orphan from an interrupted copy
+                    // (never journaled) is reused and truncated rather than wedging scans.
                     let mut copy = open_at(
                         stage.as_raw_fd(),
                         &name(OsStr::new(&version))?,
-                        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
                     )?;
                     displaced.seek(SeekFrom::Start(0))?;
                     std::io::copy(&mut (&mut displaced).take(observed.size), &mut copy)?;
                     copy.sync_all()?;
                     stage.sync_all()?;
-                    let copied =
-                        open_file(&stage, &version).and_then(|mut c| native_hash(&mut c))?;
-                    record(
-                        &core,
-                        Retained {
-                            operation: &r.operation,
-                            original_base: &r.base,
-                            source_path: &f.path,
-                            observed_generation: r.generation,
-                            digest_hex: &copied,
-                            copy: &r.stage.join(&version),
-                            causal_coverage: RecoveryCausality::Unknown,
-                        },
-                    )?;
+                    crate::faults::capture_barrier("native-version-copied", 1)?;
                     f.versions.push(r.stage.join(version));
                     generations += 1;
                     bytes = bytes.saturating_add(observed.size);
@@ -844,6 +877,7 @@ impl Replica {
                 }
             }
             save(&core, r)?;
+            records_for_versions(&core, r)?;
         }
         if let Ok(previous) = baseline(&core) {
             match Scan::observe(&n.root, &n.policy, Instant::now() + Duration::from_secs(30)) {
@@ -990,6 +1024,10 @@ impl Replica {
                 use std::os::unix::ffi::OsStrExt;
                 for file in &retained.files {
                     allowed.insert(file.stage.as_bytes().to_vec());
+                    // An interrupted, never-journaled copy of the next version is our own.
+                    allowed.insert(
+                        format!("{}-version-{}", file.stage, file.versions.len()).into_bytes(),
+                    );
                     if file.expected.is_some() && file.exchanged {
                         required.insert(file.stage.as_bytes().to_vec());
                     }
@@ -998,6 +1036,9 @@ impl Replica {
                         allowed.insert(leaf.as_bytes().to_vec());
                         required.insert(leaf.as_bytes().to_vec());
                     }
+                }
+                if let Some(root) = &retained.root {
+                    allowed.insert(format!("root-version-{}", root.versions.len()).into_bytes());
                 }
                 for version in retained.root.iter().flat_map(|x| &x.versions) {
                     let leaf = version.version.file_name().ok_or(FsError::UnsafeStorage)?;
