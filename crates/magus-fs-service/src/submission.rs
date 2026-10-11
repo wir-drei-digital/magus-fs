@@ -204,7 +204,8 @@ pub(crate) fn entry_ids<'a>(trees: impl IntoIterator<Item = &'a Tree>) -> Vec<St
 /// beyond its issued base view that the registry knows but that is absent from the caller's
 /// current authorized projection (deleted, moved out of scope or made unreadable alike) is
 /// refused with the same `404 not_found` a hidden identity gets, at submission, integration,
-/// resolution and replay. Identities hidden at the base are `lift`'s concern (same response).
+/// resolution admission. Recorded-result replay never admits identities (R23).
+/// Identities hidden at the base are `lift`'s concern (same response).
 /// The lookup reads published identities only; it never consults conflicts of anyone.
 pub(crate) async fn refuse_revived(
     state: &ServiceState,
@@ -273,11 +274,10 @@ pub(crate) async fn replay(
                 // moved-out or unreadable alike).
                 s.validate_receipt_base()?;
             }
-            // Ruling R22: a recorded integration or resolution result (e.g. a retained
-            // edit/delete conflict) is recovered by lookup or exact replay under current
-            // rights at current locations (R14/R20, R21), identically for deleted and
-            // moved-out identities.
-            refuse_revived(state, &s, &entry_ids([&derived.tree])).await?;
+            // R22/R23: lookup/exact replay returns immutable operation metadata, never
+            // admits a new effect. An introduced identity may since have been deleted or
+            // moved out of scope; the registry's revival check belongs only to admission.
+            // Keep current credential, scope and permission checks for every result kind.
             authorize_candidate(&s, derived)?;
         }
     }

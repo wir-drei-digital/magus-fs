@@ -731,6 +731,78 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
         assert r21i['deleted'] == r21i['moved'] == (404, {'code': 'not_found'}) and r21i_revived == [], (r21i, r21i_revived)
         assert maintained == backfilled and not maintained.startswith('0:'), (maintained, backfilled)
         assert r22['deleted'] == r22['moved'] == {'lookup': (409, 'conflicted', ['edit_delete']), 'replay_equal': True, 'conflicts': 1}, r22
+        self.result_recovery(replica, grant, entry, others)
+    def result_recovery(self, replica, grant, entry, others):
+        """R23: immutable result recovery is not new identity admission. Exercise the common
+        replay path for candidate, integration and resolution after an introduced id disappears."""
+        recovered = {}; expected = {}; requests = []
+        def witness():
+            return (self.head(), self.sql('SELECT count(*) FROM changes;'),
+                    self.sql('SELECT count(*) FROM operations;'),
+                    self.sql("SELECT encode(r.descriptor,'hex') FROM revisions r JOIN branches b ON b.namespace=r.namespace AND b.revision=r.revision WHERE b.name='main';"))
+        for kind in ['integration', 'resolution']:
+            for variant in ['deleted', 'moved']:
+                label = kind + '-' + variant;path = 'reports/r23-' + label + '.txt'
+                if kind == 'resolution':
+                    view, r = self.view('scoped');r['provenance'] = UNKNOWN
+                    r['tree']['entries'].append(file_entry(path, entry(r['tree'], 'reports')['id'], b'held'))
+                    _, held = self.submit('scoped', replica, view, r, [b'held'])
+                    conflict = self.expect('r23-held', 'POST', self.root + '/integrations', 409,
+                                           body=self.integrate_request(held, view), actor='scoped')
+                    assert conflict['code'] == 'conflicted'
+                view, r = self.view('scoped');new = file_entry(path, entry(r['tree'], 'reports')['id'], b'r23 created')
+                r['tree']['entries'].append(new)
+                candidate, private = self.submit('scoped', replica, view, r, [b'r23 created'])
+                request = self.integrate_request(private, view) if kind == 'integration' else {
+                    'operation': identity('operation'), 'replica': replica, 'expected_head': view['head'],
+                    'replacement': private['receipt'], 'conflicts': conflict['conflicts']}
+                route = '/' + kind + 's'
+                self.drop_response(self.root + route, request, 'scoped')
+                original = json.loads(self.sql("SELECT result FROM operations WHERE operation='" + request['operation'] + "';"))
+                assert self.sql("SELECT status FROM operations WHERE operation='" + request['operation'] + "';") == '200'
+                self.publish_tree(others(variant, path), label='r23-remove-' + label)
+                before = witness()
+                pairs = [('candidate', '/candidates', candidate, private), (kind, route, request, original)]
+                for name, endpoint, req, result in pairs:
+                    key = label + '-' + name
+                    looked = self.request('GET', self.op_path(req), actor='scoped')
+                    replayed = self.request('POST', self.root + endpoint, body=req, actor='scoped')
+                    changed = dict(req, original_head=secrets.token_hex(16)) if name == 'candidate' else dict(req, expected_head=secrets.token_hex(16))
+                    mismatch = self.request('POST', self.root + endpoint, body=changed, actor='scoped')
+                    foreign = self.request('GET', self.op_path(req), actor='alice')
+                    recovered[key] = {'lookup': looked, 'replay': replayed, 'changed_digest': mismatch, 'foreign': foreign}
+                    expected[key] = result
+                assert witness() == before, label
+                # A fresh proposal still cannot reuse the published, now-absent identity.
+                fresh_view, fresh = self.view('scoped');fresh['tree']['entries'].append(copy.deepcopy(new))
+                self.expect('r23-fresh-revival-' + label, 'POST', self.root + '/candidates', 404,
+                            {'code': 'not_found'}, body=self.submit_request(replica, fresh_view, fresh, [b'r23 created']), actor='scoped')
+                requests.extend(pairs)
+        # Current write narrowing denies recovery even though every response is already stored.
+        self.publish_tree(lambda t: entry(t, 'reports').update(mode=0o555), label='r23-narrow')
+        for name, endpoint, req, _ in requests:
+            self.expect('r23-narrow-lookup-' + name, 'GET', self.op_path(req), 404, {'code': 'not_found'}, actor='scoped')
+            self.expect('r23-narrow-replay-' + name, 'POST', self.root + endpoint, 404, {'code': 'not_found'}, body=req, actor='scoped')
+        self.publish_tree(lambda t: entry(t, 'reports').update(mode=0o755), label='r23-widen')
+        # The candidate's original base rule remains stricter: losing a formerly visible
+        # base entry denies its receipt even though the publication result stays recoverable.
+        self.set_file('reports/r23-base.txt', b'base read guard', 'r23-base')
+        view, r = self.view('scoped');r['tree']['entries'].append(file_entry('reports/r23-private.txt', entry(r['tree'], 'reports')['id'], b'private'))
+        req, _ = self.submit('scoped', replica, view, r, [b'private'])
+        self.publish_tree(others('deleted', 'reports/r23-base.txt'), label='r23-base-delete')
+        self.expect('r23-base-read-lookup', 'GET', self.op_path(req), 404, {'code': 'not_found'}, actor='scoped')
+        self.expect('r23-base-read-replay', 'POST', self.root + '/candidates', 404, {'code': 'not_found'}, body=req, actor='scoped')
+        self.expect('r23-revoke', 'POST', self.root + '/grants', 200, body={'revoke': grant['credential']})
+        for name, endpoint, req, _ in requests:
+            assert self.request('GET', self.op_path(req), actor='scoped')[0] == 401
+            assert self.request('POST', self.root + endpoint, body=req, actor='scoped')[0] == 401
+        self.record('service', 'r23-recorded-result-recovery', recovered=recovered, expected=expected,
+                    unchanged_head_events_entries=True, fresh_revival_denied=True, current_narrowing_denied=True,
+                    private_base_read_guard=True, revoked_denied=True)
+        for key, observed in recovered.items():
+            assert observed['lookup'] == observed['replay'] == (200, expected[key]), (key, observed)
+            assert observed['changed_digest'] == (409, {'code': 'conflict'}), (key, observed)
+            assert observed['foreign'] == (404, {'code': 'not_found'}), (key, observed)
     def submit_request(self, replica, view, r, bodies):
         r['parents'] = [view['revision']];r['replica'] = replica;r['operation'] = identity('operation')
         upload, rid = self.stage(r, 'scoped', bodies)

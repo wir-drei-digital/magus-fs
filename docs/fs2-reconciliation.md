@@ -188,17 +188,23 @@ backfilled once by migration 004 from the revisions that were ever a branch head
 maintained in every publishing commit). An identity a submission introduces beyond its
 issued base that the registry knows but that is absent from the caller's current projection
 is refused with the same `404` a hidden identity gets — at candidate submission,
-integration, resolution and replay — so a crafted client can neither revive a deleted
+integration and resolution admission — so a crafted client can neither revive a deleted
 identity (and inherit current permissions over its old versions) nor tell deleted from
 moved out or unreadable. The lookup reads published identities only, never anyone's
 conflicts. Cost: a client that re-submits an identity it saw published and that is then
 deleted before its submission or integration is denied rather than reviving it.
 
-Ruling R22: a lost reply is recovered by `GET /operations/{replica}/{operation}` or the
+Rulings R22/R23: a lost reply is recovered by `GET /operations/{replica}/{operation}` or the
 exact re-POST. An integration or resolution result (including a retained `409 conflicted`
 with its conflict IDs) is replayed under current rights at current locations (R14/R20,
-R21), identically for deleted and moved-out entries; a private receipt replay keeps A's
-rule that every formerly visible identity of its base is still readable.
+R23), identically for deleted and moved-out entries; a private receipt replay keeps A's
+rule that every formerly visible identity of its base is still readable. The registry
+refuses new proposals/effects, not recovery of already-recorded immutable results: an
+identity introduced by a committed operation may later disappear without preventing
+lookup or exact replay. Current credential, action, scope, permission and operation
+ownership checks still apply, as does request digest equality. Recovery returns only
+the original operation response; it cannot revive identities or grant content/history
+access.
 
 Limitation: local composition is opaque, so an entry the service could have text-merged
 takes its chosen side when the same candidate also has real conflicts (choose or replace
@@ -215,9 +221,11 @@ native ordinary-folder owners on macOS and Linux, and exercises disconnected com
 and text merges, text/binary/namespace conflicts with atomic non-publication, alternative
 export and explicit absence, delayed and commit-raced resolution, the unknown-causality
 hold → conflict → resolution → resumed application path on both OSes, scoped
-hidden-sibling/move/collision/revocation negatives, the R20–R22 identity cases (deletion
+hidden-sibling/move/collision/revocation negatives, the R20–R23 identity cases (deletion
 or edit beneath a folder deleted vs moved out of scope, crafted identity re-use at
-submission and integration, lost-reply recovery of a retained conflict, registry backfill
+submission and integration, lost-reply recovery of a retained conflict and committed creation/resolution after
+later deletion or movement out of scope (including private receipts and current
+authority/digest/base-read denials), registry backfill
 equals upkeep), the killable worker deadline and a service killed between
 generated-object installation and commit. Exit 0/1/2 =
 passed/failed/missing prerequisite.
