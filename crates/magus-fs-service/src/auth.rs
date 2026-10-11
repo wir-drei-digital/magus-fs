@@ -131,7 +131,7 @@ impl Provision {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             || self.actions.is_empty()
-            || self.actions.len() > 5
+            || self.actions.len() > 6
             || self.branches.is_empty()
             || self.branches.len() > 64
             || self.prefixes.is_empty()
@@ -142,7 +142,7 @@ impl Provision {
         if self.actions.iter().any(|a| {
             !matches!(
                 a.as_str(),
-                "read" | "write" | "history" | "integrate" | "admin"
+                "read" | "write" | "history" | "integrate" | "admin" | "retained_history"
             )
         }) || self
             .branches

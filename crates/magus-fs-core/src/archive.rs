@@ -5,6 +5,7 @@ use crate::{
     objects::{name, open_at},
     permissions as perm, *,
 };
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -592,4 +593,193 @@ pub fn restore_archive(
         derived_revision: id,
         recovery_state: state,
     })
+}
+
+/// Explicit local recovery source link. The archived source is evidence, not ancestry or
+/// remote authority. Import never advances the working head or queues a publication.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryImport {
+    pub operation: OperationId,
+    pub source_revision: RevisionId,
+    pub revision: RevisionId,
+    pub current_base: RevisionId,
+    pub published: bool,
+}
+impl Replica {
+    pub fn list_recovery_imports(&self, actor: Actor) -> Result<Vec<RecoveryImport>, FsError> {
+        let core = lock(&self.core)?;
+        perm::authority(&core.config, &actor)?;
+        let rows = core
+            .journal
+            .db
+            .prepare("SELECT record FROM recovery_imports ORDER BY rowid LIMIT 128")?
+            .query_map([], |r| r.get::<_, Vec<u8>>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.iter().map(|b| crate::engine::from_json(b)).collect()
+    }
+    pub fn compare_recovery_archive(
+        &self,
+        path: impl AsRef<Path>,
+        actor: Actor,
+    ) -> Result<Vec<String>, FsError> {
+        let archive = VerifiedArchive::open(path.as_ref())?;
+        let core = lock(&self.core)?;
+        let a = perm::authority(&core.config, &actor)?;
+        let current = &core.working()?.tree;
+        for e in &current.entries {
+            authorize_tree_read(current, &e.id, a)?;
+        }
+        let source = &archive.revisions[&archive.manifest.revision].tree;
+        let paths = current
+            .entries
+            .iter()
+            .chain(&source.entries)
+            .map(|e| e.path.clone())
+            .collect::<BTreeSet<_>>();
+        Ok(paths
+            .into_iter()
+            .filter(|path| {
+                current
+                    .entries
+                    .iter()
+                    .find(|e| &e.path == path)
+                    .map(|e| &e.content)
+                    != source
+                        .entries
+                        .iter()
+                        .find(|e| &e.path == path)
+                        .map(|e| &e.content)
+            })
+            .collect())
+    }
+    pub fn import_recovery_archive(
+        &self,
+        path: impl AsRef<Path>,
+        operation: OperationId,
+        actor: Actor,
+    ) -> Result<RecoveryImport, FsError> {
+        let archive = VerifiedArchive::open(path.as_ref())?;
+        let mut core = lock(&self.core)?;
+        let a = perm::authority(&core.config, &actor)?.clone();
+        let source = &archive.revisions[&archive.manifest.revision];
+        if let Some(bytes) = core
+            .journal
+            .db
+            .query_row(
+                "SELECT record FROM recovery_imports WHERE operation=?",
+                [operation.as_str()],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        {
+            let old: RecoveryImport = crate::engine::from_json(&bytes)?;
+            if old.source_revision != archive.manifest.revision {
+                return Err(FsError::OperationMismatch);
+            }
+            return Ok(old);
+        }
+        let count: i64 =
+            core.journal
+                .db
+                .query_row("SELECT count(*) FROM recovery_imports", [], |r| r.get(0))?;
+        if count >= 128 {
+            return Err(FsError::Backpressure);
+        }
+        let current = core.working()?.clone();
+        let mut derived = core.revision(&current.head)?;
+        derived.parents = vec![current.head.clone()];
+        derived.operation = operation.clone();
+        derived.replica = core.config.replica.clone();
+        derived.principal = actor.principal().clone();
+        derived.format = FORMAT.into();
+        derived.restoration = None;
+        derived.provenance = "explicit".into();
+        let mut mapping =
+            BTreeMap::from([(source.tree.root.id.clone(), current.tree.root.id.clone())]);
+        let mut entries = vec![];
+        for old in &source.tree.entries {
+            let now = current.tree.entries.iter().find(|e| e.path == old.path);
+            let mut entry = old.clone();
+            entry.parent = mapping
+                .get(&old.parent)
+                .cloned()
+                .ok_or(FsError::InvalidDescriptor)?;
+            if let Some(now) = now {
+                entry.id = now.id.clone();
+                entry.owner = now.owner.clone();
+                entry.group = now.group.clone();
+                entry.mode = now.mode;
+            } else {
+                entry.id = EntryId::random()?;
+                entry.owner = a.principal.clone();
+                entry.group = a.primary_group.clone();
+                entry.mode = if entry.content == EntryContent::Directory {
+                    0o755
+                } else {
+                    0o644
+                };
+            }
+            mapping.insert(old.id.clone(), entry.id.clone());
+            entries.push(entry);
+        }
+        derived.tree = Tree {
+            root: current.tree.root.clone(),
+            entries,
+        };
+        authorize_tree_transition(
+            &current.tree,
+            &derived.tree,
+            &a,
+            &core.config.authorities,
+            &TransitionScope {
+                read_prefixes: vec!["".into()],
+                write_prefixes: vec!["".into()],
+                read_only: false,
+            },
+        )?;
+        core.reserve(&archive.objects)?;
+        for (id, size) in &archive.objects {
+            let bytes = read_file(
+                &archive.object_dir,
+                id.as_str().trim_start_matches("sha256:"),
+                *size,
+            )?;
+            if bytes.len() as u64 != *size || ObjectId::for_bytes(&bytes)? != *id {
+                return Err(FsError::CorruptObject);
+            }
+            core.objects.install(&bytes)?;
+            core.objects.sync_object(id)?;
+        }
+        let id = revision_id(&derived)?;
+        let record = RecoveryImport {
+            operation: operation.clone(),
+            source_revision: archive.manifest.revision.clone(),
+            revision: id.clone(),
+            current_base: current.head,
+            published: false,
+        };
+        let tx = core.journal.db.transaction()?;
+        for (id, r) in &archive.revisions {
+            tx.execute(
+                "INSERT OR IGNORE INTO revisions VALUES(?,?)",
+                rusqlite::params![id.as_str(), encode_revision(r)?],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO revisions VALUES(?,?)",
+            rusqlite::params![id.as_str(), encode_revision(&derived)?],
+        )?;
+        tx.execute(
+            "INSERT INTO recovery_imports VALUES(?,?,?,?)",
+            rusqlite::params![
+                operation.as_str(),
+                record.source_revision.as_str(),
+                id.as_str(),
+                json(&record)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(record)
+    }
 }

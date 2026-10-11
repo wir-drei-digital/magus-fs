@@ -14,6 +14,7 @@ struct Query {
     branch: BranchName,
     after: i64,
     limit: usize,
+    snapshot: bool,
 }
 fn query(raw: Option<String>) -> Result<Query> {
     let mut values = std::collections::BTreeMap::new();
@@ -21,7 +22,7 @@ fn query(raw: Option<String>) -> Result<Query> {
         let (key, value) = pair
             .split_once('=')
             .ok_or(Error::invalid("invalid_request"))?;
-        if !["branch", "after", "limit"].contains(&key)
+        if !["branch", "after", "limit", "snapshot"].contains(&key)
             || values.insert(key.to_owned(), value.to_owned()).is_some()
         {
             return Err(Error::invalid("invalid_request"));
@@ -47,9 +48,14 @@ fn query(raw: Option<String>) -> Result<Query> {
         return Err(Error::limit());
     }
     if after < 0 {
-        return Err(Error::invalid("expired_cursor"));
+        return Err(Error::invalid("cursor_expired"));
     }
+    let snapshot = values
+        .remove("snapshot")
+        .map(|v| v == "true")
+        .unwrap_or(false);
     Ok(Query {
+        snapshot,
         branch,
         after,
         limit,
@@ -65,7 +71,10 @@ async fn page(state: &ServiceState, c: &auth::AuthContext, q: &Query) -> Result<
   let tx=db.transaction().await?;db::lock_namespace(&tx,&c.namespace).await?;let context=auth::authenticate(&tx,&c.token_hash,&c.namespace).await?;context.action("read")?;
   let max=tx.query_one("SELECT COALESCE(max(sequence),0)::bigint FROM changes WHERE namespace=$1 AND branch=$2",&[&c.namespace,&q.branch.as_str()]).await?.get::<_,i64>(0);
   if q.after>max{return Err(Error::invalid("invalid_cursor"))}
-  let rows=tx.query("SELECT sequence,head,paths FROM changes WHERE namespace=$1 AND branch=$2 AND sequence>$3 ORDER BY sequence LIMIT $4",&[&c.namespace,&q.branch.as_str(),&q.after,&(q.limit as i64)]).await?.into_iter().map(|r|(r.get::<_,i64>(0),r.get::<_,String>(1),r.get::<_,Vec<String>>(2))).collect::<Vec<_>>();tx.commit().await?;Ok((rows,max))
+  let floor=tx.query_opt("SELECT floor FROM change_retention WHERE namespace=$1 AND branch=$2",&[&c.namespace,&q.branch.as_str()]).await?.map(|r|r.get::<_,i64>(0)).unwrap_or(0);
+  if !q.snapshot && q.after<floor{return Err(Error::invalid("cursor_expired"))}
+  let after=if q.snapshot {max}else{q.after};
+  let rows=tx.query("SELECT sequence,head,paths FROM changes WHERE namespace=$1 AND branch=$2 AND sequence>$3 ORDER BY sequence LIMIT $4",&[&c.namespace,&q.branch.as_str(),&after,&(q.limit as i64)]).await?.into_iter().map(|r|(r.get::<_,i64>(0),r.get::<_,String>(1),r.get::<_,Vec<String>>(2))).collect::<Vec<_>>();tx.commit().await?;Ok((rows,max))
  })).await?;
     let cursor = rows.last().map(|r| r.0).unwrap_or(max.max(q.after));
     let mut events = vec![];

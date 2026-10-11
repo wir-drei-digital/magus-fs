@@ -12,7 +12,30 @@ pub const MAX_RESOLUTION_CONFLICTS: usize = 128;
 /// The 409 body code for an integration whose candidate retained immutable conflicts.
 pub const CONFLICTED: &str = "conflicted";
 
-opaque_id!(ConflictId, AlternativeId);
+opaque_id!(ConflictId, AlternativeId, HistoryId);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistorySummary {
+    pub id: HistoryId,
+    pub entry: EntryId,
+    pub change: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryPage {
+    pub items: Vec<HistorySummary>,
+    pub next: Option<String>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreRequest {
+    pub operation: OperationId,
+    pub replica: ReplicaId,
+    pub history: HistoryId,
+    pub expected_head: HeadToken,
+    pub restore_metadata: bool,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

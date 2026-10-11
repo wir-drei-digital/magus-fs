@@ -4,9 +4,11 @@ mod changes;
 pub mod config;
 mod conflicts;
 pub mod db;
+mod history;
 pub mod policy;
 mod publication;
 pub mod reconciliation;
+pub mod retention;
 mod revisions;
 pub mod storage;
 mod submission;
@@ -158,6 +160,8 @@ async fn bounded(State(state): State<ServiceState>, req: Request, next: Next) ->
         || path.contains("/views/")
         || path.contains("/operations/")
         || path.contains("/conflicts")
+        || path.contains("/history")
+        || path.ends_with("/restores")
         || [
             "/seed",
             "/views",
@@ -179,6 +183,7 @@ async fn bounded(State(state): State<ServiceState>, req: Request, next: Next) ->
         || req.uri().path().ends_with("/integrations")
         || req.uri().path().ends_with("/resolutions")
         || req.uri().path().ends_with("/seed")
+        || req.uri().path().ends_with("/restores")
     {
         60
     } else {
@@ -225,6 +230,12 @@ pub fn router(state: ServiceState) -> Router {
                 })
             }),
         )
+        .route("/v1/n/{namespace}/history", get(history::list))
+        .route(
+            "/v1/n/{namespace}/history/{history}/view",
+            post(history::view),
+        )
+        .route("/v1/n/{namespace}/restores", post(history::restore))
         .route("/v1/n/{namespace}/conflicts", get(conflicts::list))
         .route(
             "/v1/n/{namespace}/conflicts/{conflict}",

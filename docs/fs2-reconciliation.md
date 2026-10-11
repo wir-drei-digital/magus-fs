@@ -229,3 +229,13 @@ authority/digest/base-read denials), registry backfill
 equals upkeep), the killable worker deadline and a service killed between
 generated-object installation and commit. Exit 0/1/2 =
 passed/failed/missing prerequisite.
+
+Task 3 adds `HistoryId`, `HistorySummary { id, entry, change }`,
+`HistoryPage { items, next }` and `RestoreRequest { operation, replica, history,
+expected_head, restore_metadata }`. Routes are `GET /history?view=...&cursor=...`,
+`POST /history/{id}/view` and `POST /restores` under the same namespace prefix.
+`change` currently has the bounded code `version`. See [recovery](fs2-recovery.md)
+for current history authority, retained-history admin scope, explicit restore and GC.
+Published-entry records are separate from private ancestry; history projections omit full
+restoration sidecars. A projected descriptor does not enumerate complete server-side lineage.
+Frozen service-v1 request hashes and v1/v2 canonical descriptor bytes remain unchanged.

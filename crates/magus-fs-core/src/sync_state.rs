@@ -163,11 +163,59 @@ impl SyncProgress {
         }
     }
 }
+/// Durable incoming progress and safe diagnostics in the existing single-owner journal.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncomingRecovery {
+    pub cursor: i64,
+    pub needs_snapshot: bool,
+    pub discovery_error: Option<String>,
+    pub acknowledgement_error: Option<String>,
+}
+fn safe_incoming_code(code: &str) -> &str {
+    match code {
+        "invalid_credential"
+        | "denied"
+        | "cursor_expired"
+        | "invalid_cursor"
+        | "base_unavailable"
+        | "conflict"
+        | "conflicted"
+        | "backend_unavailable"
+        | "backpressure"
+        | "transport"
+        | "deadline"
+        | "invalid_source"
+        | "permission_denied"
+        | "stale_handle"
+        | "generation_mismatch"
+        | "dirty_working_state"
+        | "replica_busy"
+        | "limit_exceeded"
+        | "corrupt_object"
+        | "io" => code,
+        _ => "invalid_response",
+    }
+}
+fn incoming(core: &crate::engine::Core) -> Result<IncomingRecovery, FsError> {
+    core.journal
+        .db
+        .query_row(
+            "SELECT record FROM incoming_recovery WHERE singleton=1",
+            [],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .map(|b| from_json(&b))
+        .transpose()
+        .map(|v| v.unwrap_or_default())
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncStatus {
     pub binding: Option<SyncBinding>,
     pub submissions: Vec<SyncProgress>,
+    pub incoming: IncomingRecovery,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Record {
@@ -238,6 +286,17 @@ impl crate::engine::Core {
     }
     pub(crate) fn sync_roots(&self) -> Result<BTreeSet<ObjectId>, FsError> {
         let mut roots = BTreeSet::new();
+        let imports = self
+            .journal
+            .db
+            .prepare("SELECT source,revision FROM recovery_imports")?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (source, revision) in imports {
+            for id in [source, revision] {
+                roots.extend(self.recovery_closure(&RevisionId::parse(id)?)?.into_keys());
+            }
+        }
         for record in self.sync_records()? {
             roots.extend(
                 self.sync_staged_closure(
@@ -648,6 +707,7 @@ impl Replica {
             .map(|b| from_json(&b))
             .transpose()?;
         Ok(SyncStatus {
+            incoming: incoming(&core)?,
             binding,
             submissions: core
                 .sync_records()?
@@ -822,5 +882,34 @@ impl Replica {
         deadline: Instant,
     ) -> Result<Vec<u8>, FsError> {
         lock(&self.core)?.fetch(id, size, deadline)
+    }
+}
+
+impl Replica {
+    pub fn incoming_recovery(&self) -> Result<IncomingRecovery, FsError> {
+        {
+            let core = lock(&self.core)?;
+            incoming(&core)
+        }
+    }
+    pub fn record_incoming_recovery(&self, mut value: IncomingRecovery) -> Result<(), FsError> {
+        if value.cursor < 0 {
+            return Err(FsError::InvalidDescriptor);
+        }
+        value.discovery_error = value
+            .discovery_error
+            .map(|s| safe_incoming_code(&s).to_owned());
+        value.acknowledgement_error = value
+            .acknowledgement_error
+            .map(|s| safe_incoming_code(&s).to_owned());
+        let core = lock(&self.core)?;
+        core.journal.guard()?;
+        core.journal.db.execute("INSERT INTO incoming_recovery VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET record=excluded.record",[json(&value)?])?;
+        Ok(())
+    }
+    pub fn record_incoming_acknowledgement(&self, error: Option<&FsError>) -> Result<(), FsError> {
+        let mut value = self.incoming_recovery()?;
+        value.acknowledgement_error = error.map(|e| e.code().to_owned());
+        self.record_incoming_recovery(value)
     }
 }

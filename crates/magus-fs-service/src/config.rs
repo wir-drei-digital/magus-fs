@@ -13,6 +13,9 @@ use std::{
 /// Opens every directory component without following links, then validates the
 /// private parent and final file on the actual descriptors (no check/open race).
 pub fn read_private(path: &Path) -> Result<Vec<u8>> {
+    read_private_bounded(path, 65_536)
+}
+pub fn read_private_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     if !path.is_absolute() || path.file_name().is_none() {
         return Err(Error::invalid("unsafe_config"));
     }
@@ -66,15 +69,15 @@ pub fn read_private(path: &Path) -> Result<Vec<u8>> {
         || meta.uid() != unsafe { libc::geteuid() }
         || meta.mode() & 0o777 != 0o600
         || meta.nlink() != 1
-        || meta.len() > 65_536
+        || meta.len() > limit
     {
         return Err(Error::invalid("unsafe_config"));
     }
     let mut bytes = Vec::new();
-    file.take(65_537)
+    file.take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| Error::invalid("unsafe_config"))?;
-    if bytes.len() > 65_536 {
+    if bytes.len() as u64 > limit {
         return Err(Error::invalid("unsafe_config"));
     }
     Ok(bytes)

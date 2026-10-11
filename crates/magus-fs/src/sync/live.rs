@@ -45,7 +45,7 @@ impl Incoming {
         Ok(Self {
             rep: rep.clone(),
             execution: SyncExecution::for_replica(&rep.configuration()?.replica)?,
-            cursor: 0,
+            cursor: rep.incoming_recovery()?.cursor,
             credential: None,
             needs_refresh: true,
             pending_source: None,
@@ -67,21 +67,33 @@ impl Incoming {
         else {
             return Ok(None);
         };
-        let binding = self
-            .rep
-            .sync_status()?
-            .binding
-            .ok_or(FsError::ConfigMismatch)?;
-        let transport = Transport::new(binding.clone(), &self.rep.configuration()?)?;
-        let credential = transport.credential_stamp()?;
+        let prepared = (|| -> Result<_, FsError> {
+            let binding = self
+                .rep
+                .sync_status()?
+                .binding
+                .ok_or(FsError::ConfigMismatch)?;
+            let transport = Transport::new(binding.clone(), &self.rep.configuration()?)?;
+            let credential = transport.credential_stamp()?;
+            let authority_generation = self.rep.live_status()?.authority_generation;
+            Ok((binding, transport, credential, authority_generation))
+        })();
+        let (binding, transport, credential, authority_generation) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let mut recovery = self.rep.incoming_recovery()?;
+                recovery.discovery_error = Some(error.code().into());
+                self.rep.record_incoming_recovery(recovery)?;
+                return Err(error);
+            }
+        };
         if self.credential.as_ref() != Some(&credential) {
             self.needs_refresh = true;
             self.pending_source = None;
         }
         let refreshed = self.needs_refresh;
-        let authority_generation = self.rep.live_status()?.authority_generation;
         let result = (|| -> Result<Option<T>, Failure> {
-            let page: ChangePage = transport.json(
+            let response: Result<ChangePage, Failure> = transport.json(
                 "GET",
                 &format!(
                     "/changes?branch={}&after={}&limit=128",
@@ -90,11 +102,32 @@ impl Incoming {
                 ),
                 (),
                 deadline,
-            )?;
+            );
+            let page = match response {
+                Ok(page) => page,
+                Err(error) if matches!(error.code, "cursor_expired" | "invalid_cursor") => {
+                    self.needs_refresh = true;
+                    let mut recovery = self.rep.incoming_recovery()?;
+                    recovery.needs_snapshot = true;
+                    recovery.discovery_error = Some(error.code.into());
+                    self.rep.record_incoming_recovery(recovery)?;
+                    transport.json(
+                        "GET",
+                        &format!("/changes?branch={}&snapshot=true", binding.branch.as_str()),
+                        (),
+                        deadline,
+                    )?
+                }
+                Err(error) => return Err(error),
+            };
             self.cursor = page.cursor;
+            let mut recovery = self.rep.incoming_recovery()?;
+            recovery.cursor = self.cursor;
+            self.rep.record_incoming_recovery(recovery)?;
             let view: ViewBinding =
                 transport.json("POST", "/views", json!({"branch":binding.branch}), deadline)?;
             if !refreshed
+                && !self.needs_refresh
                 && binding.view.revision == view.revision
                 && binding.view.head == view.head
             {
@@ -163,14 +196,25 @@ impl Incoming {
             }
         })();
         match result {
-            Ok(v) => Ok(v),
+            Ok(v) => {
+                let mut recovery = self.rep.incoming_recovery()?;
+                recovery.cursor = self.cursor;
+                recovery.needs_snapshot = false;
+                recovery.discovery_error = None;
+                self.rep.record_incoming_recovery(recovery)?;
+                Ok(v)
+            }
             Err(e) => {
+                let mut recovery = self.rep.incoming_recovery()?;
+                recovery.cursor = self.cursor;
+                recovery.discovery_error = Some(e.code.into());
+                self.rep.record_incoming_recovery(recovery)?;
                 if matches!(e.code, "invalid_credential" | "denied") {
                     self.rep
                         .observe_remote_authority(None, authority_generation)?;
                     self.needs_refresh = true;
                 }
-                if matches!(e.code, "invalid_cursor" | "expired_cursor") {
+                if matches!(e.code, "invalid_cursor" | "cursor_expired") {
                     self.cursor = 0;
                 }
                 Err(if e.retryable {

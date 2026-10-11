@@ -195,8 +195,24 @@ impl VerifiedObjects {
             let row = db.query_opt("SELECT storage_key FROM objects WHERE namespace=$1 AND object_id=$2 AND size=$3 AND state='ready'",&[&namespace,&id.as_str(),&size]).await?.ok_or(Error::not_found())?;
             Ok(row.get::<_, String>(0))
         })).await?;
-        self.read_verified(&Path::from(key), id, size as usize, "merge_input_body")
-            .await
+        let bytes = self
+            .read_verified(
+                &Path::from(key.clone()),
+                id,
+                size as usize,
+                "merge_input_body",
+            )
+            .await;
+        if bytes
+            .as_ref()
+            .is_err_and(|e| matches!(e.code, "corrupt_object" | "base_unavailable"))
+        {
+            self.db.acquire().await?.run(|db|Box::pin(async move {
+                let tx=db.transaction().await?;lock_namespace(&tx,namespace).await?;
+                tx.execute("UPDATE objects SET state='corrupt' WHERE namespace=$1 AND object_id=$2 AND storage_key=$3",&[&namespace,&id.as_str(),&key]).await?;tx.commit().await?;Ok(())
+            })).await?;
+        }
+        bytes
     }
     /// Installs a service-generated (merged text) chunk under a fresh immutable generation,
     /// verified by readback before it becomes ready. Unreferenced results are left for GC.
@@ -229,6 +245,7 @@ impl VerifiedObjects {
             Ok(result)
         })).await?;
         let Some((generation, key)) = reserved else {
+            self.read_ready(namespace, id, bytes.len() as u64).await?;
             return Ok(());
         };
         let path = Path::from(key);
@@ -266,6 +283,80 @@ impl VerifiedObjects {
             Ok(())
         })).await
     }
+    /// Trusted repair from explicitly supplied verified bytes. The bad immutable generation
+    /// is quarantined, never overwritten; retained hash references atomically bind the new
+    /// verified generation under namespace -> object lock ordering.
+    pub async fn repair(
+        &self,
+        namespace: &NamespaceId,
+        id: &ObjectId,
+        bytes: Bytes,
+    ) -> Result<String> {
+        if bytes.len() as u64 > MAX_CHUNK
+            || ObjectId::for_bytes(&bytes).map_err(|_| Error::limit())? != *id
+        {
+            return Err(Error::invalid("hash_mismatch"));
+        }
+        let original=self.db.acquire().await?.run(|db|Box::pin(async move {
+            let tx=db.transaction().await?;lock_namespace(&tx,namespace.as_str()).await?;
+            let row=tx.query_opt("SELECT generation,storage_key,size,state FROM objects WHERE namespace=$1 AND object_id=$2 FOR UPDATE",&[&namespace.as_str(),&id.as_str()]).await?.ok_or(Error::not_found())?;
+            if row.get::<_,&str>(3)=="deleting" {return Err(Error::conflict());}
+            let out=(row.get::<_,String>(0),row.get::<_,String>(1),row.get::<_,i64>(2),row.get::<_,String>(3));tx.commit().await?;Ok(out)
+        })).await?;
+        if original.2 != bytes.len() as i64 {
+            return Err(Error::invalid("hash_mismatch"));
+        }
+        let (generation,key)=self.db.acquire().await?.run(|db| {let original=&original;Box::pin(async move {
+            let tx=db.transaction().await?;lock_namespace(&tx,namespace.as_str()).await?;
+            let proposed=NamespaceId::random().map_err(|_|Error::backend())?.as_str().to_owned();let key=format!("{}/{}/{}",namespace.as_str(),&id.as_str()[7..],proposed);
+            tx.execute("INSERT INTO repair_attempts(namespace,object_id,source_generation,generation,storage_key,state) VALUES($1,$2,$3,$4,$5,'prepared') ON CONFLICT DO NOTHING",&[&namespace.as_str(),&id.as_str(),&original.0,&proposed,&key]).await?;
+            tx.execute("UPDATE objects SET lease_until=GREATEST(lease_until,clock_timestamp()+interval '900 seconds') WHERE namespace=$1 AND object_id=$2 AND generation=$3 AND state!='deleting'",&[&namespace.as_str(),&id.as_str(),&original.0]).await?;
+            let row=tx.query_one("SELECT generation,storage_key FROM repair_attempts WHERE namespace=$1 AND object_id=$2 AND source_generation=$3",&[&namespace.as_str(),&id.as_str(),&original.0]).await?;let out=(row.get::<_,String>(0),row.get::<_,String>(1));tx.commit().await?;Ok(out)
+        })}).await?;
+        let path = Path::from(key.clone());
+        match self
+            .store
+            .put_opts(
+                &path,
+                bytes.clone().into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_)
+            | Err(object_store::Error::AlreadyExists { .. })
+            | Err(object_store::Error::Precondition { .. }) => {}
+            Err(_) => return Err(Error::backend()),
+        }
+        if self
+            .read_verified(&path, id, bytes.len(), "repair_verification_body")
+            .await?
+            != bytes
+        {
+            return Err(Error::invalid("corrupt_object"));
+        }
+        crate::publication::barrier("repair").await;
+        self.db.acquire().await?.run(|db|{let generation=&generation;Box::pin(async move {
+            let tx=db.transaction().await?;lock_namespace(&tx,namespace.as_str()).await?;
+            let row=tx.query_opt("SELECT generation,state FROM objects WHERE namespace=$1 AND object_id=$2 FOR UPDATE",&[&namespace.as_str(),&id.as_str()]).await?.ok_or(Error::not_found())?;
+            if row.get::<_,String>(0)!=original.0||row.get::<_,&str>(1)=="deleting" {return Err(Error::conflict());}
+            tx.execute("INSERT INTO quarantined_generations(namespace,object_id,generation,storage_key,size,state) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",&[&namespace.as_str(),&id.as_str(),&original.0,&original.1,&original.2,&original.3]).await?;
+            let refs=tx.query("DELETE FROM revision_objects WHERE namespace=$1 AND object_id=$2 RETURNING revision",&[&namespace.as_str(),&id.as_str()]).await?.iter().map(|r|r.get::<_,String>(0)).collect::<Vec<_>>();
+            tx.execute("DELETE FROM session_objects WHERE namespace=$1 AND object_id=$2",&[&namespace.as_str(),&id.as_str()]).await?;
+            tx.execute("UPDATE objects SET generation=$3,storage_key=$4,state='ready',lease_until=clock_timestamp()+interval '900 seconds' WHERE namespace=$1 AND object_id=$2",&[&namespace.as_str(),&id.as_str(),generation,&key]).await?;
+            tx.execute("INSERT INTO revision_objects(namespace,revision,object_id,generation) SELECT $1,unnest($2::text[]),$3,$4",&[&namespace.as_str(),&refs,&id.as_str(),generation]).await?;tx.execute("UPDATE repair_attempts SET state='installed' WHERE namespace=$1 AND object_id=$2 AND source_generation=$3",&[&namespace.as_str(),&id.as_str(),&original.0]).await?;tx.commit().await?;Ok(())
+        })}).await?;
+        Ok(generation)
+    }
+    pub(crate) async fn delete_generation(&self, key: &str) -> Result<()> {
+        match self.store.delete(&Path::from(key)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(_) => Err(Error::backend()),
+        }
+    }
     pub async fn read_authorized(
         &self,
         context: &AuthContext,
@@ -277,7 +368,10 @@ impl VerifiedObjects {
         let bytes = self
             .read_verified(&Path::from(key), id, size, "authorized_body")
             .await;
-        if bytes.as_ref().is_err_and(|e| e.code == "corrupt_object") {
+        if bytes
+            .as_ref()
+            .is_err_and(|e| matches!(e.code, "corrupt_object" | "base_unavailable"))
+        {
             self.db.acquire().await?.run(|db|Box::pin(async move {
                 let tx=db.transaction().await?;lock_namespace(&tx,&context.namespace).await?;
                 tx.execute("UPDATE objects SET state='corrupt' WHERE namespace=$1 AND object_id=$2 AND generation=$3",&[&context.namespace,&id.as_str(),&generation]).await?;
@@ -297,7 +391,13 @@ impl VerifiedObjects {
     ) -> Result<Bytes> {
         #[cfg(not(feature = "test-faults"))]
         let _ = traffic;
-        let result = self.store.get(path).await.map_err(|_| Error::backend())?;
+        let result = self.store.get(path).await.map_err(|error| match error {
+            object_store::Error::NotFound { .. } => Error {
+                status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                code: "base_unavailable",
+            },
+            _ => Error::backend(),
+        })?;
         if result.meta.size != size as u64 {
             return Err(Error::invalid("corrupt_object"));
         }

@@ -808,8 +808,10 @@ pub fn mount(
                     state.epoch = adoption.epoch;
                     Ok(adoption)
                 });
-                if let Ok(Some(adoption)) = result {
-                    pending = Some(adoption);
+                match result {
+                    Ok(Some(adoption)) => pending = Some(adoption),
+                    Ok(None) => {}
+                    Err(error) => eprintln!("live_discovery_error code={}", error.code()),
                 }
                 if let Some(adoption) = &pending {
                     let started = std::time::Instant::now();
@@ -860,7 +862,12 @@ pub fn mount(
                         }
                         rep.acknowledge_adoption(&adoption.revision, adoption.epoch)
                     })();
+                    if let Err(error) = &result {
+                        let _ = rep.record_incoming_acknowledgement(Some(error));
+                        eprintln!("live_acknowledgement_error code={}", error.code());
+                    }
                     if result.is_ok() {
+                        let _ = rep.record_incoming_acknowledgement(None);
                         eprintln!(
                             "live_applied epoch={} revision={} invalidation_us={}",
                             adoption.epoch,

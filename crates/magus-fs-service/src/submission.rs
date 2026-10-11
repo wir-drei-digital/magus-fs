@@ -123,7 +123,7 @@ pub(crate) async fn operation(
 pub(crate) fn authorize_candidate(s: &r::Snapshot, derived: &Revision) -> Result<()> {
     s.context.action("read")?;
     let view = s.view.as_ref().ok_or(Error::not_found())?;
-    if view.alternative.is_some() {
+    if view.alternative.is_some() || view.history.is_some() {
         return Err(Error::not_found());
     }
     let a = s.authority()?;
@@ -260,6 +260,9 @@ pub(crate) async fn replay(
     c: &auth::AuthContext,
     op: &Operation,
 ) -> Result<()> {
+    if op.kind == "restore" {
+        return crate::history::replay(state, c, op).await;
+    }
     let s = r::snapshot(&state.db, c, &op.branch, op.view.as_deref()).await?;
     s.context.action(if op.kind == "candidate" {
         "write"
@@ -542,6 +545,7 @@ mod tests {
                     projected,
                     head: "original-head".into(),
                     alternative: None,
+                    history: None,
                 }),
             },
             derived,

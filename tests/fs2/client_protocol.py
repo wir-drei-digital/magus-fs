@@ -3,7 +3,7 @@
 import argparse, datetime, concurrent.futures, hashlib, http.client, http.server, json, os, secrets, socket, ssl, subprocess, sys, threading, time, traceback
 from pathlib import Path
 from infra import OwnedInfra, InfrastructureUnavailable, ROOT
-from provenance import capture, verify_image
+from provenance import capture, verify_image, resolve_reused_image
 from service_protocol import Journey as ProtocolJourney, identity, canonical, file_entry, GROUP, REPLICA, WORKER
 from service_storage import NS, ALICE, object_id
 
@@ -189,8 +189,13 @@ class Journey(ProtocolJourney):
     def owner_control(self,state,receipt,revision):
         p=self.spawn([ROOT/'target/debug/magus-fs','sync','run','--state',state,'--serve','true'],'owner')
         deadline=time.monotonic()+5
-        while not (state/'control.sock').exists() and p.poll() is None and time.monotonic()<deadline:time.sleep(.05)
-        assert (state/'control.sock').exists()
+        ready=False
+        while p.poll() is None and time.monotonic()<deadline:
+            if (state/'control.sock').exists():
+                value=self.cli('sync','status','--state',state,'--revision',revision,check=False)
+                if value.get('ok'):ready=True;break
+            time.sleep(.05)
+        assert ready,('owner status readiness',p.poll())
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
             values=list(ex.map(lambda _:self.cli('sync','status','--state',state,'--revision',revision),range(4)))
         assert all(v['progress']==receipt for v in values)
@@ -243,10 +248,12 @@ class Journey(ProtocolJourney):
             if p and p.poll() is None:self.kill(p)
 
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument('--output',required=True);ap.add_argument('--image',default='magus-fs2-task3');ap.add_argument('--skip-build',action='store_true');ap.add_argument('--skip-checks',action='store_true');args=ap.parse_args()
+    ap=argparse.ArgumentParser();ap.add_argument('--output',required=True);ap.add_argument('--image',default='magus-fs2-task3');ap.add_argument('--skip-build',action='store_true');ap.add_argument('--skip-checks',action='store_true');ap.add_argument('--reuse-image');args=ap.parse_args()
     i=OwnedInfra(Path(args.output));status=1;j=None
     try:
         i.preflight();source=capture(i)
+        reused=resolve_reused_image(i,args.reuse_image) if args.reuse_image else None
+        if reused:args.image=reused['image'];args.skip_build=True
         if not args.skip_checks:
             i.run(['python3','-m','unittest','discover','-s','tests/fs2','-p','test_*.py'],timeout=60)
             i.run(['cargo','+stable','fmt','--all','--check'],timeout=60)
@@ -258,7 +265,7 @@ def main():
         i.run(['cargo','+stable','build','--locked','-p','magus-fs','--examples'],timeout=300)
         i.run(['cargo','+stable','build','--locked','-p','magus-fs','-p','magus-fs-service'],timeout=300)
         if not args.skip_build:i.docker('build','-f','tests/fs2/Dockerfile.linux','--build-arg','VERIFY='+('0' if args.skip_checks else '1'),'-t',args.image,'.',timeout=900)
-        i.setup(args.image);verify_image(i,source)
+        i.setup(args.image);verify_image(i,source);i.isolate_service_control()
         binaries={}
         for name,local in [('magus-fs','magus-fs'),('magus-fs-client-faults','magus-fs-client-faults'),('client_probe','examples/client_probe')]:
             binaries[name]={'host':hashlib.sha256((ROOT/'target/debug'/local).read_bytes()).hexdigest(),'linux':i.docker('exec',i.service,'sha256sum','/usr/local/bin/'+name).stdout.split()[0]}

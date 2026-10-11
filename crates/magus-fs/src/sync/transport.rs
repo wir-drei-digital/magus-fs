@@ -402,6 +402,8 @@ impl Transport {
                                         Some("invalid_resolution") => "invalid_resolution",
                                         Some("absent_alternative") => "absent_alternative",
                                         Some("invalid_cursor") => "invalid_cursor",
+                                        Some("cursor_expired") => "cursor_expired",
+                                        Some("base_unavailable") => "base_unavailable",
                                         _ => match status.as_u16() {
                                             401 => "invalid_credential",
                                             404 => "denied",

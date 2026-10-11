@@ -185,3 +185,31 @@ fn invalid_offline_policy_cannot_publish_a_destination() {
         assert!(!out.exists());
     }
 }
+
+#[test]
+fn explicit_recovery_import_preserves_source_without_changing_head_or_queue() {
+    let (d, rep, id) = fixture();
+    let archive = d.path().join("import-archive");
+    rep.export(&id, &archive, actor()).unwrap();
+    let operation = OperationId::random().unwrap();
+    let before = rep.status().unwrap().head;
+    let imported = rep
+        .import_recovery_archive(&archive, operation.clone(), actor())
+        .unwrap();
+    assert_eq!(rep.status().unwrap().head, before);
+    assert_eq!(imported.source_revision, id);
+    assert_ne!(imported.revision, id);
+    assert!(!imported.published);
+    assert_eq!(
+        rep.revision(&imported.revision).unwrap().parents,
+        vec![before.unwrap()]
+    );
+    assert_eq!(
+        rep.import_recovery_archive(&archive, operation, actor())
+            .unwrap(),
+        imported
+    );
+    drop(rep);
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    assert_eq!(rep.list_recovery_imports(actor()).unwrap(), vec![imported]);
+}

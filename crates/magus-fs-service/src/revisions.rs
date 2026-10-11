@@ -75,6 +75,7 @@ pub(crate) struct BoundView {
     pub head: String,
     /// Conflict alternative export binding (id, narrowed entry), never a candidate base.
     pub alternative: Option<(String, Option<EntryId>)>,
+    pub history: Option<(String, EntryId)>,
 }
 pub(crate) struct Snapshot {
     pub context: AuthContext,
@@ -116,6 +117,13 @@ impl Snapshot {
     fn validate(&self, history: bool) -> Result<&BoundView> {
         self.context.action("read")?;
         let view = self.view.as_ref().ok_or(Error::not_found())?;
+        if let Some((_, entry)) = &view.history {
+            let projection = crate::history::projection(self, &view.full, entry)?;
+            if projection.tree != view.projected.tree {
+                return Err(Error::not_found());
+            }
+            return Ok(view);
+        }
         if let Some((_, entry)) = &view.alternative {
             let current = self.current.as_ref().ok_or(Error::not_found())?;
             let projection = crate::views::alternative(
@@ -161,7 +169,7 @@ pub(crate) async fn snapshot(
   let root=tx.query_opt("SELECT root_policy FROM namespace_policy WHERE namespace=$1",&[&c.namespace]).await?.ok_or(Error::not_found())?.get::<_,String>(0);
   let b=tx.query_opt("SELECT r.descriptor,b.head FROM branches b JOIN revisions r ON r.namespace=b.namespace AND r.revision=b.revision WHERE b.namespace=$1 AND b.name=$2",&[&c.namespace,&branch]).await?;
   let current=b.as_ref().map(|r|r.get::<_,Vec<u8>>(0));let head=b.as_ref().map(|r|r.get::<_,String>(1));
-  let bound=if let Some(view)=view {let r=tx.query_opt("SELECT v.descriptor,r.descriptor,v.head,v.alternative,v.alternative_entry FROM views v JOIN revisions r ON r.namespace=v.namespace AND r.revision=v.full_revision WHERE v.id=$1 AND v.namespace=$2 AND v.branch=$3 AND v.credential=$4 AND v.principal=$5 AND v.replica=$6",&[&view,&c.namespace,&branch,&context.credential,&context.principal,&context.replica]).await?.ok_or(Error::not_found())?;Some((view.to_owned(),r.get::<_,Vec<u8>>(0),r.get::<_,Vec<u8>>(1),r.get::<_,String>(2),r.get::<_,Option<String>>(3),r.get::<_,Option<String>>(4)))}else{None};
+  let bound=if let Some(view)=view {let r=tx.query_opt("SELECT v.descriptor,r.descriptor,v.head,v.alternative,v.alternative_entry,v.history,v.history_entry FROM views v JOIN revisions r ON r.namespace=v.namespace AND r.revision=v.full_revision WHERE v.id=$1 AND v.namespace=$2 AND v.branch=$3 AND v.credential=$4 AND v.principal=$5 AND v.replica=$6",&[&view,&c.namespace,&branch,&context.credential,&context.principal,&context.replica]).await?.ok_or(Error::not_found())?;Some((view.to_owned(),r.get::<_,Vec<u8>>(0),r.get::<_,Vec<u8>>(1),r.get::<_,String>(2),r.get::<_,Option<String>>(3),r.get::<_,Option<String>>(4),r.get::<_,Option<String>>(5),r.get::<_,Option<String>>(6)))}else{None};
   tx.commit().await?;Ok((context,authorities,root,current,head,bound))
  })).await?;
     let authorities = authorities
@@ -176,23 +184,34 @@ pub(crate) async fn snapshot(
         current: current.map(|b| decode(&b)).transpose()?,
         head,
         view: bound
-            .map(|(_id, p, f, head, alternative, entry)| {
-                Ok::<BoundView, Error>(BoundView {
-                    projected: decode(&p)?,
-                    full: decode(&f)?,
-                    head,
-                    alternative: alternative
-                        .map(|id| {
-                            Ok::<_, Error>((
-                                id,
-                                entry
-                                    .map(|e| EntryId::parse(e).map_err(|_| Error::backend()))
-                                    .transpose()?,
-                            ))
-                        })
-                        .transpose()?,
-                })
-            })
+            .map(
+                |(_id, p, f, head, alternative, entry, history, history_entry)| {
+                    Ok::<BoundView, Error>(BoundView {
+                        projected: decode(&p)?,
+                        history: history
+                            .map(|id| {
+                                Ok::<_, Error>((
+                                    id,
+                                    EntryId::parse(history_entry.ok_or(Error::backend())?)
+                                        .map_err(|_| Error::backend())?,
+                                ))
+                            })
+                            .transpose()?,
+                        full: decode(&f)?,
+                        head,
+                        alternative: alternative
+                            .map(|id| {
+                                Ok::<_, Error>((
+                                    id,
+                                    entry
+                                        .map(|e| EntryId::parse(e).map_err(|_| Error::backend()))
+                                        .transpose()?,
+                                ))
+                            })
+                            .transpose()?,
+                    })
+                },
+            )
             .transpose()?,
     })
 }
@@ -325,6 +344,23 @@ pub(crate) async fn final_read(database: &db::Database, s: &Snapshot) -> Result<
         .await
 }
 
+pub(crate) async fn publish_history(
+    tx: &Transaction<'_>,
+    ns: &str,
+    branch: &str,
+    revision: &Revision,
+) -> Result<()> {
+    let entries = revision
+        .tree
+        .entries
+        .iter()
+        .filter(|e| matches!(e.content, EntryContent::File { .. }))
+        .map(|e| e.id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    tx.execute("INSERT INTO published_entries(namespace,branch,revision,entry) SELECT $1,$2,$3,unnest($4::text[]) ON CONFLICT DO NOTHING",&[&ns,&branch,&rid(revision)?.as_str(),&entries]).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +424,7 @@ mod tests {
                 projected: revision,
                 head: "head".into(),
                 alternative: None,
+                history: None,
             }),
         };
         match snapshot.validate_view() {

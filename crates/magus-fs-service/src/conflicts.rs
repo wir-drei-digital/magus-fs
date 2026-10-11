@@ -687,6 +687,7 @@ pub(crate) async fn resolve(
                 let generations = r::ready(&tx, &current, required, None, required).await?;
                 r::save_revision(&tx, &current.namespace, resolved_id, bytes, &generations).await?;
                 r::register_entries(&tx, &current.namespace, s.current.as_ref().map(|c| &c.tree), resolved_tree).await?;
+                r::publish_history(&tx,&current.namespace,&candidate.branch,&r::decode(bytes)?).await?;
                 tx.execute("UPDATE branches SET revision=$3,head=$4 WHERE namespace=$1 AND name=$2",&[&current.namespace,&candidate.branch,&resolved_id.as_str(),&receipt.head.as_str()]).await?;
                 tx.execute("INSERT INTO changes(namespace,branch,head,paths) VALUES($1,$2,$3,$4)",&[&current.namespace,&candidate.branch,&receipt.head.as_str(),paths]).await?;
             }

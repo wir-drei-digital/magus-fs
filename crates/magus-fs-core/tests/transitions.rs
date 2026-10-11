@@ -96,3 +96,22 @@ fn historical_read_requires_present_identity_current_path_and_ancestors() {
         "permission_denied",
     );
 }
+
+#[test]
+fn receipt_parent_policy_does_not_readmit_an_occupied_name() {
+    let mut r = revision();
+    add_file(&mut r, "occupied", b"fresh identity");
+    let a = &config().authorities[0];
+    authorize_tree_parent_write(&r.tree, "occupied", a, &scope()).unwrap();
+    let mut denied = scope();
+    denied.write_prefixes = vec!["elsewhere".into()];
+    err(
+        authorize_tree_parent_write(&r.tree, "occupied", a, &denied),
+        "permission_denied",
+    );
+    r.tree.root.mode = 0o555;
+    err(
+        authorize_tree_parent_write(&r.tree, "occupied", a, &scope()),
+        "permission_denied",
+    );
+}

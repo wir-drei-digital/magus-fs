@@ -210,7 +210,7 @@ pub(crate) async fn create(
             &c.generation, &c.actions, &c.branches, &c.prefixes,
         ];
         let existing = tx.query_opt(
-            "SELECT id FROM views WHERE namespace=$1 AND branch=$2 AND credential=$3 AND principal=$4 AND replica=$5 AND full_revision=$6 AND head=$7 AND projected_revision=$8 AND descriptor=$9 AND credential_generation=$10 AND grant_actions=$11 AND grant_branches=$12 AND grant_prefixes=$13 AND alternative IS NULL ORDER BY id LIMIT 1",
+            "SELECT id FROM views WHERE namespace=$1 AND branch=$2 AND credential=$3 AND principal=$4 AND replica=$5 AND full_revision=$6 AND head=$7 AND projected_revision=$8 AND descriptor=$9 AND credential_generation=$10 AND grant_actions=$11 AND grant_branches=$12 AND grant_prefixes=$13 AND alternative IS NULL AND history IS NULL ORDER BY id LIMIT 1",
             fields,
         ).await?;
         let view = if let Some(row) = existing {

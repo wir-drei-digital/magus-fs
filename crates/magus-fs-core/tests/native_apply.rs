@@ -1445,7 +1445,7 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
             .unwrap()
             == 1
     };
-    assert_eq!(version(), 4);
+    assert_eq!(version(), 5);
     // From version 1: every later table is added in place.
     rusqlite::Connection::open(&db_path)
         .unwrap()
@@ -1457,7 +1457,7 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
     assert_eq!(rep.status().unwrap().head, Some(base.clone()));
     assert!(rep.list_native_recovery(actor()).unwrap().is_empty());
     drop(rep);
-    assert_eq!(version(), 4);
+    assert_eq!(version(), 5);
     assert!(table("native_recovery") && table("native_applied"));
     // From version 2 (recovery tables only): the applied-path table is added in place.
     rusqlite::Connection::open(&db_path)
@@ -1467,7 +1467,7 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
     let rep = Replica::reopen(d.path().join("state")).unwrap();
     assert_eq!(rep.status().unwrap().head, Some(base.clone()));
     drop(rep);
-    assert_eq!(version(), 4);
+    assert_eq!(version(), 5);
     assert!(table("native_applied"));
     // From version 3: sync records may now carry collaboration fields; same tables.
     rusqlite::Connection::open(&db_path)
@@ -1477,11 +1477,23 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
     let rep = Replica::reopen(d.path().join("state")).unwrap();
     assert_eq!(rep.status().unwrap().head, Some(base));
     drop(rep);
-    assert_eq!(version(), 4);
+    assert_eq!(version(), 5);
+    // From version 4: recovery cursor/import roots are added without losing native work.
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE incoming_recovery; DROP TABLE recovery_imports; PRAGMA user_version=4;",
+        )
+        .unwrap();
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    assert_eq!(rep.incoming_recovery().unwrap().cursor, 0);
+    drop(rep);
+    assert_eq!(version(), 5);
+    assert!(table("incoming_recovery") && table("recovery_imports"));
     // A newer schema fails closed.
     rusqlite::Connection::open(&db_path)
         .unwrap()
-        .pragma_update(None, "user_version", 5)
+        .pragma_update(None, "user_version", 6)
         .unwrap();
     err(
         Replica::reopen(d.path().join("state")),
@@ -2210,4 +2222,51 @@ fn unknown_causality_is_inherited_by_unpublished_descendants() {
     assert!(!rep.unknown_causality_since(&view, &view).unwrap());
     // Ancestry before the bound view is already published and does not count.
     assert!(!rep.unknown_causality_since(&later, &later).unwrap());
+}
+
+#[test]
+fn local_checkpoint_baseline_uses_per_object_remote_source_after_restart() {
+    use std::sync::Arc;
+    struct Fetch;
+    impl RemoteFetcher for Fetch {
+        fn fetch(
+            &self,
+            _: &protocol::RemoteSourceId,
+            object: &ObjectId,
+            size: u64,
+            _: std::time::Instant,
+        ) -> Result<Vec<u8>, FsError> {
+            assert_eq!(*object, ObjectId::for_bytes(b"before").unwrap());
+            assert_eq!(size, 6);
+            Ok(b"before".to_vec())
+        }
+    }
+    let (d, rep, _n, base) = fixture();
+    let r = rep.revision(&base).unwrap();
+    import(
+        &rep,
+        &r,
+        ChunkSource::Remote {
+            source: protocol::RemoteSourceId::random().unwrap(),
+        },
+    );
+    // A local checkpoint has no revision-level source. Its immutable unchanged objects
+    // retain their individual remote binding. All fixture mutation happens after owner drop.
+    drop(rep);
+    let db = rusqlite::Connection::open(database(d.path())).unwrap();
+    db.execute(
+        "DELETE FROM revision_sources WHERE revision=?",
+        [base.as_str()],
+    )
+    .unwrap();
+    drop(db);
+    fs::remove_file(
+        d.path()
+            .join("state/objects")
+            .join(ObjectId::for_bytes(b"before").unwrap().as_str()),
+    )
+    .unwrap();
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    rep.set_remote_fetcher(Arc::new(Fetch)).unwrap();
+    rep.verify_native_baseline(actor()).unwrap();
 }

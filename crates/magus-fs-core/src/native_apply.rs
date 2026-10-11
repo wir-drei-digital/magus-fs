@@ -694,28 +694,26 @@ impl Replica {
         source: Option<protocol::RemoteSourceId>,
         hydration: NativeHydration,
     ) -> Result<(), FsError> {
-        let (objects, source, fetcher) = {
+        let (objects, sources, fetcher) = {
             let core = lock(&self.core)?;
-            let source = match source {
-                Some(source) => ChunkSource::Remote { source },
-                None => core
-                    .journal
-                    .db
-                    .query_row(
-                        "SELECT source FROM revision_sources WHERE revision=?",
-                        [revision.as_str()],
-                        |r| r.get::<_, Vec<u8>>(0),
-                    )
-                    .optional()?
-                    .map(|bytes| from_json(&bytes))
-                    .transpose()?
-                    .unwrap_or(ChunkSource::Unavailable),
-            };
-            (
-                crate::cache::closure(&core.revision(revision)?.tree),
-                source,
-                core.remote_fetcher.clone(),
-            )
+            let objects = crate::cache::closure(&core.revision(revision)?.tree);
+            let mut sources = std::collections::BTreeMap::new();
+            for (id, size) in &objects {
+                let selected = if let Some(source) = &source {
+                    ChunkSource::Remote {
+                        source: source.clone(),
+                    }
+                } else if let Some((observed, source)) = core.source(id)? {
+                    if observed != *size {
+                        return Err(FsError::CorruptObject);
+                    }
+                    source
+                } else {
+                    ChunkSource::Unavailable
+                };
+                sources.insert(id.clone(), selected);
+            }
+            (objects, sources, core.remote_fetcher.clone())
         };
         let started = Instant::now();
         for (id, size) in objects {
@@ -733,7 +731,8 @@ impl Replica {
                 }
                 core.reserve(&std::collections::BTreeMap::from([(id.clone(), size)]))?;
             }
-            let bytes = match &source {
+            let selected = sources.get(&id).ok_or(FsError::InvalidSource)?;
+            let bytes = match selected {
                 ChunkSource::Remote { source } => crate::remote_source::fetch(
                     fetcher.as_deref().ok_or(FsError::InvalidSource)?,
                     source,
@@ -741,7 +740,7 @@ impl Replica {
                     size,
                     hydration.fetch_deadline(started, Instant::now()),
                 )?,
-                _ => source.fetch(&id, size, hydration.closure_deadline(started))?,
+                _ => selected.fetch(&id, size, hydration.closure_deadline(started))?,
             };
             if bytes.len() as u64 != size || ObjectId::for_bytes(&bytes)? != id {
                 return Err(FsError::CorruptObject);

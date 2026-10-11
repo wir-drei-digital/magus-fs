@@ -37,6 +37,8 @@ fn args(mut argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
         "sync-drain" => vec!["state", "revision", "level", "deadline-ms"],
         "sync-integrate" => vec!["state", "revision", "expected-head"],
         "sync-recovery-list" => vec!["state"],
+        "sync-recovery-import" => vec!["state", "archive", "operation-id"],
+        "sync-recovery-compare" => vec!["state", "archive"],
         "sync-recovery-capture" => vec!["state", "id", "digest", "operation-id"],
         "sync-recovery-export" => vec!["state", "id", "digest", "destination"],
         "sync-recovery-release" => vec!["state", "operation-id"],
@@ -738,8 +740,22 @@ fn recovery_control(
     let digest = || ObjectId::parse(required(options, "digest")?).map_err(|e| (2, e));
     match action {
         "list" => Ok(
-            json!({"ok":true,"records":rep.list_native_recovery(actor).map_err(|e|(1,e))?,"limit":MAX_RECOVERY_LISTING}),
+            json!({"ok":true,"records":rep.list_native_recovery(actor.clone()).map_err(|e|(1,e))?,"imports":rep.list_recovery_imports(actor).map_err(|e|(1,e))?,"limit":MAX_RECOVERY_LISTING}),
         ),
+        "import" => {
+            let archive = absolute(required(options, "archive")?)?;
+            let result = rep
+                .import_recovery_archive(archive, operation(options)?, actor)
+                .map_err(|e| (1, e))?;
+            Ok(json!({"ok":true,"recovery":result}))
+        }
+        "compare" => {
+            let archive = absolute(required(options, "archive")?)?;
+            let changes = rep
+                .compare_recovery_archive(archive, actor)
+                .map_err(|e| (1, e))?;
+            Ok(json!({"ok":true,"changed_paths":changes,"published":false}))
+        }
         "capture" => {
             let revision = rep
                 .capture_native_recovery(id()?, digest()?, operation(options)?, actor)

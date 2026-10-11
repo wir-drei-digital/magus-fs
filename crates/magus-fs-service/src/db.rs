@@ -85,6 +85,7 @@ impl Database {
                                 include_str!("../migrations/002_revisions.sql"),
                                 include_str!("../migrations/003_view_reuse.sql"),
                                 include_str!("../migrations/004_collaboration.sql"),
+                                include_str!("../migrations/005_recovery.sql"),
                             ]
                             .concat(),
                         )

@@ -237,10 +237,28 @@ class OwnedInfra:
         assert len(self.expected_volumes)==1
         self.write_json('persistent-volumes-before-restart.json',state)
 
+    def isolate_service_control(self):
+        """Opt-in for owned recovery fixtures: bind staging ownership may change after
+        host writes. Production private-file checks remain strict on guest-owned copies."""
+        self.service_control='/fs2-owned-control';self.service_config=self.service_control+'/service.json'
+        self.docker('exec',self.service,'python3','-c',"import os;os.mkdir('/fs2-owned-control',0o700)")
+        for name in ['service.json','server.crt','server.key']:self.copy_service_control(name)
+        script="import os,json,hashlib;root='/fs2-owned-control';out={'root':root,'uid':os.stat(root).st_uid,'mode':oct(os.stat(root).st_mode&0o777),'files':{}}\nfor n in ['service.json','server.crt','server.key']:\n p=root+'/'+n;s=os.stat(p);out['files'][n]={'uid':s.st_uid,'mode':oct(s.st_mode&0o777),'links':s.st_nlink,'sha256':hashlib.sha256(open(p,'rb').read()).hexdigest()}\nprint(json.dumps(out))"
+        info=json.loads(self.docker('exec',self.service,'python3','-c',script,evidence=False).stdout)
+        assert info['uid']==0 and info['mode']=='0o700' and all(v['uid']==0 and v['mode']=='0o600' and v['links']==1 for v in info['files'].values())
+        self.write_json('service-control-ownership.json',{'container':self.service,'container_id':self.inspect('container',self.service)['Id'],'control':info,'host_staging':str(self.control),'reason':'strict private-file ownership on guest-owned configuration, no weakened validator'})
+
+    def copy_service_control(self, name):
+        if not hasattr(self,'service_control'):return '/control/'+name
+        assert name and '/' not in name and name not in ('.','..')
+        script="import os,stat,json,sys;name=sys.argv[1];fd=os.open('/control/'+name,os.O_RDONLY|os.O_NOFOLLOW);s=os.fstat(fd);assert stat.S_ISREG(s.st_mode) and s.st_nlink==1 and s.st_size<=1048576\nwith os.fdopen(fd,'rb') as f:body=f.read()\nif name=='service.json':\n config=json.loads(body);config['tls_cert']='/fs2-owned-control/server.crt';config['tls_key']='/fs2-owned-control/server.key';body=json.dumps(config).encode()\nfd=os.open('/fs2-owned-control/'+name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)\nwith os.fdopen(fd,'wb') as f:f.write(body);f.flush();os.fsync(f.fileno())"
+        self.docker('exec',self.service,'python3','-c',script,name,evidence=False)
+        return self.service_control+'/'+name
+
     def provision(self, records):
         name='provision-'+secrets.token_hex(4)+'.json'
         self.private(name,records)
-        return self.docker('exec',self.service,'magus-fs-service','provision','/control/service.json','/control/'+name)
+        return self.docker('exec',self.service,'magus-fs-service','provision',getattr(self,'service_config','/control/service.json'),self.copy_service_control(name))
 
     def start_service(self, faults=False):
         deadline=time.monotonic()+30
@@ -251,7 +269,8 @@ class OwnedInfra:
         else:
             raise RuntimeError('PG restart readiness timeout')
         binary='magus-fs-service-faults' if faults else 'magus-fs-service'
-        self.docker('exec','-d','-e','HTTP_PROXY=http://127.0.0.1:1','-e','HTTPS_PROXY=http://127.0.0.1:1','-e','ALL_PROXY=http://127.0.0.1:1',self.service,'sh','-c','echo $$ > /tmp/service.pid; exec '+binary+' serve /control/service.json > /tmp/service.log 2>&1')
+        config=getattr(self,'service_config','/control/service.json')
+        self.docker('exec','-d','-e','HTTP_PROXY=http://127.0.0.1:1','-e','HTTPS_PROXY=http://127.0.0.1:1','-e','ALL_PROXY=http://127.0.0.1:1',self.service,'sh','-c','echo $$ > /tmp/service.pid; exec '+binary+' serve '+config+' > /tmp/service.log 2>&1')
         port=self.docker('port',self.service,'8443/tcp').stdout.strip().split(':')[-1]
         self.port=int(port)
 

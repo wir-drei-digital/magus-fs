@@ -199,7 +199,7 @@ impl Core {
         self.working = Some(next);
         Ok(())
     }
-    fn source(&self, id: &ObjectId) -> Result<Option<(u64, ChunkSource)>, FsError> {
+    pub(crate) fn source(&self, id: &ObjectId) -> Result<Option<(u64, ChunkSource)>, FsError> {
         let value = self
             .journal
             .db

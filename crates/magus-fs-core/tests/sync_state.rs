@@ -925,3 +925,26 @@ fn shared_resolution_links_resolved_candidates_and_never_blocks_application() {
     );
     assert_eq!(rep.mark_resolved(&r.operation).unwrap(), vec![]);
 }
+
+#[test]
+fn incoming_cursor_and_safe_diagnostics_survive_owner_restart() {
+    let (d, rep, w, _) = setup();
+    drop(w);
+    rep.record_incoming_recovery(IncomingRecovery {
+        cursor: 42,
+        needs_snapshot: true,
+        discovery_error: Some("https://private.invalid/secret?token=hidden".into()),
+        acknowledgement_error: Some("stale_handle".into()),
+    })
+    .unwrap();
+    drop(rep);
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    let state = rep.sync_status().unwrap().incoming;
+    assert_eq!(state.cursor, 42);
+    assert!(state.needs_snapshot);
+    assert_eq!(state.discovery_error.as_deref(), Some("invalid_response"));
+    assert_eq!(state.acknowledgement_error.as_deref(), Some("stale_handle"));
+    assert!(!serde_json::to_string(&state)
+        .unwrap()
+        .contains("private.invalid"));
+}

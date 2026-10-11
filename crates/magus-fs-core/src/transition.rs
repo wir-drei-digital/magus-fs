@@ -62,6 +62,19 @@ pub fn authorize_tree_read(tree: &Tree, id: &EntryId, a: &Authority) -> Result<E
     )?;
     Ok(e)
 }
+/// Checks current destination-parent traversal/write policy without admitting a new name
+/// or identity. Immutable operation recovery can use this after its effect was committed.
+pub fn authorize_tree_parent_write(
+    tree: &Tree,
+    path: &str,
+    a: &Authority,
+    scope: &TransitionScope,
+) -> Result<(), FsError> {
+    p::mutation(scope.read_only)?;
+    scoped(path, &scope.write_prefixes)?;
+    p::parent_write(tree, path, a)?;
+    Ok(())
+}
 /// Validates a complete transition; callers overlay projected edits on the full
 /// base first. Existing permissions are always taken from the trusted base.
 pub fn authorize_tree_transition(
