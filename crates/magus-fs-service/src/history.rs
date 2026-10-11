@@ -21,6 +21,64 @@ fn readable_scaffold(s: &r::Snapshot, e: &Entry) -> bool {
             && s.context.prefixes.iter().any(|p| auth::within(p, &e.path)))
 }
 
+fn parent_path(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+/// Retained access follows the historical scoped path, not a relocated ancestor ID.
+/// Missing directory prefixes use the nearest existing enclosing directory. A present
+/// denied/non-directory component is authoritative and may never be skipped.
+fn historical_directory(s: &r::Snapshot, path: &str) -> Result<Entry> {
+    let current = s.current.as_ref().ok_or(Error::not_found())?;
+    let mut enclosing = path;
+    loop {
+        if enclosing.is_empty() {
+            return authorize_tree_read(&current.tree, &current.tree.root.id, s.authority()?)
+                .map_err(core_error);
+        }
+        if let Some(e) = current.tree.entries.iter().find(|e| e.path == enclosing) {
+            if e.content != EntryContent::Directory || !readable_scaffold(s, e) {
+                return Err(Error::not_found());
+            }
+            return authorize_tree_read(&current.tree, &e.id, s.authority()?).map_err(core_error);
+        }
+        enclosing = parent_path(enclosing);
+    }
+}
+
+fn historical_parent_write(s: &r::Snapshot, path: &str) -> Result<()> {
+    if !s.context.permits("write", &s.branch, path) {
+        return Err(Error::not_found());
+    }
+    let enclosing = historical_directory(s, parent_path(path))?;
+    // Original scope was checked above. This pure permission probe uses the current
+    // enclosing directory without admitting a name or inventing missing directories.
+    let leaf = path.rsplit('/').next().ok_or(Error::not_found())?;
+    let policy_path = if enclosing.path.is_empty() {
+        leaf.to_owned()
+    } else {
+        format!("{}/{}", enclosing.path, leaf)
+    };
+    let mut scope = s.scope();
+    scope.write_prefixes = vec!["".into()];
+    authorize_tree_parent_write(
+        &s.current.as_ref().ok_or(Error::not_found())?.tree,
+        &policy_path,
+        s.authority()?,
+        &scope,
+    )
+    .map_err(core_error)
+}
+
+fn restore_parent(s: &r::Snapshot, path: &str) -> Result<EntryId> {
+    let parent = parent_path(path);
+    let current = historical_directory(s, parent)?;
+    if current.path != parent {
+        return Err(Error::not_found());
+    }
+    Ok(current.id)
+}
+
 /// Current metadata and complete current ancestor permissions govern extant identities.
 /// Deleted/moved-out identities require explicit retained-history administration and a
 /// presently readable destination parent. A selected view exposes only its ancestor chain.
@@ -51,6 +109,7 @@ pub(crate) fn projection(s: &r::Snapshot, source: &Revision, entry: &EntryId) ->
         s.context.action("admin")?;
         s.context.action("retained_history")?;
     }
+    historical_directory(s, parent_path(&old.path))?;
     let by_id = source
         .tree
         .entries
@@ -65,13 +124,7 @@ pub(crate) fn projection(s: &r::Snapshot, source: &Revision, entry: &EntryId) ->
             return Err(Error::backend());
         }
         let e = by_id.get(parent).ok_or(Error::not_found())?;
-        let present = current
-            .tree
-            .entries
-            .iter()
-            .find(|n| n.id == e.id && readable_scaffold(s, n))
-            .ok_or(Error::not_found())?;
-        authorize_tree_read(&current.tree, &present.id, a).map_err(core_error)?;
+        historical_directory(s, &e.path)?;
         chain.push((*e).clone());
         parent = &e.parent;
     }
@@ -83,12 +136,14 @@ pub(crate) fn projection(s: &r::Snapshot, source: &Revision, entry: &EntryId) ->
     result.coverage = vec!["".into()];
     result.tree.root = current.tree.root.clone();
     for e in &mut chain {
-        if let Some(n) = current
-            .tree
-            .entries
-            .iter()
-            .find(|n| n.id == e.id && readable_scaffold(s, n))
-        {
+        let now = current.tree.entries.iter().find(|n| {
+            if e.content == EntryContent::Directory {
+                n.path == e.path && n.content == EntryContent::Directory && readable_scaffold(s, n)
+            } else {
+                n.id == e.id && s.context.permits("read", &s.branch, &n.path)
+            }
+        });
+        if let Some(n) = now {
             e.owner = n.owner.clone();
             e.group = n.group.clone();
             e.mode = n.mode;
@@ -276,8 +331,7 @@ pub(crate) async fn replay(
     } else {
         // Recover the immutable result after current policy checks. A fresh occupant
         // at the old name cannot turn lookup/replay into another create admission.
-        authorize_tree_parent_write(&current.tree, &restored.path, s.authority()?, &s.scope())
-            .map_err(core_error)?;
+        historical_parent_write(&s, &restored.path)?;
     }
     r::final_read(&state.db, &s).await
 }
@@ -357,6 +411,7 @@ pub(crate) async fn restore(
         }
         let mut entry = original.clone();
         entry.id = EntryId::random().map_err(core_error)?;
+        entry.parent = restore_parent(&s, &entry.path)?;
         entry.owner = s.authority()?.principal.clone();
         entry.group = s.authority()?.primary_group.clone();
         entry.mode = 0o644;
@@ -408,8 +463,7 @@ use axum::response::IntoResponse;
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn file_scope_history_keeps_authorized_ancestor_scaffolding() {
+    fn fixture() -> (r::Snapshot, Revision, EntryId) {
         let p = PrincipalId::random().unwrap();
         let g = GroupId::random().unwrap();
         let root = Root {
@@ -486,7 +540,12 @@ mod tests {
             head: Some("1".repeat(32)),
             view: None,
         };
-        let projected = projection(&s, &revision, &file.id).unwrap();
+        (s, revision, file.id)
+    }
+    #[test]
+    fn file_scope_history_keeps_authorized_ancestor_scaffolding() {
+        let (s, revision, file) = fixture();
+        let projected = projection(&s, &revision, &file).unwrap();
         assert_eq!(
             projected
                 .tree
@@ -495,6 +554,65 @@ mod tests {
                 .map(|e| e.path.as_str())
                 .collect::<Vec<_>>(),
             vec!["reports", "reports/live"]
+        );
+    }
+    #[test]
+    fn retained_history_uses_current_historical_path_and_enclosing_policy() {
+        let (mut s, source, file) = fixture();
+        s.context
+            .actions
+            .extend(["admin".into(), "retained_history".into()]);
+        s.context.prefixes = vec!["".into()];
+        let mut relocated = source.tree.entries[0].clone();
+        relocated.path = "archive".into();
+        relocated.mode = 0o777;
+        let mut replacement = source.tree.entries[0].clone();
+        replacement.id = EntryId::random().unwrap();
+        replacement.mode = 0;
+        s.current.as_mut().unwrap().tree.entries = vec![relocated, replacement.clone()];
+        assert_eq!(
+            projection(&s, &source, &file).unwrap_err().code,
+            "not_found"
+        );
+        s.current.as_mut().unwrap().tree.entries[1].mode = 0o700;
+        let permitted = projection(&s, &source, &file).unwrap();
+        assert_eq!(permitted.tree.entries[0].mode, 0o700);
+        assert_eq!(restore_parent(&s, "reports/live").unwrap(), replacement.id);
+        s.current.as_mut().unwrap().tree.entries.pop();
+        assert!(projection(&s, &source, &file).is_ok());
+        s.context.actions.push("write".into());
+        s.context.prefixes = vec!["reports/live".into()];
+        historical_parent_write(&s, "reports/live").unwrap();
+        s.current.as_mut().unwrap().tree.root.mode = 0o555;
+        assert_eq!(
+            historical_parent_write(&s, "reports/live")
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
+        s.current.as_mut().unwrap().tree.root.mode = 0o700;
+        s.context.actions.retain(|action| action != "write");
+        assert_eq!(
+            historical_parent_write(&s, "reports/live")
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
+        assert_eq!(
+            restore_parent(&s, "reports/live").unwrap_err().code,
+            "not_found"
+        );
+        s.current.as_mut().unwrap().tree.root.mode = 0;
+        assert_eq!(
+            projection(&s, &source, &file).unwrap_err().code,
+            "not_found"
+        );
+        s.current.as_mut().unwrap().tree.root.mode = 0o700;
+        replacement.content = source.tree.entries[1].content.clone();
+        s.current.as_mut().unwrap().tree.entries.push(replacement);
+        assert_eq!(
+            projection(&s, &source, &file).unwrap_err().code,
+            "not_found"
         );
     }
 }

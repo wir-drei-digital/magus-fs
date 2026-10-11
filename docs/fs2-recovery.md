@@ -32,7 +32,10 @@ Authenticated history uses `GET /history?view=VIEW&cursor=TOKEN` and
 opaque continuation. Only entries of actually published shared revisions appear; a private
 merge parent is never a history grant. Every list/pin/content read checks current read/history,
 current ancestor permissions and historical/current path scope. Deleted or moved-out entries
-require all of `history`, `admin`, `retained_history` and a currently readable scoped parent.
+require all of `history`, `admin`, `retained_history` and currently readable parent policy at
+the historical scoped path. A relocated historical parent identity cannot substitute for a
+current replacement directory. Missing prefixes use their reachable current enclosing
+directory/root; present unreadable or non-directory prefixes remain denied.
 A former reader cannot use an old history selector to reopen deleted content. Exact-file
 grants retain only required directory scaffolding, with current ancestor permissions.
 
@@ -45,7 +48,8 @@ are rechecked at commit. The immutable restoration sidecar records the full hist
 ordinary current projections retain canonical standalone `parents: []` and omit historical
 lineage. Reading restored current content does not require history permission. Exact committed
 restore replay/lookup recovers the immutable receipt after current authorization checks,
-including parent write policy for a deleted destination; a fresh occupant at the same name
+including current enclosing-parent write policy for a deleted destination with absent
+prefixes; new restore still needs an actual exact destination parent. A fresh occupant at the same name
 does not readmit the old effect. New restore operations still reject name/identity collisions.
 
 Trusted local storage collection is configuration-bound, never a client endpoint:

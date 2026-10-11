@@ -13,6 +13,9 @@ class Recovery(Reconciliation):
     CASES = ['history', 'storage', 'reconnect', 'offline']
     def __init__(self, i, image, platforms, cases):
         super().__init__(i, image, platforms, ['recovery']);self.cases = cases
+    def candidate(self, view, r, actor='worker', bodies=(), drop=False):
+        if actor=='alice':r['principal']=ALICE
+        return super().candidate(view,r,actor,bodies,drop)
     def run(self):
         self.i.start_service();self.wait()
         authority={'principal':ALICE,'uid':1001,'gid':1001,'primary_group':GROUP,'groups':[GROUP],'dac_override':False,'ownership_transfer':False}
@@ -120,7 +123,75 @@ class Recovery(Reconciliation):
         self.publish_tree(many,label='history-pages');pv,_=self.view();pg=self.history(pv);assert len(pg['items'])<=32 and pg['next'] and len(json.dumps(pg).encode())<=65536
         pg2=self.history(pv,cursor=pg['next']);assert len(pg2['items'])<=32
         scoped_view,_=self.view('reader');self.expect('history-cursor-no-history','GET',self.root+'/history?view='+scoped_view['view']+'&cursor='+pg['next'],404,{'code':'not_found'},actor='reader')
+        self.historical_path_policy(old)
         self.record('service','history-restore',new_revision=True,current_metadata=True,fresh_deleted_identity=True,hidden_sibling_untouched=True,no_projected_lineage=True,former_reader_denied=True,current_parent_denied=True,exact_replay_cardinality=True)
+    def historical_path_policy(self, alice_source):
+        guest='principal:'+'d'*32;replica=identity('replica');self.tokens['path-admin']=secrets.token_hex(32)
+        self.i.provision([{'namespace':NS,'principal':guest,'replica':replica,'token':self.tokens['path-admin'],'expires':int(time.time())+1800,'actions':['read','write','history','admin','retained_history'],'branches':['main'],'prefixes':[''],'authority':{'principal':guest,'uid':1002,'gid':1001,'primary_group':GROUP,'groups':[GROUP],'dac_override':False,'ownership_transfer':False}}])
+        fresh=self.tree()[1]['reports/live']['id'];gv,_=self.view('path-admin');page=self.history(gv,'path-admin')
+        while not any(x['entry']==fresh for x in page['items']):
+            assert page['next'];page=self.history(gv,'path-admin',page['next'])
+        source=next(x['id'] for x in page['items'] if x['entry']==fresh)
+        self.publish_tree(lambda t:t['entries'].__setitem__(slice(None),[e for e in t['entries'] if e['id']!=fresh]),label='path-policy-delete')
+        pinned=self.expect('path-policy-retained-pin','POST',self.root+'/history/'+source+'/view',200,actor='path-admin',body={})
+        replacement=identity('entry')
+        def move_parent(t):
+            for e in t['entries']:
+                if e['path']=='reports':e['path']='archive';e['mode']=0o777
+                elif e['path'].startswith('reports/'):e['path']='archive/'+e['path'][8:]
+            t['entries'].append({'path':'reports','id':replacement,'parent':t['root']['id'],'owner':ALICE,'group':GROUP,'mode':0o700,'content':{'kind':'directory'}})
+        self.publish_tree(move_parent,label='path-policy-move-parent-replace')
+        self.expect('path-policy-retained-pin-denied','POST',self.root+'/history/'+source+'/view',404,{'code':'not_found'},actor='path-admin',body={})
+        self.expect('path-policy-issued-pin-denied','GET',self.root+'/views/'+pinned['view']+'/descriptor',404,{'code':'not_found'},actor='path-admin')
+        assert self.bytes_request(self.root+'/views/'+pinned['view']+'/objects/'+object_id(b'old content'),'path-admin')[0]==404
+        current,_=self.view('path-admin');page=self.history(current,'path-admin');items=page['items'][:]
+        while page['next']:page=self.history(current,'path-admin',page['next']);items+=page['items']
+        assert all(x['id']!=source for x in items)
+        request={'operation':identity('operation'),'replica':replica,'history':source,'expected_head':self.head(),'restore_metadata':False}
+        self.expect('path-policy-restore-denied','POST',self.root+'/restores',404,{'code':'not_found'},actor='path-admin',body=request)
+        self.publish_tree(lambda t:next(e for e in t['entries'] if e['path']=='reports').update(mode=0o755),label='path-policy-permit-read')
+        self.expect('path-policy-issued-pin-recovered','GET',self.root+'/views/'+pinned['view']+'/descriptor',200,actor='path-admin')
+        readable=self.expect('path-policy-retained-pin-recovered','POST',self.root+'/history/'+source+'/view',200,actor='path-admin',body={})
+        code,raw=self.bytes_request(self.root+'/views/'+readable['view']+'/descriptor','path-admin');assert code==200 and 'archive' not in raw.decode()
+        desc=json.loads(raw);parent=next(e for e in desc['tree']['entries'] if e['path']=='reports');assert parent['mode']==0o755
+        assert self.body(readable,next(e for e in desc['tree']['entries'] if e['path']=='reports/live'),'path-admin')==b'old content'
+        self.publish_tree(lambda t:next(e for e in t['entries'] if e['path']=='reports').update(mode=0o775),label='path-policy-permit-write')
+        request.update(expected_head=self.head());receipt=self.expect('path-policy-restore-rebound','POST',self.root+'/restores',200,actor='path-admin',body=request)
+        v,f,_=self.tree();assert f['reports/live']['parent']==replacement and f['reports/live']['id']!=fresh and self.body(v,f['reports/live'])==b'old content'
+        self.publish_tree(lambda t:next(e for e in t['entries'] if e['path']=='reports').update(mode=0o700),label='path-policy-deny-replay')
+        self.expect('path-policy-replay-denied','POST',self.root+'/restores',404,{'code':'not_found'},actor='path-admin',body=request)
+        self.expect('path-policy-lookup-denied','GET',self.op_path(request),404,{'code':'not_found'},actor='path-admin')
+        self.publish_tree(lambda t:next(e for e in t['entries'] if e['path']=='reports').update(mode=0o775),label='path-policy-permit-replay')
+        count=self.sql('SELECT count(*) FROM changes;');self.expect('path-policy-replay-recovered','POST',self.root+'/restores',200,receipt,actor='path-admin',body=request);assert count==self.sql('SELECT count(*) FROM changes;')
+        # Missing prefixes use current enclosing root policy for read/export, while
+        # a new restore still requires an actual destination parent.
+        self.publish_tree(lambda t:t['entries'].__setitem__(slice(None),[e for e in t['entries'] if e['path']!='reports' and not e['path'].startswith('reports/')]),label='path-policy-parent-absent')
+        self.publish_tree(lambda t:t['root'].update(mode=0o775),label='path-policy-enclosing-root-write-permitted')
+        missing=self.expect('path-policy-absent-parent-read','POST',self.root+'/history/'+source+'/view',200,actor='path-admin',body={})
+        self.expect('path-policy-absent-parent-restore','POST',self.root+'/restores',404,{'code':'not_found'},actor='path-admin',body={**request,'operation':identity('operation'),'expected_head':self.head()})
+        count=self.sql('SELECT count(*) FROM changes;')
+        self.expect('path-policy-absent-parent-replay','POST',self.root+'/restores',200,receipt,actor='path-admin',body=request)
+        self.expect('path-policy-absent-parent-lookup','GET',self.op_path(request),200,receipt,actor='path-admin');assert count==self.sql('SELECT count(*) FROM changes;')
+        self.publish_tree(lambda t:t['root'].update(mode=0o555),label='path-policy-enclosing-root-write-denied')
+        self.expect('path-policy-absent-parent-replay-write-denied','POST',self.root+'/restores',404,{'code':'not_found'},actor='path-admin',body=request)
+        self.expect('path-policy-absent-parent-lookup-write-denied','GET',self.op_path(request),404,{'code':'not_found'},actor='path-admin')
+        self.publish_tree(lambda t:t['root'].update(mode=0o775),label='path-policy-enclosing-root-write-permitted')
+        self.publish_tree(lambda t:t['root'].update(mode=0o700),label='path-policy-enclosing-root-denied')
+        self.expect('path-policy-absent-parent-root-denied','POST',self.root+'/history/'+source+'/view',404,{'code':'not_found'},actor='path-admin',body={})
+        self.expect('path-policy-absent-issued-pin-root-denied','GET',self.root+'/views/'+missing['view']+'/descriptor',404,{'code':'not_found'},actor='path-admin')
+        self.publish_tree(lambda t:t['root'].update(mode=0o755),label='path-policy-enclosing-root-permitted')
+        self.publish_tree(lambda t:t['entries'].append(file_entry('reports',t['root']['id'],b'path blocker')),[b'path blocker'],label='path-policy-parent-nondirectory')
+        self.expect('path-policy-nondirectory-denied','POST',self.root+'/history/'+source+'/view',404,{'code':'not_found'},actor='path-admin',body={})
+        credential=self.sql("SELECT id FROM credentials WHERE token_hash='"+hashlib.sha256(self.tokens['path-admin'].encode()).hexdigest()+"';")
+        self.expect('path-policy-revoke','POST',self.root+'/grants',200,actor='path-admin',body={'revoke':credential})
+        self.expect('path-policy-revoked-replay','POST',self.root+'/restores',401,{'code':'invalid_credential'},actor='path-admin',body=request)
+        self.expect('path-policy-revoked-lookup','GET',self.op_path(request),401,{'code':'invalid_credential'},actor='path-admin')
+        def normal_parent(t):
+            t['entries']=[e for e in t['entries'] if e['path']!='reports'];t['entries'].append({'path':'reports','id':identity('entry'),'parent':t['root']['id'],'owner':ALICE,'group':GROUP,'mode':0o755,'content':{'kind':'directory'}})
+        self.publish_tree(normal_parent,label='path-policy-normal-parent')
+        self.expect('path-policy-normal-restore','POST',self.root+'/restores',200,body={'operation':identity('operation'),'replica':REPLICA,'history':alice_source['id'],'expected_head':self.head(),'restore_metadata':False})
+        v,f,_=self.tree();assert self.body(v,f['secret/private'])==b'hidden content' and self.body(v,f['reports/live'])==b'old content' and f['reports/live']['owner']==ALICE
+        self.record('service','historical-path-parent-authority',replacement_parent_denied=True,issued_pin_rechecked=True,restored_parent_rebound=True,immutable_replay_current_policy=True,absent_prefix_enclosing_root=True,nondirectory_denied=True,hidden_sibling_unchanged=True)
     def cleanup(self):
         if getattr(self,'mounted',None):self.mounted.cleanup()
         super().cleanup()
@@ -160,8 +231,24 @@ class Recovery(Reconciliation):
         self.i.docker('exec','-d',self.i.service,'sh','-c',"echo $$ > /tmp/gc-owned.pid; exec magus-fs-service-faults gc "+self.i.service_config+" --namespace "+NS+" --plan "+interrupted+" > /tmp/gc-owned.log 2>&1")
         self.until(lambda:self.i.docker('exec',self.i.service,'test','-f','/tmp/fs2-gc-barrier',check=False,evidence=False).returncode==0,10)
         assert self.sql("SELECT state FROM objects WHERE object_id='"+obj2+"';")=='deleting'
+        old_generation=self.sql("SELECT generation FROM objects WHERE object_id='"+obj2+"';")
+        v,r=self.view();parent=next(e['id'] for e in r['tree']['entries'] if e['path']=='reports');r['tree']['entries'].append(file_entry('reports/gc-contested',parent,partial));r['tree']['entries'].sort(key=lambda e:e['path']);r['parents']=[v['revision']];r['operation']=identity('operation');r['replica']=REPLICA
+        competing_upload,competing_revision=self.stage(r,'alice',[])
+        competing={'operation':r['operation'],'replica':REPLICA,'original_view':v['view'],'original_head':v['head'],'revision':competing_revision,'upload':competing_upload}
+        def admission_state():
+            return {'head':self.head(),'operations':self.sql('SELECT count(*) FROM operations;'),'references':self.sql('SELECT count(*) FROM revision_objects;'),'sessions':self.sql("SELECT count(*) FROM session_objects WHERE object_id='"+obj2+"';"),'generation':self.sql("SELECT generation FROM objects WHERE object_id='"+obj2+"';")}
+        marked_state=admission_state()
+        self.expect('gc-marked-upload-denied','PUT',self.root+'/uploads/'+competing_upload+'/objects/'+obj2,409,{'code':'conflict'},raw=partial)
+        self.expect('gc-marked-reference-denied','POST',self.root+'/candidates',404,{'code':'not_found'},body=competing)
+        assert admission_state()==marked_state and self.sql("SELECT state FROM objects WHERE object_id='"+obj2+"';")=='deleting'
         self.i.docker('exec',self.i.service,'python3','-c',"import os,signal;p=int(open('/tmp/gc-owned.pid').read());assert os.readlink('/proc/%d/exe'%p).endswith('magus-fs-service-faults');os.kill(p,signal.SIGKILL)")
         (self.i.control/'pause-gc').unlink();assert obj2 in self.gc(interrupted)['deleted']
+        later_request,later_private=self.candidate(v,r,'alice',[partial]);fresh_generation=self.sql("SELECT generation FROM objects WHERE object_id='"+obj2+"';");assert fresh_generation!=old_generation
+        later_integration=self.integrate_request(later_private,v);later_shared=self.expect('gc-fresh-generation-publish','POST',self.root+'/integrations',200,body=later_integration)
+        current,entries,_=self.tree();assert self.body(current,entries['reports/gc-contested'])==partial
+        assert self.sql("SELECT count(*) FROM revision_objects ro JOIN objects o ON o.namespace=ro.namespace AND o.object_id=ro.object_id AND o.generation=ro.generation WHERE ro.namespace='"+NS+"' AND o.state!='ready';")=='0'
+        self.expect('gc-fresh-private-reconstructable','GET',self.op_path(later_request),200,later_private);self.expect('gc-fresh-shared-reconstructable','GET',self.op_path(later_integration),200,later_shared)
+        self.record('service','gc-mark-before-admission',marked_state=marked_state,old_generation=old_generation,fresh_generation=fresh_generation,upload_denied=True,reference_denied=True,cardinality_unchanged=True,shared_receipt=later_shared,verified_body_hash=obj2)
         self.i.snapshot_volumes()
         for container in [self.i.pg,self.i.s3]:
             self.i.docker('kill','--signal','KILL',container);self.i.docker('start',container)
@@ -188,7 +275,7 @@ class Recovery(Reconciliation):
         assert self.bytes_request(self.root+'/views/'+v['view']+'/objects/'+target)[0]==404
         self.i.docker('exec',self.i.service,'python3','-c',"import os,signal;p=int(open('/tmp/repair-owned.pid').read());assert os.readlink('/proc/%d/exe'%p).endswith('magus-fs-service-faults');os.kill(p,signal.SIGKILL)")
         (self.i.control/'pause-repair').unlink()
-        repaired=self.i.docker('exec',self.i.service,'magus-fs-service','repair' ,'/control/service.json','--namespace',NS,'--object',target,'--source',self.i.service_control+'/repair-body')
+        repaired=self.i.docker('exec',self.i.service,'magus-fs-service','repair' ,self.i.service_config,'--namespace',NS,'--object',target,'--source',self.i.service_control+'/repair-body')
         assert json.loads(repaired.stdout)['repaired'] and json.loads(repaired.stdout)['generation']==proposed;assert self.body(v,f['reports/live'])==original
         assert immutable==self.sql("SELECT string_agg(revision||':'||encode(descriptor,'hex'),',' ORDER BY revision) FROM revisions WHERE namespace='"+NS+"';") and receipts==self.sql("SELECT string_agg(operation||':'||digest||':'||result,',' ORDER BY operation) FROM operations WHERE namespace='"+NS+"';")
         assert self.sql("SELECT count(*) FROM quarantined_generations WHERE object_id='"+target+"';")=='1'
