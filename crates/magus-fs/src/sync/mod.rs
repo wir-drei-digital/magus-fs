@@ -7,3 +7,6 @@ mod live;
 pub(crate) use live::{subscribe, Incoming};
 
 pub(crate) mod watch;
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod mounted;

@@ -61,11 +61,11 @@ class Mac(Endpoint):
         return marker
 
 class Lazy(LiveJourney):
-    def __init__(self,j):
+    def __init__(self,j,suffix='lazy'):
         # Reuse real FUSE lifecycle/helpers without re-provisioning a second authority.
         self.commands=[]
         self.i=j.i;self.image=j.image;self.tokens=j.tokens;self.mounts=[];self.holders=[];self.evidence={};self.owner=j
-        self.daemon=self.i.create('container','lazy',['--network',self.i.ingress,'--cap-drop','ALL','--cap-add','SYS_ADMIN','--cap-add','DAC_OVERRIDE','--cap-add','SYS_CHROOT','--security-opt','apparmor=unconfined','--security-opt','no-new-privileges','--device','/dev/fuse','--memory','512m','--cpus','2','--pids-limit','256','--tmpfs','/private:rw,nosuid,nodev,mode=700,size=256m','--tmpfs','/shared:rw,nosuid,nodev,mode=755,size=16m',self.image,'python3','-c',"import os,signal,time\ndef reap(*a):\n while True:\n  try:p,s=os.waitpid(-1,os.WNOHANG)\n  except ChildProcessError:return\n  if p==0:return\nsignal.signal(signal.SIGCHLD,reap)\nwhile True:time.sleep(.2)"])
+        self.daemon=self.i.create('container',suffix,['--network',self.i.ingress,'--cap-drop','ALL','--cap-add','SYS_ADMIN','--cap-add','DAC_OVERRIDE','--cap-add','SYS_CHROOT','--security-opt','apparmor=unconfined','--security-opt','no-new-privileges','--device','/dev/fuse','--memory','512m','--cpus','2','--pids-limit','256','--tmpfs','/private:rw,nosuid,nodev,mode=700,size=256m','--tmpfs','/shared:rw,nosuid,nodev,mode=755,size=16m',self.image,'python3','-c',"import os,signal,time\ndef reap(*a):\n while True:\n  try:p,s=os.waitpid(-1,os.WNOHANG)\n  except ChildProcessError:return\n  if p==0:return\nsignal.signal(signal.SIGCHLD,reap)\nwhile True:time.sleep(.2)"])
         self.i.docker('start',self.daemon)
     def execute(self,code,settings=None,user='0:0',check=True):
         started=time.monotonic();record={'python':code,'settings':public_settings(settings),'user':user,'started_monotonic':started}
@@ -74,8 +74,8 @@ class Lazy(LiveJourney):
             result=super().execute(code,settings,user,check);record.update(result=result,seconds=time.monotonic()-started);return result
         except Exception as error:record.update(error=str(error),seconds=time.monotonic()-started);raise
         finally:self.i.write_json('linux-native-commands.json',self.commands)
-    def start(self,name,readonly=False,publication='shared-live',actor='alice',drop=False,lookup_barrier=False):
-        settings={'name':name,'namespace':NS,'replica':WORKER if actor=='worker' else REPLICA if actor=='alice' else 'replica:'+f'{3:032x}','principal':ALICE,'group':GROUP,'token':self.tokens[actor],'ca':(self.i.control/'ca.crt').read_text(),'readonly':readonly,'publication':publication,'drop':drop,'lookup_barrier':lookup_barrier}
+    def start(self,name,readonly=False,publication='shared-live',actor='alice',drop=False,lookup_barrier=False,replica_identity=None):
+        settings={'name':name,'namespace':NS,'replica':replica_identity or (WORKER if actor=='worker' else REPLICA if actor=='alice' else 'replica:'+f'{3:032x}'),'principal':ALICE,'group':GROUP,'token':self.tokens[actor],'ca':(self.i.control/'ca.crt').read_text(),'readonly':readonly,'publication':publication,'drop':drop,'lookup_barrier':lookup_barrier}
         self.mounts.append(name);self.i.write_json('mount-ownership.json',{'container':self.daemon,'mounts':self.mounts})
         result=self.execute('''import json,os,subprocess,sys,time
 s=json.load(sys.stdin);name=s['name'];control='/private/'+name;os.mkdir(control,0o700)

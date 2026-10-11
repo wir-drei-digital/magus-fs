@@ -451,6 +451,16 @@ pub(crate) fn control(
     };
     match command {
         "checkpoint" => {
+            // An explicit checkpoint shares capture/publication/incoming execution ownership.
+            // Waiting never holds Core, so ordinary mounted writes remain available.
+            let execution = crate::sync::SyncExecution::for_replica(
+                &rep.configuration().map_err(|e| (1, e))?.replica,
+            )
+            .map_err(|e| (1, e))?;
+            let _gate = execution
+                .acquire(std::time::Instant::now() + std::time::Duration::from_secs(5))
+                .map_err(|e| (1, e))?
+                .ok_or((1, FsError::Backpressure))?;
             let status = rep.status().map_err(|e| (1, e))?;
             let base = status.head.ok_or((2, FsError::NotFound))?;
             let workspace = rep.begin(&base, actor, false).map_err(|e| (1, e))?;

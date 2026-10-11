@@ -779,6 +779,59 @@ pub fn mount(
     let shared_live = binding
         .as_ref()
         .is_some_and(|b| b.publication == PublicationMode::SharedLive);
+    // Capture and publication use separate bounded schedulers: slow HTTP must not
+    // turn every ordinary filesystem save into a scan or block the adapter lock.
+    let outgoing = if binding.is_some() && !read_only {
+        let actor =
+            crate::sync::publication_actor(&rep, rep.actor_for_uid(unsafe { libc::geteuid() })?)?;
+        let workspace = rep.begin_live(revision, actor, false)?;
+        let mut capture = crate::sync::mounted::MountedCapture::new(&rep)?;
+        let publisher = crate::sync::SyncController::new(&rep)?;
+        let capture_stop = stop.clone();
+        let capture_state = live_state.clone();
+        let capture_thread = std::thread::spawn(move || {
+            while !capture_stop.load(Ordering::Relaxed) {
+                match capture.tick(|operation, generation| {
+                    let _state = capture_state.lock().map_err(|_| FsError::ReplicaBusy)?;
+                    workspace.checkpoint(
+                        operation,
+                        generation,
+                        Attribution {
+                            captured_at_ns: 0,
+                            coverage: vec!["".into()],
+                            provenance: "engine_observed".into(),
+                        },
+                    )
+                }) {
+                    Ok(Some(revision)) => {
+                        eprintln!("mounted_captured revision={}", revision.as_str())
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("mounted_capture_error code={}", error.code()),
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let publish_stop = stop.clone();
+        let publish_thread = std::thread::spawn(move || {
+            while !publish_stop.load(Ordering::Relaxed) {
+                if let Err(error) = publisher.tick() {
+                    if !matches!(error, FsError::NotFound) {
+                        eprintln!("mounted_publication_error code={}", error.code());
+                    }
+                }
+                for _ in 0..10 {
+                    if publish_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
+        Some((capture_thread, publish_thread))
+    } else {
+        None
+    };
     let incoming = if binding.is_some() {
         let stop = stop.clone();
         let rep = rep.clone();
@@ -891,6 +944,10 @@ pub fn mount(
     };
     let result = session.run();
     stop.store(true, Ordering::Relaxed);
+    if let Some((capture, publish)) = outgoing {
+        let _ = capture.join();
+        let _ = publish.join();
+    }
     if let Some(thread) = incoming {
         let _ = thread.join();
     }

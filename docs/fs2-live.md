@@ -10,6 +10,24 @@ magus-fs sync status --state STATE
 
 Use `--mode read-only` for an absolute readonly live mount. The default isolated publication mode preserves private work and does not adopt shared updates automatically. Its discovery worker still enforces authenticated current authority and credential revocation, without changing bytes, adopted epoch or Applied acknowledgement. Existing unbound FS1 snapshot mounts keep their historical behavior.
 
+## Automatic mounted saves
+
+An attached writable mount observes the engine's dirty generation every 50 ms. After the observed generation remains unchanged for 100 ms, its existing owner checkpoints with `engine_observed` attribution and automatically admits the exact local revision/operation. It never scans through its own mount. A captured-but-not-admitted revision is admitted before any later capture after restart, preserving its original view/head/base. Clean issued views and foreign revisions are not submitted.
+
+The separate publisher uses the existing bounded controller every 1 s. `shared-live` explicitly permits automatic integration; `isolated` automatically obtains only a private remote receipt and remains pinned to its input view. Residency does not select policy. Readonly mounts do not capture or submit. Dirty work and unresolved submissions still hold incoming replacement, and conflicts require explicit resolution.
+
+Capture, publication, incoming adoption and explicit checkpoint controls share execution coordination. Network work holds neither the engine nor adapter lock. Stable generation means stable observed engine work, not every application buffer. Local fsync, local checkpoint, private receipt, shared acceptance and received Applied readiness remain separate observations.
+
+Run the owned Linux A/B plus native Mac observer lifecycle proof on the qualified Mac host:
+
+```sh
+python3 tests/fs2/mounted_lifecycle.py --output /private/tmp/FS2_MOUNTED_NEW_PATH
+```
+
+It uses two independent Linux containers, separate replica/state/owners, B-only disconnection/restart, ordinary saves, fresh received-file edits, directory continuation, original-operation capture/admission restart, dirty incoming contention, retained conflict/resolution, readonly and isolated policy negatives, exact receipts and ordinary inventory/hash checks. `--focused` is only the first-save regression. Source-matched debug images may be retained with `--reuse-image IMMUTABLE_IMAGE`.
+
+The `--actual-agents` extension requires a coordinator to dispatch two actual tool-backed Codex agents into the emitted per-container roots as UID/GID1001:1001. The runner publishes an external `agent-bridge-write.json`, then `agent-bridge-follow-up.json`; each names actual fixture instruction paths, allowed content, a 600 s deadline and the external resume/report paths. The same two agent identities must continue in phase 2, editing peer-received files and observing directory rename without remount. The coordinator supplies actual agent/model/tool metadata and saved reports. The runner never substitutes its Python file edits for this agent assertion. Client credentials/control remain private and inaccessible to workload UID1001. This bounded smoke does not qualify external providers or replace final Task6 fresh full PoC runs.
+
 ## Descriptor semantics
 
 Each accepted remote adoption advances a persistent epoch independently of the ordinary local mutation generation. Files receive distinct native inodes per epoch; directory identities remain stable to avoid invalidating a path walk halfway through a directory lookup. Existing descriptors read the preceding epoch's bytes and size. Current identity, ancestry and permission checks still apply. A remote rename retaining the identity permits old reads under current ancestry. A remote replacement or unlink removing that identity denies old-epoch reads conservatively. Same-epoch open-unlinked, append and fsync semantics are unchanged.

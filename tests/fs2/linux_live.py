@@ -238,6 +238,23 @@ print(json.dumps(rows))
             assert time.monotonic()<deadline,'observable mounted visibility deadline exceeded'
             time.sleep(.05)
     def save(self):self.i.write_json('live-evidence.json',self.evidence)
+    def unmount(self,name):
+        assert name in self.mounts,'unrecorded mount'
+        return self.execute('''import json,os,subprocess,sys,time
+name=json.load(sys.stdin);mount='/shared/'+name;control='/private/'+name
+deadline=time.monotonic()+10
+while True:
+ p=subprocess.run(['umount',mount],capture_output=True,text=True,timeout=10)
+ if p.returncode==0:break
+ assert 'busy' in p.stderr.lower() and time.monotonic()<deadline,(p.stdout,p.stderr)
+ time.sleep(.05)
+assert not os.path.ismount(mount)
+pid=int(open(control+'/pid').read());deadline=time.monotonic()+10
+while os.path.exists('/proc/'+str(pid)):
+ assert time.monotonic()<deadline,'daemon failed normal exit'
+ time.sleep(.05)
+print(json.dumps({'mount':mount,'unmount':p.returncode,'still_mounted':False,'pid':pid,'exited':True,'reaped':True}))''',name)
+
     def cleanup(self):
         if not self.daemon:return
         rows=[]
@@ -245,15 +262,7 @@ print(json.dumps(rows))
         if self.holders:
             self.execute("import json,os,signal,sys,time;ids=json.load(sys.stdin)\nfor pid in ids:\n try:os.kill(pid,signal.SIGTERM)\n except ProcessLookupError:pass\ndeadline=time.monotonic()+5\nwhile any(os.path.exists('/proc/'+str(pid)) for pid in ids):\n assert time.monotonic()<deadline\n time.sleep(.05)\nprint('{}')",self.holders)
         for name in self.mounts:
-            row=self.execute('''import json,os,subprocess,sys,time
-name=json.load(sys.stdin);mount='/shared/'+name;control='/private/'+name
-p=subprocess.run(['umount',mount],capture_output=True,text=True,timeout=10);assert p.returncode==0,(p.stdout,p.stderr)
-assert not os.path.ismount(mount)
-pid=int(open(control+'/pid').read());deadline=time.monotonic()+10
-while os.path.exists('/proc/'+str(pid)):
- assert time.monotonic()<deadline,'daemon failed normal exit'
- time.sleep(.05)
-print(json.dumps({'mount':mount,'unmount':p.returncode,'still_mounted':False,'pid':pid,'exited':True,'reaped':True}))''',name);rows.append(row)
+            rows.append(self.unmount(name))
         self.i.write_json('mount-cleanup.json',rows)
 
 def main():
