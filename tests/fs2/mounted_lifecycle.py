@@ -15,6 +15,17 @@ ROOT_INSTRUCTIONS = b'''# Synthetic ICM\nRead work/AGENTS.md before editing work
 WORK_INSTRUCTIONS = b'''# Work procedures\nRead procedure.txt and the selected task file. Append a line with completed-value: COMPUTED_VALUE and procedure-code: ACTUAL_CODE from the procedure. Keep all prior lines, including task-value.\n'''
 PROCEDURE = b'''procedure-code: mounted-ordinary-v1\nUse integer arithmetic: completed-value is task-value plus seven.\n'''
 
+def validate_agent_edit(original,before,body,phase):
+    """Validate the instructed append, without imposing wording on the agent."""
+    assert phase in ['write','follow-up']
+    assert body.startswith(before),'agent must preserve every prior byte'
+    lines=body[len(before):].splitlines()
+    assert len(lines)==1 and lines[0].strip(),'agent must append exactly one observation line'
+    value=int(re.search(rb'task-value: (\d+)',original).group(1))+7
+    assert re.findall(rb'completed-value: (\d+)\b',lines[0])==[str(value).encode()],'wrong or missing observed completed value'
+    code=re.search(rb'procedure-code: (\S+)',PROCEDURE).group(1)
+    assert re.findall(rb'procedure-code: ([A-Za-z0-9-]+)',lines[0])==[code],'wrong or missing observed procedure code'
+
 class Mounted(NativeJourney):
     def __init__(self,i,image,focused=False,agents=False):
         super().__init__(i,image,['linux','macos']);self.lazy=None;self.secondary=None;self.workloads=[];self.focused=focused;self.agents=agents;self.records=[];self.observer=None;self.mac=None
@@ -64,8 +75,9 @@ class Mounted(NativeJourney):
         fresh=bytes.fromhex(self.secondary.read('b/reports/live'));self.save_and_wait('b','reports/live',fresh+b' freshly reread follow-up','a')
         l.execute("import os;os.mkdir('/shared/a/work/new');os.rename('/shared/a/work/new','/shared/a/work/renamed');print('{}')",user='1001:1001');self.until(lambda:self.secondary.has('b/work/renamed'))
         self.save_and_wait('a','work/renamed/later',b'work after directory rename','b')
+        if self.agents:self.agent_boundary(bodies,['write'])
         self.restart_capture();self.contention();self.conflict();self.negatives();self.converge()
-        if self.agents:self.agent_boundary(bodies)
+        if self.agents:self.agent_boundary(bodies,['follow-up'])
         self.inventories()
     def head(self):
         return self.i.sql("SELECT head FROM branches WHERE namespace='"+NS+"' AND name='main';")
@@ -180,27 +192,26 @@ print(json.dumps({'pid':p.pid,'revision':s['revision']}))''',{'name':name,'fault
         if mac:assert content(a)==content(mac)
         head=self.converge();self.note('authorized-inventory-and-readiness',a=a,b=b,mac=mac,head=head,status={n:self.owner(n).status(n) for n in ['a','b']})
 
-    def agent_boundary(self,bodies):
+    def agent_boundary(self,bodies,phases=None):
         tasks={'write':{'a':'Read actual root and nested instructions, then complete work/task-a.txt through ordinary file APIs. Do not use publication controls.','b':'Read actual root and nested instructions, then complete work/task-b.txt through ordinary file APIs. Do not use publication controls.'},'follow-up':{'a':'Reread actual root/nested instructions and both task files. Freshly open the received work/task-b.txt and append one follow-up line stating the peer completed value and procedure code. Create work/agent-dir, rename it to work/agent-renamed, and write work/agent-renamed/notes.txt documenting those peer observations using ordinary APIs. Report actual peer bytes and changes.','b':'Reread actual root/nested instructions and both task files. Freshly open the received work/task-a.txt and append one follow-up line stating the peer completed value and procedure code. Wait at most30seconds through ordinary file reads for work/agent-renamed/notes.txt, then read and report its actual bytes. Do not use publication controls.'}}
-        identities=None
-        for phase in ['write','follow-up']:
+        identities=getattr(self,'agent_identities',None)
+        for phase in phases or ['write','follow-up']:
+            paths=[('a','work/task-a.txt'),('b','work/task-b.txt')] if phase=='write' else [('a','work/task-b.txt'),('b','work/task-a.txt')]
+            before_files={n:bytes.fromhex(self.owner(n).read(n+'/'+path)) for n,path in paths}
             before_phase={n:self.owner(n).status(n) for n in ['a','b']}
             resume=self.i.output/('agents-'+phase+'-resume.json')
-            recipe={'containers':{n:self.owner(n).daemon for n in ['a','b']},'roots':{'a':'/shared/a','b':'/shared/b'},'uid':1001,'gid':1001,'mapping':{'principal':ALICE,'group':GROUP},'owner_pids':{n:self.owner(n).execute("import json,sys;print(open('/private/'+json.load(sys.stdin)+'/pid').read())",n) for n in ['a','b']},'allowed':{'a':['AGENTS.md','work'],'b':['AGENTS.md','work']},'initial_sha256':{p:hashlib.sha256(b).hexdigest() for p,b in bodies.items()},'phase':phase,'deadline_seconds':600,'resume':str(resume),'report_prefix':str(self.i.output/('actual-agent-'+phase+'-')),'task':tasks[phase],'control_boundary':'/private0700 inaccessible to1001; do not execute owner/control commands; stdout reports are stored by coordinator outside content'}
+            recipe={'containers':{n:self.owner(n).daemon for n in ['a','b']},'roots':{'a':'/shared/a','b':'/shared/b'},'uid':1001,'gid':1001,'mapping':{'principal':ALICE,'group':GROUP},'owner_pids':{n:self.owner(n).execute("import json,sys;print(open('/private/'+json.load(sys.stdin)+'/pid').read())",n) for n in ['a','b']},'allowed':{'a':['AGENTS.md','work'],'b':['AGENTS.md','work']},'initial_sha256':{p:hashlib.sha256(b).hexdigest() for p,b in bodies.items()},'phase':phase,'before_sha256':{n:hashlib.sha256(b).hexdigest() for n,b in before_files.items()},'deadline_seconds':600,'resume':str(resume),'report_prefix':str(self.i.output/('actual-agent-'+phase+'-')),'task':tasks[phase],'control_boundary':'/private0700 inaccessible to1001; do not execute owner/control commands; stdout reports are stored by coordinator outside content'}
             self.i.write_json('agent-bridge-'+phase+'.json',recipe);print(json.dumps({'agent_boundary':str(self.i.output/('agent-bridge-'+phase+'.json'))}),flush=True);deadline=time.monotonic()+600
             while not resume.exists():
                 assert time.monotonic()<deadline,'actual agents bridge timeout';time.sleep(.2)
             evidence=json.loads(resume.read_text());assert set(evidence)=={'a','b'} and all(evidence[k].get('agent_id') and evidence[k].get('report') and Path(evidence[k]['report']).is_file() for k in evidence)
             ids={k:evidence[k]['agent_id'] for k in evidence};assert len(set(ids.values()))==2
-            if identities is None:identities=ids
+            if identities is None:identities=ids;self.agent_identities=ids
             else:assert ids==identities,'same actual agent identities must continue'
-            paths=[('a','work/task-a.txt'),('b','work/task-b.txt')] if phase=='write' else [('a','work/task-b.txt'),('b','work/task-a.txt')]
             for name,path in paths:
-                body=bytes.fromhex(self.owner(name).read(name+'/'+path));assert b'completed' in body and b'mounted-ordinary-v1' in body
-                value=int(re.search(rb'task-value: (\d+)',bodies[path]).group(1))+7
-                assert value in [int(v) for v in re.findall(rb'completed-value: (\d+)',body)]
-                if phase=='follow-up':assert b'follow-up' in body.lower()
-                self.until(lambda:self.received('b' if name=='a' else 'a',path,body));self.note('actual-agent-file',phase=phase,name=name,path=path,body=body.hex(),metadata=evidence[name],report_sha256=hashlib.sha256(Path(evidence[name]['report']).read_bytes()).hexdigest())
+                body=bytes.fromhex(self.owner(name).read(name+'/'+path))
+                validate_agent_edit(bodies[path],before_files[name],body,phase)
+                self.until(lambda:self.received('b' if name=='a' else 'a',path,body));self.note('actual-agent-file',phase=phase,name=name,path=path,before_body=before_files[name].hex(),body=body.hex(),metadata=evidence[name],report_sha256=hashlib.sha256(Path(evidence[name]['report']).read_bytes()).hexdigest())
             self.converge()
             for n in ['a','b']:
                 prior={p['operation'] for p in before_phase[n]['status']['submissions']};progress=[p for p in self.owner(n).status(n)['status']['submissions'] if p['operation'] not in prior]
@@ -210,7 +221,7 @@ print(json.dumps({'pid':p.pid,'revision':s['revision']}))''',{'name':name,'fault
                     assert p['private_receipt']['operation']==p['operation'] and p['private_receipt']['submitted_revision']==p['local_revision'] and p['shared_receipt']['submitted_revision']==p['local_revision']
                     assert self.i.sql("SELECT count(*) FROM operations WHERE operation='"+p['operation']+"';")=='1'
                 self.note('actual-agent-receipts',phase=phase,name=n,progress=progress,before=before_phase[n])
-        self.until(lambda:self.secondary.has('b/work/agent-renamed/notes.txt'))
+        if 'follow-up' in (phases or ['write','follow-up']):self.until(lambda:self.secondary.has('b/work/agent-renamed/notes.txt'))
     def cleanup(self):
         for w in self.workloads:
             self.owner(w['name']).execute("import json,sys,os,signal,time;p=json.load(sys.stdin)\ntry:os.kill(p,signal.SIGTERM)\nexcept ProcessLookupError:pass\ndeadline=time.monotonic()+5\nwhile os.path.exists('/proc/'+str(p)):\n assert time.monotonic()<deadline\n time.sleep(.02)\nprint('{}')",w['pid'],user=w['uid'])

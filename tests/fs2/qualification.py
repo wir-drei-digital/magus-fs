@@ -65,3 +65,10 @@ def normalize(evidence):
     except (TypeError,ValueError,KeyError,AttributeError):errors.append('malformed evidence')
     exit_code=0 if not errors else 2 if evidence.get('blocked') and not evidence.get('failures') else 1
     return {'exit':exit_code,'passed':exit_code==0,'scope':'FS2-A connected slice only','errors':errors,'evidence':evidence}
+
+def normalize_full(evidence):
+    import importlib.util
+    from pathlib import Path
+    spec=importlib.util.spec_from_file_location('poc_qualification',Path(__file__).parents[1]/'poc'/'qualification.py')
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    return module.normalize(evidence)

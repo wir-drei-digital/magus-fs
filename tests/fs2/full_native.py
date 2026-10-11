@@ -12,7 +12,7 @@ from service_storage import NS, ALICE
 class Endpoint:
     def __init__(self,j,platform,image):
         self.j=j;self.i=j.i;self.platform=platform;self.container=None;self.clients=[];self.children=[]
-        self.binary=str(ROOT/'target/debug/magus-fs');self.faults=str(ROOT/'target/debug/magus-fs-client-faults')
+        profile=getattr(self.i,'runtime_profile','debug');self.binary=str(ROOT/'target'/profile/'magus-fs');self.faults=str(ROOT/'target'/profile/'magus-fs-client-faults')
         if platform=='linux':
             self.container=self.i.create('container','native',['--network',self.i.ingress,'--cap-drop','ALL','--security-opt','no-new-privileges','--memory','512m','--cpus','2','--pids-limit','256','--user','1001:1001',image,'python3','-c',"import os,signal,time\ndef reap(*a):\n while True:\n  try:p,s=os.waitpid(-1,os.WNOHANG)\n  except ChildProcessError:return\n  if p==0:return\nsignal.signal(signal.SIGCHLD,reap)\nwhile True:time.sleep(.2)"])
             self.i.docker('start',self.container);self.binary='/usr/local/bin/magus-fs';self.faults='/usr/local/bin/magus-fs-client-faults'
@@ -40,8 +40,7 @@ class Endpoint:
                 body=b''
                 for x in e['content']['version']['extents']:
                     assert x['kind']=='chunk'
-                    import http.client
-                    conn=http.client.HTTPSConnection('127.0.0.1',self.i.port,context=self.j.ca,timeout=10);conn.request('GET',self.j.root+'/views/'+view['view']+'/objects/'+x['object'],headers={'Authorization':'Bearer '+self.j.tokens[actor]});response=conn.getresponse();part=response.read();assert response.status==200;conn.close();body+=part[x['offset']:x['offset']+x['length']]
+                    part=self.j.expect_bytes('hydrate-'+e['path'],self.j.root+'/views/'+view['view']+'/objects/'+x['object'],actor=actor);body+=part[x['offset']:x['offset']+x['length']]
                 bodies[e['path']]=body.hex()
         path=self.base+'/'+name;self.clients.append({'path':path,'creating':True});self.save()
         c=self.run('''p=s['path'];os.mkdir(p,0o700);base=p+'/native' if s['nest'] else p

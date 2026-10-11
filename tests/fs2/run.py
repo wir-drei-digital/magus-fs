@@ -38,6 +38,10 @@ def inspect_cleanup(i,j):
     return {'verified':True,'mounts':unresolved,'pids':pids,'containers':remaining,'resources_removed':True,'independent_lists':rows,'normal_unmount_rows':mount_rows,'retained_host_fixture':str(i.output/'mac')}
 
 def main():
+    if '--slice' not in sys.argv:
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('poc_run',ROOT/'tests/poc/run.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        return module.main()
     ap=argparse.ArgumentParser();ap.add_argument('--slice',choices=['connected'],default='connected');ap.add_argument('--platform',choices=['all','macos','linux'],default='all');ap.add_argument('--output',type=Path,required=True);ap.add_argument('--probe',action='store_true');ap.add_argument('--reuse-image');a=ap.parse_args()
     if not a.output.is_absolute() or a.output.exists() or not a.output.parent.is_dir():ap.error('--output must be absolute, new, with existing parent')
     output=a.output;build=OwnedInfra(output);data={'platform':a.platform,'failures':[],'blocked':[],'journeys':[],'source':{},'probe':a.probe};image=a.reuse_image or build.owner+'-connected';code=1

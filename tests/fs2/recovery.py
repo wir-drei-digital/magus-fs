@@ -42,7 +42,7 @@ class Recovery(Reconciliation):
         self.set_file('reports/live',b'new content','advance',mode=0o600)
         current,files,_=self.tree();page=self.history(current);old=next(x for x in page['items'] if x['entry']==oldid)
         historical=self.expect('history-pin','POST',self.root+'/history/'+old['id']+'/view',200,body={})
-        code,data=self.bytes_request(self.root+'/views/'+historical['view']+'/descriptor');assert code==200
+        data=self.expect_bytes('historical-descriptor',self.root+'/views/'+historical['view']+'/descriptor')
         desc=json.loads(data);assert desc['parents']==[] and all(e['path'].startswith('reports') for e in desc['tree']['entries'])
         selected=next(e for e in desc['tree']['entries'] if e['id']==oldid);assert self.body(historical,selected)==b'old content'
         reader,rg=self.grant(['read'],['reports'],'reader');rv,_=self.view('reader')
@@ -100,7 +100,7 @@ class Recovery(Reconciliation):
         self.publish_tree(move_out,[b'new outside-scope bytes'],label='history-moved-out')
         self.expect('moved-ordinary-history-denied','POST',self.root+'/history/'+ordinary_source+'/view',404,{'code':'not_found'},actor='historian',body={})
         scoped_pin=self.expect('moved-retained-admin-old-source','POST',self.root+'/history/'+retained_source+'/view',200,actor='retained-scoped',body={})
-        code,scoped_bytes=self.bytes_request(self.root+'/views/'+scoped_pin['view']+'/descriptor','retained-scoped');assert code==200
+        scoped_bytes=self.expect_bytes('scoped-descriptor',self.root+'/views/'+scoped_pin['view']+'/descriptor','retained-scoped')
         scoped_descriptor=json.loads(scoped_bytes);assert 'secret' not in scoped_bytes.decode() and object_id(b'new outside-scope bytes') not in scoped_bytes.decode()
         selected=next(e for e in scoped_descriptor['tree']['entries'] if e['id']==fresh);assert selected['mode']==0o644 and self.body(scoped_pin,selected,'retained-scoped')==b'old content'
         def move_back(t):
@@ -152,7 +152,7 @@ class Recovery(Reconciliation):
         self.publish_tree(lambda t:next(e for e in t['entries'] if e['path']=='reports').update(mode=0o755),label='path-policy-permit-read')
         self.expect('path-policy-issued-pin-recovered','GET',self.root+'/views/'+pinned['view']+'/descriptor',200,actor='path-admin')
         readable=self.expect('path-policy-retained-pin-recovered','POST',self.root+'/history/'+source+'/view',200,actor='path-admin',body={})
-        code,raw=self.bytes_request(self.root+'/views/'+readable['view']+'/descriptor','path-admin');assert code==200 and 'archive' not in raw.decode()
+        raw=self.expect_bytes('readable-descriptor',self.root+'/views/'+readable['view']+'/descriptor','path-admin');assert 'archive' not in raw.decode()
         desc=json.loads(raw);parent=next(e for e in desc['tree']['entries'] if e['path']=='reports');assert parent['mode']==0o755
         assert self.body(readable,next(e for e in desc['tree']['entries'] if e['path']=='reports/live'),'path-admin')==b'old content'
         self.publish_tree(lambda t:next(e for e in t['entries'] if e['path']=='reports').update(mode=0o775),label='path-policy-permit-write')

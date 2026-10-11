@@ -110,12 +110,12 @@ class Journey(StorageJourney):
         self.expect('shared-exact-replay','POST',self.root+'/integrations',200,shared,body=integration,actor='worker')
         assert shared['submitted_revision']==request['revision']
         accepted,accepted_tree=self.view('worker')
-        status,data=self.bytes_request(self.root+'/views/'+accepted['view']+'/objects/'+object_id(b'worker-report'))
+        data=self.expect_bytes('authorized-worker-object',self.root+'/views/'+accepted['view']+'/objects/'+object_id(b'worker-report'),actor='worker');status=200
         assert status==200 and data==b'worker-report',(status,data)
         self.observations.append({'case':'authorized-object-bytes','status':status,'sha256':hashlib.sha256(data).hexdigest()})
         self.i.snapshot_volumes();self.i.docker('stop','--time','5',self.i.service,self.i.pg,self.i.s3)
         self.i.docker('start',self.i.pg,self.i.s3,self.i.service);self.i.start_service();self.wait();self.i.wait_s3('protocol-all-process-restart')
-        status,data=self.bytes_request(self.root+'/views/'+accepted['view']+'/objects/'+object_id(b'worker-report'))
+        data=self.expect_bytes('authorized-worker-object',self.root+'/views/'+accepted['view']+'/objects/'+object_id(b'worker-report'),actor='worker');status=200
         assert status==200 and data==b'worker-report'
         self.expect('shared-recover-all-processes','GET',self.op_path(integration),200,shared,actor='worker')
         _,after=self.view('readonly');assert sorted(e['path'] for e in after['tree']['entries'])==['reports','reports/result','secret']

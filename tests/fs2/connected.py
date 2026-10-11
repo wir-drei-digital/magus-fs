@@ -199,6 +199,8 @@ class Connected(NativeJourney):
             before_status=mac.status(c);start=time.monotonic();body=('serialized procedure %02d\n'%n).encode();mac.write(c,body,'reports/procedure.txt');self.save_target(mac,c,lazy,before_status,start,body,measure=True)
         if not getattr(self,'probe',False):self.result['latency']={k:{'p50':sorted(s[k] for s in self.result['saves'])[9],'p95':sorted(s[k] for s in self.result['saves'])[18]} for k in ['capture','private','shared','visible']};self.result['environment']={'visibility_deadline':15,'target_drain_deadline':60,'scan_seconds':2,'poll_seconds':1,'sampling':'observed upper bounds; serialized exact target revision drains; nearest-rank p50/p95','universal_sla':False}
         current_body=new_procedure if getattr(self,"probe",False) else body
+        self.mac_endpoint=mac;self.mac_client=c
+        if hasattr(self,'editor_hook'):self.editor_hook(mac,c,lazy)
         self.worker(mac,c,lazy,current_body)
         self.security(lazy,readonly_view)
         self.faults(mac,c,lazy)
@@ -237,7 +239,7 @@ class Connected(NativeJourney):
         # Retain exact worker private state before the explicitly authorized integration.
         worker_before=lazy.status('worker')['status']['submissions'];self.result['worker_private']={'local':local,'private':private,'output':output,'expected_hash':hashlib.sha256(expected).hexdigest(),'shared_unchanged':True,'drain':drained}
         integrated=lazy.cli('sync','integrate','--state','/private/worker/state','--revision',revision,'--expected-head',head)['progress'];assert integrated['shared_receipt'] and integrated['integration']['expected_head']==head and integrated['integration']['candidate_receipt']==private['private_receipt']['receipt']
-        self.until(lambda:mac.exists(c['root']+'/reports/result.json') and mac.read(c,'reports/result.json')==expected.hex());self.until(lambda:mac.ready(c,integrated['shared_receipt']['head']));self.until(lambda:lazy.read('live/reports/result.json')==expected.hex())
+        self.until(lambda:mac.exists(c['root']+'/reports/result.json') and mac.read(c,'reports/result.json')==expected.hex());self.until(lambda:mac.ready(c,integrated['shared_receipt']['head']));self.until(lambda:lazy.has('live/reports/result.json') and lazy.read('live/reports/result.json')==expected.hex())
         view,descriptor=self.view();report=next(e for e in descriptor['tree']['entries'] if e['path']=='reports/result.json');assert report['owner']==ALICE
         stored=json.loads(self.i.sql("SELECT request FROM operations WHERE operation='"+operation+"';"));assert stored==private['request'] and stored['replica']==WORKER
         audit=json.loads(self.i.sql("SELECT json_build_object('credential',credential,'principal',principal,'replica',replica)::text FROM operations WHERE operation='"+operation+"';"));assert audit=={'credential':self.worker_credential,'principal':ALICE,'replica':WORKER}

@@ -47,3 +47,7 @@ python3 tests/fs2/view_reuse.py --output /private/tmp/FS2A_NEW_VIEW_PATH
 Revision admission is2 concurrent requests; larger test bursts may correctly return503. Repeat startup exercises additive migration compatibility. Do not delete old view IDs or rewrite queued original bases to reduce row counts. Genuine history retention belongs to FS2-B, whose migrations start at004.
 
 Safe redacted discovery/acknowledgement diagnostics remain a nonblocking FS2-B Task3 item. Existing pending/retry/authorization behavior is preserved. Full structural native application and Mac NFS live epochs, conflict reconciliation, disconnected recovery, dependencies, CRDT comparison and actual editor/external-harness gates remain B work. Start B on a new isolated branch. No product migration or deployment is implied by local qualification.
+
+## Full FS2-B / integrated PoC gate
+
+The default `tests/fs2/run.py --platform all --output ABSOLUTE_NEW_PATH` now selects the full S1–S15/P1–P12 gate. See [the full qualification runbook](poc-qualification.md) for two fresh component compositions, actual VSCode and continuing coding-agent prerequisites, exact release provenance, independent archive restore and cleanup. Use explicit `--slice connected` to reproduce only the historical FS2-A scope. A full-gate implementation is not itself a passing runtime result; consult its retained result.json and reviews.

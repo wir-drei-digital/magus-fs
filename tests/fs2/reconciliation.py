@@ -32,8 +32,8 @@ class Reconciliation(NativeJourney):
     def body(self, view, entry, actor='alice'):
         out = b''
         for x in entry['content']['version']['extents']:
-            status, data = self.bytes_request(self.root + '/views/' + view['view'] + '/objects/' + x['object'], actor=actor)
-            assert status == 200, (status, entry['path']);out += data[x['offset']:x['offset'] + x['length']]
+            data = self.expect_bytes('export-'+entry['path'],self.root + '/views/' + view['view'] + '/objects/' + x['object'], actor=actor)
+            out += data[x['offset']:x['offset'] + x['length']]
         return out
     def bytes_request(self, path, actor='alice'):
         import http.client

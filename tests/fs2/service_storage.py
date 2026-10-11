@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Actual HTTPS, PostgreSQL and S3 process boundary; exit 0/1/2 = pass/fail/blocked."""
 import argparse
+import copy
 import datetime
 import hashlib
 import http.client
@@ -37,8 +38,8 @@ class Journey:
             rows.append({'namespace':OTHER if name=='bob' else NS,'principal':BOB if name=='bob' else ALICE,'replica':'replica:'+f'{n+1:032x}','token':self.tokens[name], 'expires':now-1 if name=='expired' else now+3600,'actions':['read'] if name=='readonly' else ['read','write','history','integrate','admin'],'branches':['main'],'prefixes':['']})
         infra.provision(rows)
 
-    def request(self, method, path, actor='alice', body=None, raw=None, headers=None):
-        c=http.client.HTTPSConnection('127.0.0.1',self.i.port,context=self.ca,timeout=10)
+    def request(self, method, path, actor='alice', body=None, raw=None, headers=None, timeout=10, response_bytes=False):
+        c=http.client.HTTPSConnection('127.0.0.1',self.i.port,context=self.ca,timeout=timeout)
         h={'Authorization':'Bearer '+self.tokens.get(actor,actor)}
         if body is not None:
             raw=json.dumps(body).encode();h['Content-Type']='application/json'
@@ -46,18 +47,42 @@ class Journey:
         try:
             c.request(method,path,body=raw,headers=h)
             r=c.getresponse();data=r.read()
-            return r.status,json.loads(data) if data else None
+            return r.status,(data if response_bytes else json.loads(data) if data else None)
         finally:
             c.close()
 
-    def expect(self, name, method, path, status, value=None, **kw):
-        before=time.monotonic();actual,data=self.request(method,path,**kw)
-        assert actual==status,(name,actual,data,status)
-        if value is not None:
-            assert data==value,(name,data,value)
-        self.observations.append({'case':name,'status':actual,'body':data,'seconds':time.monotonic()-before})
-        self.i.write_json('observations.json',self.observations)
-        return data
+    def expect(self, name, method, path, status, value=None, response_bytes=False, **kw):
+        # Scripted fixture calls obey the existing admission backoff without
+        # regenerating candidate/upload/operation identities or extending10s.
+        before=time.monotonic();deadline=before+10;actor=kw.get('actor','alice')
+        headers={'Authorization':'Bearer '+self.tokens.get(actor,actor)}
+        if kw.get('body') is not None:
+            kw['raw']=json.dumps(kw.pop('body')).encode();headers['Content-Type']='application/json'
+        headers.update(kw.get('headers') or {});kw['headers']=headers
+        raw=kw.get('raw');payload=raw.encode() if isinstance(raw,str) else bytes(raw or b'')
+        if raw is not None:kw['raw']=payload
+        request={'method':method,'path':path,'actor':actor,'body_sha256':hashlib.sha256(payload).hexdigest(),'body_bytes':len(payload),'authorization_sha256':hashlib.sha256(headers['Authorization'].encode()).hexdigest()}
+        for attempt in range(3):
+            if attempt:time.sleep(min((.1,.3)[attempt-1],max(0,deadline-time.monotonic())))
+            remaining=deadline-time.monotonic();assert remaining>0,(name,'request deadline exceeded')
+            started=time.monotonic();actual,data=self.request(method,path,timeout=remaining,**({'response_bytes':True} if response_bytes else {}),**kw)
+            elapsed=time.monotonic()-before
+            classification=data;recorded=copy.deepcopy(data)
+            if response_bytes:
+                data=bytes(data);leaf='http-body-'+str(len(self.observations))+'.bin';(self.i.output/leaf).write_bytes(data)
+                recorded={'artifact':leaf,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()}
+                try:classification=json.loads(data)
+                except (ValueError,UnicodeDecodeError):classification=None
+            self.observations.append({'case':name,'status':actual,'body':recorded,'seconds':time.monotonic()-started,'elapsed_seconds':elapsed,'attempt':attempt+1,'request':request})
+            self.i.write_json('observations.json',self.observations)
+            assert elapsed<=10,(name,'request deadline exceeded')
+            if 200<=status<300 and actual==503 and classification=={'code':'backpressure'} and attempt<2:continue
+            assert actual==status,(name,actual,data,status)
+            if value is not None:assert data==value,(name,data,value)
+            return data
+
+    def expect_bytes(self,name,path,actor='alice'):
+        return self.expect(name,'GET',path,200,actor=actor,response_bytes=True)
 
     def wait(self):
         until=time.monotonic()+30

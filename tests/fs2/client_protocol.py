@@ -49,16 +49,16 @@ class Journey(ProtocolJourney):
     def __init__(self,i):
         super().__init__(i);self.children=[];self.proxy=None;self.operations={}
     def cli(self,*args,check=True,binary='magus-fs'):
-        p=self.i.run([str(ROOT/'target/debug'/binary),*map(str,args)],timeout=70,check=False)
+        p=self.i.run([str(ROOT/'target'/getattr(self.i,'runtime_profile','debug')/binary),*map(str,args)],timeout=70,check=False)
         value=json.loads(p.stdout)
         if check:assert p.returncode==0 and value['ok'],(args,value,p.stderr)
         return value
     def cli_failure(self,*args):
-        p=self.i.run([str(ROOT/'target/debug/magus-fs'),*map(str,args)],timeout=70,check=False)
+        p=self.i.run([str(ROOT/'target'/getattr(self.i,'runtime_profile','debug')/'magus-fs'),*map(str,args)],timeout=70,check=False)
         value=json.loads(p.stdout);assert p.returncode!=0 and value['ok'] is False,(p.returncode,value)
         return value
     def probe(self,state,*args,check=True):
-        p=self.i.run([str(ROOT/'target/debug/examples/client_probe'),str(state),*map(str,args)],timeout=70,check=False)
+        p=self.i.run([str(ROOT/'target'/getattr(self.i,'runtime_profile','debug')/'examples/client_probe'),str(state),*map(str,args)],timeout=70,check=False)
         value=json.loads(p.stdout)
         if check:assert p.returncode==0 and value['ok'],(args,value,p.stderr)
         return value
@@ -92,8 +92,8 @@ class Journey(ProtocolJourney):
     def kill_at(self,state,revision,point,enqueue=False):
         marker=self.i.output/(point+'-'+secrets.token_hex(3));env=dict(os.environ,MAGUS_TEST_FAULT_POINT=point,MAGUS_TEST_FAULT_ACTION='pause',MAGUS_TEST_FAULT_MARKER=str(marker))
         op=self.operations[revision]
-        if enqueue:args=[ROOT/'target/debug/magus-fs-client-faults','sync','run','--state',state,'--revision',revision,'--operation-id',op]
-        else:args=[ROOT/'target/debug/magus-fs-client-faults','sync','drain','--state',state,'--revision',revision,'--level','private-remote','--deadline-ms','60000']
+        if enqueue:args=[ROOT/'target'/getattr(self.i,'runtime_profile','debug')/'magus-fs-client-faults','sync','run','--state',state,'--revision',revision,'--operation-id',op]
+        else:args=[ROOT/'target'/getattr(self.i,'runtime_profile','debug')/'magus-fs-client-faults','sync','drain','--state',state,'--revision',revision,'--level','private-remote','--deadline-ms','60000']
         p=self.spawn(args,point+'-'+secrets.token_hex(3),env)
         deadline=time.monotonic()+65
         while not marker.exists() and p.poll() is None and time.monotonic()<deadline:time.sleep(.05)
@@ -122,7 +122,7 @@ class Journey(ProtocolJourney):
         attached=self.attach(state,profile);binding=attached['binding']
         assert attached['counters']['downloaded_body_bytes']==0 and attached['applied_revision'] is None
         self.i.docker('start',self.i.s3);self.i.wait_s3('client-lazy-restart',require_volumes=True)
-        status,data=self.bytes_request(self.root+'/views/'+binding['view']['view']+'/objects/'+object_id(chunks[0]));self.i.write_json('restart-independent-read.json',{'status':status,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()});assert status==200 and data==chunks[0],(status,len(data))
+        data=self.expect_bytes('restart-independent-object',self.root+'/views/'+binding['view']['view']+'/objects/'+object_id(chunks[0]),actor='worker');status=200;self.i.write_json('restart-independent-read.json',{'status':status,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()});assert status==200 and data==chunks[0],(status,len(data))
         cold=[]
         for name,offset in [('head',0),('tail',64*1024*1024-4096)]:
             out=self.i.output/(name+'.bin');v=self.probe(state,'read','reports/large',offset,4096,out);cold.append(v['counters']['downloaded_body_bytes']);expected=chunks[0][:4096] if offset==0 else chunks[-1][-4096:];assert out.read_bytes()==expected
@@ -213,7 +213,7 @@ class Journey(ProtocolJourney):
         self.i.write_json('checkpoint-admission.json',{'binding':binding,'operations':operations,'revisions':revisions,'original_receipts':receipts,'working_head':self.cli('status','--state',state)['captured_revision'],'no_tick_between_checkpoints':True})
         assert self.cli('status','--state',state)['captured_revision']==revisions[-1]
     def owner_control(self,state,receipt,revision):
-        p=self.spawn([ROOT/'target/debug/magus-fs','sync','run','--state',state,'--serve','true'],'owner')
+        p=self.spawn([ROOT/'target'/getattr(self.i,'runtime_profile','debug')/'magus-fs','sync','run','--state',state,'--serve','true'],'owner')
         deadline=time.monotonic()+5
         ready=False
         while p.poll() is None and time.monotonic()<deadline:
@@ -287,7 +287,7 @@ def main():
             i.run(['cargo','+stable','test','--locked','--workspace','--all-features'],timeout=300)
         i.run(['cargo','+stable','build','--locked','-p','magus-fs','--features','test-faults'],timeout=300)
         import shutil
-        shutil.copyfile(ROOT/'target/debug/magus-fs',ROOT/'target/debug/magus-fs-client-faults');os.chmod(ROOT/'target/debug/magus-fs-client-faults',0o755)
+        shutil.copyfile(ROOT/'target/debug'/'magus-fs',ROOT/'target/debug/magus-fs-client-faults');os.chmod(ROOT/'target/debug/magus-fs-client-faults',0o755)
         i.run(['cargo','+stable','build','--locked','-p','magus-fs','--examples'],timeout=300)
         i.run(['cargo','+stable','build','--locked','-p','magus-fs','-p','magus-fs-service'],timeout=300)
         if not args.skip_build:i.docker('build','-f','tests/fs2/Dockerfile.linux','--build-arg','VERIFY='+('0' if args.skip_checks else '1'),'-t',args.image,'.',timeout=900)
