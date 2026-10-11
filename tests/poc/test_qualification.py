@@ -14,16 +14,6 @@ class FullQualificationTests(unittest.TestCase):
     def check(self,e):return getattr(qualification,'normalize_full',qualification.normalize)(e)
     def test_connected_success_cannot_qualify_full_gate(self):
         self.assertNotEqual(self.check(connected_complete())['exit'],0)
-    def test_each_required_family_missing_fails(self):
-        for family in [*(f'S{x}' for x in range(1,16)),*(f'P{x}' for x in range(1,13))]:
-            with self.subTest(family=family):
-                e=connected_complete();e['matrix']={k:[] for k in [*(f'S{x}' for x in range(1,16)),*(f'P{x}' for x in range(1,13))] if k!=family}
-                self.assertNotEqual(self.check(e)['exit'],0)
-    def test_missing_app_restore_and_static_source_fail(self):
-        for field in ['editor','agents','archive','crdt','predecessors']:
-            with self.subTest(field=field):
-                e=connected_complete();e[field]=None
-                self.assertNotEqual(self.check(e)['exit'],0)
 if __name__=='__main__':unittest.main()
 
 class CompleteEvidenceTests(unittest.TestCase):
@@ -44,7 +34,7 @@ class CompleteEvidenceTests(unittest.TestCase):
                 if name=='connected':
                     editor={'api':'TextDocument.save','saved':True,'dirty':False,'installed_version':'actual-test-version','cleanup':{'remaining':[]},'sha256':'a'*64,'expected_sha256':'a'*64,'progress':{'shared_receipt':{'head':'h'}}}
                     inventory={'instructions.md':{'sha256':'a'*64},'reports/result.json':{'sha256':'b'*64}}
-                    archive={'network_mode':'none','mounts':[],'credentials_absent':True,'network_denied':[1,1],'original_denied':[1,1,1],'actual':inventory,'expected':{'inventory':inventory},'rejected_absent':True,'corruption':{'ok':False}}
+                    archive={'exported':{'ok':True},'verified':{'ok':True},'restored':{'ok':True},'network_mode':'none','mounts':[],'credentials_absent':True,'network_denied':[1,1],'original_denied':[1,1,1],'actual':inventory,'expected':{'inventory':inventory},'rejected_absent':True,'corruption':{'ok':False}}
                     connected_row=old['journeys'][n];connected_row['worker_private']={'expected_hash':'b'*64};connected_row['replacement']={'actual':{'file':'hash'},'expected':{'file':'hash'},'unmount':{'still_mounted':False},'discarded':'/private/live'};records=[{'case':'connected','journey':connected_row,'editor':editor,'archive':archive}]
                 if name=='mounted':
                     records=[r for r in records if not r['case'].startswith('actual-agent')];before=[];after=[]
@@ -112,3 +102,38 @@ class CompleteEvidenceTests(unittest.TestCase):
                 else:race['policy_race']=[409,{'code':'other'}]
             self.mutate_raw(e,'dependencies',change)
             with self.subTest(kind=kind):self.assertNotEqual(self.q.normalize(e)['exit'],0)
+
+    def test_each_required_family_missing_fails(self):
+        for family in [*(f'S{x}' for x in range(1,16)),*(f'P{x}' for x in range(1,13))]:
+            with self.subTest(family=family):
+                e=self.fixture();self.assertEqual(self.q.normalize(e)['exit'],0)
+                del e['matrix'][family]
+                result=self.q.normalize(e)
+                self.assertEqual(result['exit'],1);self.assertIn('complete exact matrix',result['errors'])
+
+    def test_missing_app_restore_and_static_source_fail(self):
+        for field,label in [('editor','raw fields connected'),('archive','raw fields connected'),('agents','two agents/two phases'),('crdt','static bridges'),('predecessors','static bridges')]:
+            with self.subTest(field=field):
+                e=self.fixture();self.assertEqual(self.q.normalize(e)['exit'],0)
+                if field in ['editor','archive']:
+                    self.mutate_raw(e,'connected',lambda rows:rows[0].update({field:None}))
+                elif field=='agents':
+                    self.mutate_raw(e,'mounted',lambda rows:rows.__setitem__(slice(None),[r for r in rows if r['case']!='actual-agent-file']))
+                else:
+                    static=self.q.read(e['static']);static[field]={'passed':False} if field=='crdt' else {};e['static']=self.write('mutated-static.json',static)
+                result=self.q.normalize(e)
+                self.assertEqual(result['exit'],1);self.assertIn(label,result['errors'])
+
+    def test_positive_archive_phases_require_exact_success(self):
+        # Removing any positive-phase check must let its isolated mutation qualify.
+        for phase in ['exported','verified','restored']:
+            for kind,value in [('missing',None),('null',None),('list',[]),('string','ok'),('boolean',True),('empty',{}),('false',{'ok':False}),('null_ok',{'ok':None}),('integer_ok',{'ok':1}),('string_ok',{'ok':'true'})]:
+                with self.subTest(phase=phase,kind=kind):
+                    e=self.fixture();self.assertEqual(self.q.normalize(e)['exit'],0)
+                    def change(rows):
+                        archive=rows[0]['archive']
+                        if kind=='missing':del archive[phase]
+                        else:archive[phase]=value
+                    self.mutate_raw(e,'connected',change)
+                    result=self.q.normalize(e)
+                    self.assertEqual(result['exit'],1);self.assertIn('archive positive '+phase,result['errors'])

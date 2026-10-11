@@ -49,6 +49,8 @@ def normalize(e):
                     row=records[0];replacement=row['journey']['replacement'];need(replacement['actual']==replacement['expected'] and replacement['unmount']['still_mounted'] is False and replacement['discarded']=='/private/live','ephemeral replacement reconstruction');connected_rows.append(row['journey']);editor=row['editor'];archive=row['archive']
                     need(editor['api']=='TextDocument.save' and editor['saved'] is True and editor['dirty'] is False and bool(editor['installed_version']) and editor['cleanup']['remaining']==[],'real editor')
                     need(editor['sha256']==editor['expected_sha256'] and editor['progress']['shared_receipt'] is not None,'editor shared bytes')
+                    for phase in ['exported','verified','restored']:
+                        result=archive.get(phase);need(isinstance(result,dict) and result.get('ok') is True,'archive positive '+phase)
                     need(archive['network_mode']=='none' and archive['mounts']==[] and archive['credentials_absent'] is True and len(archive['network_denied'])==2 and len(archive['original_denied'])>=3,'independent restore')
                     need(archive['actual']==archive['expected']['inventory'] and archive['rejected_absent'] is True and archive['corruption']['ok'] is False,'archive bytes/corruption')
                     need(archive['actual']['instructions.md']['sha256']==editor['sha256'] and archive['actual']['reports/result.json']['sha256']==row['journey']['worker_private']['expected_hash'],'same journey editor/report archive')
