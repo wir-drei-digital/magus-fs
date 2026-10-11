@@ -8,7 +8,7 @@ PostgreSQL/S3. Ordinary processes hold descriptors and working directories acros
 import argparse, errno, hashlib, json, os, secrets, shutil, signal, subprocess, sys, time, traceback
 from pathlib import Path
 from infra import OwnedInfra, InfrastructureUnavailable, ROOT
-from provenance import capture, verify_image
+from provenance import capture, verify_image, resolve_reused_image
 from service_protocol import identity, file_entry, GROUP
 from service_storage import NS, ALICE, object_id
 from full_native import Endpoint, NativeJourney
@@ -532,23 +532,26 @@ def readable_in(mount, path):
 
 def main():
     ap = argparse.ArgumentParser();ap.add_argument('--output', required=True);ap.add_argument('--platform', choices=['all', 'macos', 'linux'], default='all')
+    ap.add_argument('--reuse-image', metavar='IMAGE', help='borrow a source-matched dev runtime image; development evidence only')
     ap.add_argument('--case', action='append', choices=['core', 'structural', 'recovery', 'causality', 'races', 'nfs'])
-    a = ap.parse_args();cases = a.case or ['core', 'structural', 'recovery', 'causality', 'races', 'nfs'];i = OwnedInfra(a.output);j = None;code = 1;evidence = []
+    a = ap.parse_args();cases = a.case or ['core', 'structural', 'recovery', 'causality', 'races', 'nfs'];i = OwnedInfra(a.output);j = None;code = 1;evidence = [];build_reuse = {'requested': a.reuse_image} if a.reuse_image else None
     platforms = ['macos', 'linux'] if a.platform == 'all' else [a.platform]
     def record(platform, case, **data):evidence.append({'platform': platform, 'case': case, **data});i.write_json('native-complete-evidence.json', evidence)
     try:
         if sys.platform != 'darwin' or not Path('/sbin/mount_nfs').exists():raise InfrastructureUnavailable('macOS host with /sbin/mount_nfs required')
         i.preflight();source = capture(i)
+        if a.reuse_image:build_reuse = resolve_reused_image(i, a.reuse_image)
         i.write_json('toolchain.json', {'rustc': i.run(['rustc', '+stable', '--version', '--verbose']).stdout, 'sw_vers': i.run(['sw_vers']).stdout, 'uname': i.run(['uname', '-a']).stdout})
         if 'core' in cases:
             if 'macos' in platforms:host_matrix(i, record)
             if 'linux' in platforms:linux_matrix(i, record)
         service_cases = [c for c in cases if c != 'core']
         if service_cases:
-            image = i.owner + '-native';i.write_json('image-ownership.json', {'tag': image, 'intent': 'retained native test image'})
+            image = build_reuse['image'] if build_reuse else i.owner + '-native'
+            if not build_reuse:i.write_json('image-ownership.json', {'tag': image, 'intent': 'retained native test image'})
             i.run(['cargo', '+stable', 'build', '--locked', '-p', 'magus-fs', '--features', 'test-faults'], timeout=600);shutil.copyfile(ROOT / 'target/debug/magus-fs', ROOT / 'target/debug/magus-fs-client-faults');os.chmod(ROOT / 'target/debug/magus-fs-client-faults', 0o755)
             i.run(['cargo', '+stable', 'build', '--locked', '-p', 'magus-fs', '-p', 'magus-fs-service'], timeout=600)
-            i.docker('build', '-f', 'tests/fs2/Dockerfile.linux', '--build-arg', 'VERIFY=0', '--label', 'magus.fs2.owner=' + i.owner, '-t', image, '.', timeout=1800)
+            if not build_reuse:i.docker('build', '-f', 'tests/fs2/Dockerfile.linux', '--build-arg', 'VERIFY=0', '--label', 'magus.fs2.owner=' + i.owner, '-t', image, '.', timeout=1800)
             i.setup(image);verify_image(i, source)
             i.write_json('native-binaries.json', {n: {'host': hashlib.sha256((ROOT / 'target/debug' / n).read_bytes()).hexdigest(), 'linux': i.docker('exec', i.service, 'sha256sum', '/usr/local/bin/' + n).stdout.split()[0]} for n in ['magus-fs', 'magus-fs-client-faults']})
             j = Complete(i, image, platforms, service_cases);j.record = record;j.run()
@@ -562,6 +565,6 @@ def main():
             try:step()
             except Exception as e:errors.append({'reason': str(e), 'trace': traceback.format_exc()})
         if errors:i.write_json('cleanup-failure.json', errors);code = 1
-        i.write_json('result.json', {'passed': code == 0, 'exit': code, 'scope': 'FS2-B Task 1 native completion', 'platform': a.platform, 'cases': cases, 'evidence_records': len(evidence), 'complete_gate': a.platform == 'all' and not a.case})
+        i.write_json('result.json', {'passed': code == 0, 'exit': code, 'scope': 'FS2-B Task 1 native completion', 'platform': a.platform, 'cases': cases, 'evidence_records': len(evidence), 'complete_gate': a.platform == 'all' and not a.case and not a.reuse_image, 'build_reuse': build_reuse})
     return code
 if __name__ == '__main__':sys.exit(main())

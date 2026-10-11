@@ -11,7 +11,7 @@ negatives, the killable text worker deadline and atomicity across a killed servi
 import argparse, concurrent.futures, copy, hashlib, json, os, secrets, shutil, sys, time, traceback
 from pathlib import Path
 from infra import OwnedInfra, InfrastructureUnavailable, ROOT
-from provenance import capture, verify_image
+from provenance import capture, verify_image, resolve_reused_image
 from service_protocol import identity, file_entry, canonical, GROUP, REPLICA, WORKER
 from service_storage import NS, ALICE, object_id
 from full_native import Endpoint, NativeJourney
@@ -792,17 +792,20 @@ tmp=s['file']+'.editor-save';open(tmp,'wb').write(ram);os.replace(tmp,s['file'])
 
 def main():
     ap = argparse.ArgumentParser();ap.add_argument('--output', required=True)
+    ap.add_argument('--reuse-image', metavar='IMAGE', help='borrow a source-matched dev image; development evidence only')
     ap.add_argument('--phase', action='append', choices=Reconciliation.PHASES, help='focused development run; the gate needs all phases');a = ap.parse_args()
-    i = OwnedInfra(a.output);j = None;code = 1;evidence = []
+    i = OwnedInfra(a.output);j = None;code = 1;evidence = [];build_reuse = {'requested': a.reuse_image} if a.reuse_image else None
     def record(platform, case, **data):evidence.append({'platform': platform, 'case': case, **data});i.write_json('reconciliation-evidence.json', evidence)
     try:
         if sys.platform != 'darwin':raise InfrastructureUnavailable('macOS host required for the native ordinary-folder client')
         i.preflight();source = capture(i)
+        if a.reuse_image:build_reuse = resolve_reused_image(i, a.reuse_image)
         i.write_json('toolchain.json', {'rustc': i.run(['rustc', '+stable', '--version', '--verbose']).stdout, 'sw_vers': i.run(['sw_vers']).stdout, 'uname': i.run(['uname', '-a']).stdout})
-        image = i.owner + '-reconciliation';i.write_json('image-ownership.json', {'tag': image, 'intent': 'owned reconciliation test image'})
+        image = build_reuse['image'] if build_reuse else i.owner + '-reconciliation'
+        if not build_reuse:i.write_json('image-ownership.json', {'tag': image, 'intent': 'owned reconciliation test image'})
         i.run(['cargo', '+stable', 'build', '--locked', '-p', 'magus-fs', '--features', 'test-faults'], timeout=900);shutil.copyfile(ROOT / 'target/debug/magus-fs', ROOT / 'target/debug/magus-fs-client-faults');os.chmod(ROOT / 'target/debug/magus-fs-client-faults', 0o755)
         i.run(['cargo', '+stable', 'build', '--locked', '-p', 'magus-fs', '-p', 'magus-fs-service'], timeout=900)
-        i.docker('build', '-f', 'tests/fs2/Dockerfile.linux', '--build-arg', 'VERIFY=0', '--label', 'magus.fs2.owner=' + i.owner, '-t', image, '.', timeout=2400)
+        if not build_reuse:i.docker('build', '-f', 'tests/fs2/Dockerfile.linux', '--build-arg', 'VERIFY=0', '--label', 'magus.fs2.owner=' + i.owner, '-t', image, '.', timeout=2400)
         i.setup(image);verify_image(i, source)
         i.write_json('binaries.json', {'host': {n: hashlib.sha256((ROOT / 'target/debug' / n).read_bytes()).hexdigest() for n in ['magus-fs', 'magus-fs-client-faults']},
                                        'linux': {n: i.docker('exec', i.service, 'sha256sum', '/usr/local/bin/' + n).stdout.split()[0] for n in ['magus-fs', 'magus-fs-client-faults', 'magus-fs-service', 'magus-fs-service-faults']}})
@@ -824,6 +827,6 @@ def main():
             try:step()
             except Exception as e:errors.append({'reason': str(e), 'trace': traceback.format_exc()})
         if errors:i.write_json('cleanup-failure.json', errors);code = 1
-        i.write_json('result.json', {'passed': code == 0, 'exit': code, 'scope': 'FS2-B Task 2 reconciliation', 'phases': a.phase or Reconciliation.PHASES, 'complete_gate': not a.phase, 'evidence_records': len(evidence)})
+        i.write_json('result.json', {'passed': code == 0, 'exit': code, 'scope': 'FS2-B Task 2 reconciliation', 'phases': a.phase or Reconciliation.PHASES, 'complete_gate': not a.phase and not a.reuse_image, 'build_reuse': build_reuse, 'evidence_records': len(evidence)})
     print(json.dumps({'exit': code, 'output': str(i.output)}));return code
 if __name__ == '__main__':sys.exit(main())

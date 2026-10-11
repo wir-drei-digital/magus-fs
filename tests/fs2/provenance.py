@@ -49,3 +49,14 @@ def verify_image(infra,before,host_profile="debug"):
         image=json.loads(infra.docker('image','inspect',x['Image']).stdout)[0]
         assert image['Architecture']=='arm64'
     infra.write_json('image-source.json',{'matched':True,'files':len(actual),'binaries':binaries,'service_image':infra.inspect('container',infra.service)['Image'],'platform':arch,'selected_backend_manifests':selected})
+
+def resolve_reused_image(infra, reference):
+    """Pin a borrowed debug runtime image; source verification remains mandatory."""
+    image = json.loads(infra.docker('image', 'inspect', reference).stdout)[0]
+    profile = (image['Config'].get('Labels') or {}).get('magus.fs2.build-profile')
+    if profile != 'dev':
+        raise ValueError('reused runtime image requires magus.fs2.build-profile=dev')
+    immutable = image['Id']
+    if not immutable.startswith('sha256:') or len(immutable) != 71:
+        raise ValueError('reused runtime image has no immutable sha256 Id')
+    return {'requested': reference, 'image': immutable, 'profile': profile}
