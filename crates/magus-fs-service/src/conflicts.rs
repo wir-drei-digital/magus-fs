@@ -904,6 +904,21 @@ mod tests {
                 "unreadable history={history}"
             );
         }
+        // The same move stays IN a root-scoped reader's authority. The real current
+        // ancestor must authorize access even when the old ancestor remains readable.
+        let root_scope = [String::new()];
+        let check_current = |current: &Tree, history| {
+            views::alternative(&side, current, &authority, &root_scope, history, Some(&id))
+                .map(|_| ())
+                .map_err(|e| e.code)
+        };
+        let mut denied_parent = moved.clone();
+        denied_parent.entries[1].mode = 0o644;
+        for history in [false, true] {
+            assert_eq!(check_current(&moved, history), Ok(()));
+            assert_eq!(check_current(&denied_parent, history), Err("not_found"));
+            assert_eq!(check_current(&moved, history), Ok(()));
+        }
         // The current side at the out-of-scope location is never disclosed.
         let mut current_side = side.clone();
         current_side.tree = moved.clone();

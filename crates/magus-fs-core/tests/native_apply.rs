@@ -1556,6 +1556,7 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
     );
 }
 
+#[cfg(feature = "test-faults")]
 fn nested_fixture() -> (tempfile::TempDir, Replica, NativeConfig, RevisionId) {
     let d = scratch();
     let parent = d.path().join("p");

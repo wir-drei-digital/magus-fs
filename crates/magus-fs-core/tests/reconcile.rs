@@ -763,3 +763,99 @@ fn explicit_resolution_applies_per_conflict_choices_and_base_selection() {
     assert_eq!(at(&all_base, "a").content, at(&base, "a").content);
     assert_eq!(at(&all_base, "c").content, at(&right, "c").content);
 }
+
+#[test]
+fn selected_collision_locations_preserve_both_identities() {
+    for reversed in [false, true] {
+        for folded in [false, true] {
+            for directories in [false, true] {
+                let f = Fixture::new();
+                for (name, n) in [
+                    ("a", if reversed { 2 } else { 1 }),
+                    ("b", if reversed { 1 } else { 2 }),
+                ] {
+                    f.ids.borrow_mut().insert(
+                        name.into(),
+                        EntryId::parse(format!("entry:{n:032x}")).unwrap(),
+                    );
+                }
+                let make = |name: &str, path: &str| {
+                    let mut e = f.file_as(name, path, name.as_bytes());
+                    if directories {
+                        e.content = EntryContent::Directory;
+                    }
+                    e
+                };
+                let tree = |a: &str, b: &str| {
+                    let mut entries = vec![make("a", a), make("b", b)];
+                    if directories {
+                        for (name, path) in [("a", a), ("b", b)] {
+                            let mut child = f.file_as(
+                                &format!("{name}/child"),
+                                &format!("{path}/child"),
+                                name.as_bytes(),
+                            );
+                            child.parent = f.id(name);
+                            entries.push(child);
+                        }
+                    }
+                    f.tree(entries)
+                };
+                let base = tree("a", "b");
+                let left = tree("x", "b");
+                let right = tree("a", if folded { "X" } else { "x" });
+                assert_eq!(conflicts(f.merge(&base, &left, &right, &opaque())).len(), 2);
+                for (side, expected) in [
+                    (Side::Left, &left),
+                    (Side::Right, &right),
+                    (Side::Base, &base),
+                ] {
+                    let result =
+                        resolve_trees(&base, &left, &right, &opaque(), &f.store, side).unwrap();
+                    assert_eq!(&result, expected, "reversed={reversed} folded={folded} directories={directories} side={side:?}");
+                    let choices = BTreeMap::from([(f.id("a"), side), (f.id("b"), side)]);
+                    assert_eq!(
+                        resolve_trees_with(
+                            &base,
+                            &left,
+                            &right,
+                            &opaque(),
+                            &f.store,
+                            Side::Right,
+                            &choices
+                        )
+                        .unwrap(),
+                        *expected
+                    );
+                }
+                let impossible =
+                    BTreeMap::from([(f.id("a"), Side::Left), (f.id("b"), Side::Right)]);
+                assert!(resolve_trees_with(
+                    &base,
+                    &left,
+                    &right,
+                    &opaque(),
+                    &f.store,
+                    Side::Base,
+                    &impossible
+                )
+                .is_err());
+                let compatible =
+                    BTreeMap::from([(f.id("a"), Side::Right), (f.id("b"), Side::Left)]);
+                assert_eq!(
+                    resolve_trees_with(
+                        &base,
+                        &left,
+                        &right,
+                        &opaque(),
+                        &f.store,
+                        Side::Left,
+                        &compatible
+                    )
+                    .unwrap(),
+                    base
+                );
+            }
+        }
+    }
+}

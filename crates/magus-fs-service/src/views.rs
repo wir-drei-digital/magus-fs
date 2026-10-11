@@ -85,9 +85,14 @@ pub fn alternative(
                 || (e.content == EntryContent::Directory && crate::auth::within(p, &e.path))
         })
     };
-    authority
-        .entries
-        .retain(|e| history || now.get(&e.id).is_some_and(|p| in_scope(p)));
+    authority.entries.retain(|e| {
+        match now.get(&e.id).filter(|present| in_scope(present)) {
+            // Current locations and their actual ancestors govern present identities.
+            // Historical parent links below are only for the historical projection.
+            Some(_) => authorize_tree_read(current, &e.id, a).is_ok(),
+            None => history,
+        }
+    });
     for e in &mut authority.entries {
         // Current permissions apply only where the identity currently lies in scope; one
         // moved out of scope keeps its historic metadata exactly like a deleted one (R19-C).

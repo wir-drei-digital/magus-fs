@@ -212,6 +212,8 @@ impl Server {
                                     | "sync-integrate"
                                     | "sync-declare"
                                     | "sync-recovery-list"
+                                    | "sync-recovery-import"
+                                    | "sync-recovery-compare"
                                     | "sync-recovery-capture"
                                     | "sync-recovery-export"
                                     | "sync-recovery-release"
@@ -237,6 +239,7 @@ impl Server {
                                             | "sync-declare"
                                             | "sync-drain"
                                             | "sync-recovery-capture"
+                                            | "sync-recovery-import"
                                             | "sync-recovery-release"
                                             | "sync-recovery-inspect"
                                             | "sync-recovery-settle"
@@ -327,6 +330,29 @@ mod tests {
         )
         .unwrap();
         let server = Server::start(rep.clone(), &path, false).unwrap();
+        for command in ["sync-recovery-import", "sync-recovery-compare"] {
+            let response = request(
+                &path,
+                command,
+                &BTreeMap::from([
+                    (
+                        "archive".into(),
+                        path.join("absent-archive").to_str().unwrap().into(),
+                    ),
+                    (
+                        "operation-id".into(),
+                        OperationId::random().unwrap().as_str().to_owned(),
+                    ),
+                ]),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                response.value["error"], "io_error",
+                "{command}: {}",
+                response.value
+            );
+        }
         let mut stream = UnixStream::connect(path.join("control.sock")).unwrap();
         timeouts(&stream).unwrap();
         let bytes = serde_json::to_vec(&Request {
@@ -342,6 +368,34 @@ mod tests {
         let read = stream.read_to_end(&mut response);
         drop(stream);
         drop(server);
+        let readonly = Server::start(rep.clone(), &path, true).unwrap();
+        for (command, expected) in [
+            ("sync-recovery-import", "read_only"),
+            ("sync-recovery-compare", "io_error"),
+        ] {
+            let response = request(
+                &path,
+                command,
+                &BTreeMap::from([
+                    (
+                        "archive".into(),
+                        path.join("absent-archive").to_str().unwrap().into(),
+                    ),
+                    (
+                        "operation-id".into(),
+                        OperationId::random().unwrap().as_str().to_owned(),
+                    ),
+                ]),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                response.value["error"], expected,
+                "{command}: {}",
+                response.value
+            );
+        }
+        drop(readonly);
         drop(rep);
         fs::remove_dir_all(path).unwrap();
         assert!(

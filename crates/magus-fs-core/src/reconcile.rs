@@ -838,17 +838,23 @@ impl<'a> Reconciler<'a> {
                 break;
             }
         }
-        // 3. Case-folded (parent, name) collisions between distinct identities.
-        let mut slots: BTreeMap<(EntryId, String), Vec<EntryId>> = BTreeMap::new();
-        for e in entries.values() {
-            slots
-                .entry((e.parent.clone(), fold(&e.path)))
-                .or_default()
-                .push(e.id.clone());
-        }
-        for ids in slots.into_values().filter(|ids| ids.len() > 1) {
-            match self.prefer {
-                None => {
+        // 3. Repair the whole selected arrangement, not just a winning occupant.
+        // A repair may expose another collision at a selected location. Each identity
+        // can move to its fixed selected location once; unchanged collisions are invalid.
+        for _ in 0..=entries.len() {
+            let mut slots: BTreeMap<(EntryId, String), Vec<EntryId>> = BTreeMap::new();
+            for e in entries.values() {
+                slots
+                    .entry((e.parent.clone(), fold(&e.path)))
+                    .or_default()
+                    .push(e.id.clone());
+            }
+            let collisions: Vec<_> = slots.into_values().filter(|ids| ids.len() > 1).collect();
+            if collisions.is_empty() {
+                break;
+            }
+            for ids in collisions {
+                if self.prefer.is_none() {
                     let fresh = ids.iter().all(|id| !self.indexes[0].contains_key(id));
                     for id in &ids {
                         self.conflict(
@@ -861,20 +867,27 @@ impl<'a> Reconciler<'a> {
                         );
                         entries.remove(id);
                     }
-                }
-                Some(p) => {
-                    // Keep the identity whose location is the preferred input's own.
-                    let keep = ids
-                        .iter()
-                        .find(|id| {
-                            self.side(p, id).is_some_and(|s| {
-                                entries.get(*id).is_some_and(|e| loc(&s).parent == e.parent)
-                            })
-                        })
-                        .cloned()
-                        .ok_or(FsError::TargetCollision)?;
-                    for id in ids.into_iter().filter(|id| *id != keep) {
-                        remove_subtree(&mut entries, &id);
+                } else {
+                    let mut changed = false;
+                    for id in ids {
+                        let Some(e) = entries.get_mut(&id) else {
+                            continue;
+                        };
+                        match self.side(self.choose(&id).ok_or(FsError::TargetCollision)?, &id) {
+                            Some(selected) => {
+                                let location = loc(&selected);
+                                changed |= e.parent != location.parent || e.path != location.name;
+                                e.parent = location.parent;
+                                e.path = location.name;
+                            }
+                            None => {
+                                remove_subtree(&mut entries, &id);
+                                changed = true;
+                            }
+                        }
+                    }
+                    if !changed {
+                        return Err(FsError::TargetCollision);
                     }
                 }
             }
