@@ -4,6 +4,7 @@ mod changes;
 pub mod config;
 mod conflicts;
 pub mod db;
+pub mod dependencies;
 mod history;
 pub mod policy;
 mod publication;
@@ -168,6 +169,9 @@ async fn bounded(State(state): State<ServiceState>, req: Request, next: Next) ->
             "/candidates",
             "/integrations",
             "/resolutions",
+            "/declarations",
+            "/validations",
+            "/validated-integrations",
         ]
         .iter()
         .any(|suffix| path.ends_with(suffix));
@@ -179,7 +183,8 @@ async fn bounded(State(state): State<ServiceState>, req: Request, next: Next) ->
     } else {
         None
     };
-    let seconds = if req.uri().path().ends_with("/candidates")
+    let seconds = if req.uri().path().ends_with("/validated-integrations")
+        || req.uri().path().ends_with("/candidates")
         || req.uri().path().ends_with("/integrations")
         || req.uri().path().ends_with("/resolutions")
         || req.uri().path().ends_with("/seed")
@@ -196,6 +201,18 @@ async fn bounded(State(state): State<ServiceState>, req: Request, next: Next) ->
 }
 pub fn router(state: ServiceState) -> Router {
     Router::new()
+        .route(
+            "/v1/n/{namespace}/declarations",
+            post(dependencies::declare),
+        )
+        .route(
+            "/v1/n/{namespace}/validations",
+            post(dependencies::validate),
+        )
+        .route(
+            "/v1/n/{namespace}/validated-integrations",
+            post(publication::validated_integrate),
+        )
         .route(
             "/health",
             get(|| async { Json(json!({"protocol":SERVICE_PROTOCOL,"status":"ok"})) }),
@@ -437,6 +454,7 @@ async fn grants(
             getrandom::fill(&mut bytes).map_err(|_| Error::backend())?;
             let token = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
             let r = auth::Provision {
+                validator_policy: None,
                 authority: None, root_policy: None, merge_policy: None,
                 namespace: NamespaceId::parse(namespace.clone()).map_err(|_| Error::not_found())?,
                 principal: magus_fs_core::PrincipalId::parse(current.principal.clone())

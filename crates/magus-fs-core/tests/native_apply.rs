@@ -1481,7 +1481,7 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
             .unwrap()
             == 1
     };
-    assert_eq!(version(), 6);
+    assert_eq!(version(), 7);
     // From version 1: every later table is added in place.
     rusqlite::Connection::open(&db_path)
         .unwrap()
@@ -1493,7 +1493,7 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
     assert_eq!(rep.status().unwrap().head, Some(base.clone()));
     assert!(rep.list_native_recovery(actor()).unwrap().is_empty());
     drop(rep);
-    assert_eq!(version(), 6);
+    assert_eq!(version(), 7);
     assert!(table("native_recovery") && table("native_applied"));
     // From version 2 (recovery tables only): the applied-path table is added in place.
     rusqlite::Connection::open(&db_path)
@@ -1503,7 +1503,7 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
     let rep = Replica::reopen(d.path().join("state")).unwrap();
     assert_eq!(rep.status().unwrap().head, Some(base.clone()));
     drop(rep);
-    assert_eq!(version(), 6);
+    assert_eq!(version(), 7);
     assert!(table("native_applied"));
     // From version 3: sync records may now carry collaboration fields; same tables.
     rusqlite::Connection::open(&db_path)
@@ -1513,7 +1513,7 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
     let rep = Replica::reopen(d.path().join("state")).unwrap();
     assert_eq!(rep.status().unwrap().head, Some(base));
     drop(rep);
-    assert_eq!(version(), 6);
+    assert_eq!(version(), 7);
     // From version 4: recovery cursor/import roots are added without losing native work.
     rusqlite::Connection::open(&db_path)
         .unwrap()
@@ -1524,7 +1524,7 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
     let rep = Replica::reopen(d.path().join("state")).unwrap();
     assert_eq!(rep.incoming_recovery().unwrap().cursor, 0);
     drop(rep);
-    assert_eq!(version(), 6);
+    assert_eq!(version(), 7);
     assert!(table("incoming_recovery") && table("recovery_imports"));
     // From version5: settlement receipt table added without losing native/recovery work.
     rusqlite::Connection::open(&db_path)
@@ -1534,12 +1534,21 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
     let rep = Replica::reopen(d.path().join("state")).unwrap();
     assert!(rep.status().unwrap().head.is_some());
     drop(rep);
-    assert_eq!(version(), 6);
+    assert_eq!(version(), 7);
     assert!(table("native_settlements"));
+    // From version6: absent dependency supersession fields retain prior records.
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .pragma_update(None, "user_version", 6)
+        .unwrap();
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    assert!(rep.status().unwrap().head.is_some());
+    drop(rep);
+    assert_eq!(version(), 7);
     // A newer schema fails closed.
     rusqlite::Connection::open(&db_path)
         .unwrap()
-        .pragma_update(None, "user_version", 7)
+        .pragma_update(None, "user_version", 8)
         .unwrap();
     err(
         Replica::reopen(d.path().join("state")),

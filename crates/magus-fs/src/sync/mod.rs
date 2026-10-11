@@ -10,3 +10,5 @@ pub(crate) mod watch;
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod mounted;
+
+pub(crate) mod dependencies;

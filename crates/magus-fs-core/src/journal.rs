@@ -21,7 +21,7 @@ use std::{
 /// resolved links) that an older binary must not misread as ordinary pending work.
 /// 4 -> 5 adds recovery cursor/import roots; 5 -> 6 adds native settlement receipts and
 /// acknowledged inventory state that older binaries must not silently ignore.
-pub(crate) const SCHEMA_VERSION: u32 = 6;
+pub(crate) const SCHEMA_VERSION: u32 = 7;
 pub(crate) struct Journal {
     pub db: Connection,
     control: ObjectStore,
@@ -162,7 +162,7 @@ impl Journal {
   CREATE TABLE IF NOT EXISTS incoming_recovery (singleton INTEGER PRIMARY KEY CHECK(singleton=1), record BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS recovery_imports (operation TEXT PRIMARY KEY, source TEXT NOT NULL REFERENCES revisions(id), revision TEXT NOT NULL REFERENCES revisions(id), record BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS native_settlements (operation TEXT PRIMARY KEY, record BLOB NOT NULL);
-  PRAGMA user_version=6;")?;
+  PRAGMA user_version=7;")?;
         let encoded = serde_json::to_vec(&config).map_err(|_| FsError::InvalidDescriptor)?;
         if let Some(existing) = tx
             .query_row(

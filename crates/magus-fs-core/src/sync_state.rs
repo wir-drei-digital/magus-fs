@@ -122,12 +122,18 @@ pub struct SyncProgress {
     /// A shared resolution replaced this candidate's retained conflicts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<ResolvedBy>,
+    /// A complete shared descendant superseded this definitive dependency hold. Its
+    /// original private receipt/error remain unchanged; this never resolves conflicts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_superseded_by: Option<SharedReceipt>,
 }
 /// Bound on superseded integration attempts per candidate.
 pub const MAX_SUPERSEDED_INTEGRATIONS: usize = 32;
 /// Definitive service outcomes that end an uncertain integration/resolution attempt.
 pub const DEFINITIVE_OUTCOMES: &[&str] = &[
     "stale_head",
+    "dependency_changed",
+    "recompute_required",
     "conflicted",
     "already_resolved",
     "incomplete_resolution",
@@ -228,7 +234,10 @@ impl Record {
     pub(crate) fn unresolved(&self) -> bool {
         // A resolution replacement is not working-tree work, and a resolved candidate's
         // retained conflicts were replaced by an explicit shared resolution.
-        if self.progress.resolves.is_some() || self.progress.resolved_by.is_some() {
+        if self.progress.resolves.is_some()
+            || self.progress.resolved_by.is_some()
+            || self.progress.dependency_superseded_by.is_some()
+        {
             return false;
         }
         match self.progress.state {
@@ -484,6 +493,7 @@ impl Replica {
             resolves: None,
             resolution: None,
             resolved_by: None,
+            dependency_superseded_by: None,
         };
         let record = Record {
             pending: pending.clone(),
@@ -588,6 +598,7 @@ impl Replica {
             resolves: Some(target),
             resolution: None,
             resolved_by: None,
+            dependency_superseded_by: None,
         };
         let operation = pending.operation.as_str().to_owned();
         let record = json(&Record {
@@ -755,7 +766,10 @@ impl Replica {
         let superseding = old.integration.is_some()
             && old.integration != update.integration
             && old.state == SubmissionState::Failed
-            && old.error.as_deref() == Some("stale_head")
+            && matches!(
+                old.error.as_deref(),
+                Some("stale_head" | "dependency_changed" | "recompute_required")
+            )
             && !old.remote_outcome_unknown
             && update.superseded.len() == old.superseded.len() + 1
             && update.superseded.len() <= MAX_SUPERSEDED_INTEGRATIONS
@@ -771,6 +785,7 @@ impl Replica {
         if (!superseding && old.superseded != update.superseded)
             || old.resolves != update.resolves
             || old.resolved_by != update.resolved_by
+            || old.dependency_superseded_by != update.dependency_superseded_by
             || old.resolution.is_some() && old.resolution != update.resolution
         {
             return Err(FsError::OperationMismatch);
@@ -867,11 +882,57 @@ impl Replica {
         }) {
             return Err(FsError::InvalidDescriptor);
         }
+        let mut covered = vec![];
+        if old.shared_receipt.is_none()
+            && update.shared_receipt.is_some()
+            && update.resolves.is_none()
+        {
+            let mut ancestors = BTreeSet::new();
+            let mut cursor = update.local_revision.clone();
+            for _ in 0..128 {
+                if cursor == r.binding.view.revision {
+                    break;
+                }
+                let revision = core.revision(&cursor)?;
+                let [parent] = revision.parents.as_slice() else {
+                    break;
+                };
+                if !ancestors.insert(parent.clone()) {
+                    break;
+                }
+                cursor = parent.clone();
+            }
+            for mut prior in core.sync_records()? {
+                if prior.binding.transport_identity == r.binding.transport_identity
+                    && prior.binding.id == r.binding.id
+                    && prior.binding.branch == r.binding.branch
+                    && prior.progress.resolves.is_none()
+                    && prior.progress.resolved_by.is_none()
+                    && prior.progress.dependency_superseded_by.is_none()
+                    && prior.progress.state == SubmissionState::Failed
+                    && !prior.progress.remote_outcome_unknown
+                    && prior.progress.private_receipt.is_some()
+                    && prior.progress.shared_receipt.is_none()
+                    && matches!(
+                        prior.progress.error.as_deref(),
+                        Some("dependency_changed" | "recompute_required")
+                    )
+                    && ancestors.contains(&prior.pending.local_revision)
+                {
+                    prior.progress.dependency_superseded_by = update.shared_receipt.clone();
+                    covered.push(prior);
+                }
+            }
+        }
         r.progress = update;
-        core.journal.db.execute(
-            "UPDATE sync_queue SET record=? WHERE operation=?",
-            params![json(&r)?, operation.as_str()],
-        )?;
+        let tx = core.journal.db.unchecked_transaction()?;
+        for record in covered.iter().chain(std::iter::once(&r)) {
+            tx.execute(
+                "UPDATE sync_queue SET record=? WHERE operation=?",
+                params![json(record)?, record.pending.operation.as_str()],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
     /// Verified read for the trusted controller; never exposes an unverified cache body.

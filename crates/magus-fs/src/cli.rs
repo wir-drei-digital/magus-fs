@@ -34,6 +34,7 @@ fn args(mut argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
         "sync-attach" => vec!["state", "profile", "branch", "publication"],
         "sync-run" => vec!["state", "revision", "operation-id", "enqueue-only", "serve"],
         "sync-status" => vec!["state", "revision"],
+        "sync-declare" => vec!["state", "request"],
         "sync-drain" => vec!["state", "revision", "level", "deadline-ms"],
         "sync-integrate" => vec!["state", "revision", "expected-head"],
         "sync-recovery-list" => vec!["state"],
@@ -527,6 +528,14 @@ fn sync_control(rep: &Replica, command: &str, options: &BTreeMap<String, String>
     }
     if command.starts_with("sync-conflicts-") || command == "sync-resolve" {
         return conflicts_control(rep, command, options);
+    }
+    if command == "sync-declare" {
+        return Ok(
+            match crate::sync::dependencies::declare(rep, required(options, "request")?) {
+                Ok(v) => v,
+                Err(e) => json!({"ok":false,"error":e.code}),
+            },
+        );
     }
     if command == "sync-status" {
         let status = rep.sync_status().map_err(|e| (1, e))?;

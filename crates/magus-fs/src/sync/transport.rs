@@ -391,6 +391,8 @@ impl Transport {
                                         serde_json::from_slice(&bytes).unwrap_or_default();
                                     let code = match value["code"].as_str() {
                                         Some("stale_head") => "stale_head",
+                                        Some("dependency_changed") => "dependency_changed",
+                                        Some("recompute_required") => "recompute_required",
                                         Some("invalid_credential") => "invalid_credential",
                                         Some("backpressure") => "backpressure",
                                         Some("unsupported_operation") => "unsupported_operation",

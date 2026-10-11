@@ -108,6 +108,8 @@ pub async fn authenticate<C: GenericClient + Sync>(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provision {
+    #[serde(default)]
+    pub validator_policy: Option<crate::dependencies::ValidatorPolicy>,
     pub authority: Option<crate::policy::AuthorityConfig>,
     pub root_policy: Option<crate::policy::RootPolicy>,
     /// Optional trusted branch merge policy (FS2-B); absent means opaque.
@@ -125,13 +127,14 @@ pub struct Provision {
 impl Provision {
     pub fn validate(&self) -> Result<()> {
         crate::policy::validate(self)?;
-        if self.token.len() != 64
+        if (self.actions.iter().any(|a| a == "validate") && self.actions.len() != 1)
+            || self.token.len() != 64
             || !self
                 .token
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             || self.actions.is_empty()
-            || self.actions.len() > 6
+            || self.actions.len() > 7
             || self.branches.is_empty()
             || self.branches.len() > 64
             || self.prefixes.is_empty()
@@ -142,7 +145,13 @@ impl Provision {
         if self.actions.iter().any(|a| {
             !matches!(
                 a.as_str(),
-                "read" | "write" | "history" | "integrate" | "admin" | "retained_history"
+                "read"
+                    | "write"
+                    | "history"
+                    | "integrate"
+                    | "admin"
+                    | "retained_history"
+                    | "validate"
             )
         }) || self
             .branches

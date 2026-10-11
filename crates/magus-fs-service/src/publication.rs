@@ -20,15 +20,6 @@ struct SeedRequest {
     revision: RevisionId,
     upload: UploadId,
 }
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct IntegrationRequest {
-    operation: OperationId,
-    replica: ReplicaId,
-    candidate_receipt: ReceiptId,
-    expected_head: HeadToken,
-    branch: BranchName,
-}
 pub(crate) async fn barrier(name: &str) {
     #[cfg(feature = "test-faults")]
     if std::path::Path::new(&format!("/control/pause-{name}")).is_file() {
@@ -182,12 +173,40 @@ pub(crate) async fn integrate(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response> {
-    let c = state.auth(&headers, &ns, "integrate").await?;
     let req: IntegrationRequest = crate::json_body(body, &headers).await?;
+    let serialized = r::json(&req)?;
+    integrate_request(state, ns, headers, req, serialized, None).await
+}
+pub(crate) async fn validated_integrate(
+    State(state): State<ServiceState>,
+    Path(ns): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response> {
+    let req: ValidatedIntegrationRequest = crate::json_body(body, &headers).await?;
+    let serialized = r::json(&req)?;
+    integrate_request(
+        state,
+        ns,
+        headers,
+        req.integration,
+        serialized,
+        Some((req.declaration, req.validation)),
+    )
+    .await
+}
+async fn integrate_request(
+    state: ServiceState,
+    ns: String,
+    headers: HeaderMap,
+    req: IntegrationRequest,
+    serialized: String,
+    explicit: Option<(DeclarationId, Option<ValidationId>)>,
+) -> Result<Response> {
+    let c = state.auth(&headers, &ns, "integrate").await?;
     if req.replica.as_str() != c.replica {
         return Err(Error::not_found());
     }
-    let serialized = r::json(&req)?;
     for attempt in 0..3 {
         if let Some(op) =
             submission::operation(&state, &c, req.replica.as_str(), req.operation.as_str()).await?
@@ -352,14 +371,15 @@ pub(crate) async fn integrate(
         };
         let root = current.tree.root.id.clone();
         barrier("integration").await;
-        let commit=state.db.acquire().await?.run(|db|{let req=&req;let serialized=&serialized;let s=&s;let receipt=&receipt;let original=&original;let decision=&decision;let published=&published;let derived_id=&derived_id;let current_id=&current_id;let base_id=&base_id;let root=&root;Box::pin(async move {
+        let commit=state.db.acquire().await?.run(|db|{let req=&req;let serialized=&serialized;let s=&s;let receipt=&receipt;let original=&original;let decision=&decision;let published=&published;let derived_id=&derived_id;let current_id=&current_id;let base_id=&base_id;let root=&root;let explicit=&explicit;Box::pin(async move {
    let tx=db.transaction().await?;let current=r::recheck(&tx,s,"integrate").await?;
    if tx.query_opt("SELECT operation FROM operations WHERE namespace=$1 AND replica=$2 AND operation=$3",&[&current.namespace,&current.replica,&req.operation.as_str()]).await?.is_some(){return Err(Error::conflict())}
    let mut result = match decision {
     Decision::Stale => "{\"code\":\"stale_head\"}".to_owned(),
     _ => r::json(receipt)?,
    };
-   if let (Decision::Publish{provenance,..},Some((id,bytes,required,paths)))=(decision,published){
+   if let (Decision::Publish{provenance,revision},Some((id,bytes,required,paths)))=(decision,published){
+    crate::dependencies::check_publication(&tx,s,Some(&req.candidate_receipt),&revision.tree,explicit.as_ref().map(|(d,v)|(d,v.as_ref()))).await?;
     let generations=r::ready(&tx,&current,required,None,required).await?;
     if id != derived_id { r::save_revision(&tx,&current.namespace,id,bytes,&generations).await?; }
     if let (Decision::Publish{revision,..},Some(head))=(decision,s.current.as_ref()) { r::register_entries(&tx,&current.namespace,Some(&head.tree),&revision.tree).await?; r::publish_history(&tx,&current.namespace,req.branch.as_str(),revision).await?; }

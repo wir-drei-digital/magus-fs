@@ -12,7 +12,13 @@ pub const MAX_RESOLUTION_CONFLICTS: usize = 128;
 /// The 409 body code for an integration whose candidate retained immutable conflicts.
 pub const CONFLICTED: &str = "conflicted";
 
-opaque_id!(ConflictId, AlternativeId, HistoryId);
+opaque_id!(
+    ConflictId,
+    AlternativeId,
+    HistoryId,
+    DeclarationId,
+    ValidationId
+);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,4 +137,90 @@ impl ResolutionRequest {
 pub struct ConflictedIntegration {
     pub code: String,
     pub conflicts: Vec<ConflictId>,
+}
+
+/// Coverage is an explicit statement about only the declared set, never inferred.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyCoverage {
+    CompleteDeclared,
+    Partial,
+    Unknown,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadDependency {
+    pub view: ViewId,
+    pub revision: crate::RevisionId,
+    pub entry: EntryId,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MissingPathAssertion {
+    pub view: ViewId,
+    pub revision: crate::RevisionId,
+    pub path: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclareRequest {
+    pub operation: OperationId,
+    pub replica: ReplicaId,
+    pub candidate: ReceiptId,
+    pub reads: Vec<ReadDependency>,
+    pub missing: Vec<MissingPathAssertion>,
+    pub coverage: DependencyCoverage,
+    pub validator: Option<String>,
+}
+impl DeclareRequest {
+    pub fn validate(&self) -> Result<(), FsError> {
+        if self.reads.len() + self.missing.len() > 128 {
+            return Err(FsError::LimitExceeded);
+        }
+        for m in &self.missing {
+            crate::paths::validate_path(&m.path)?;
+        }
+        if self
+            .validator
+            .as_ref()
+            .is_some_and(|v| v.is_empty() || v.len() > 128)
+        {
+            return Err(FsError::InvalidDescriptor);
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclarationReceipt {
+    pub id: DeclarationId,
+    pub candidate: ReceiptId,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidatedIntegrationRequest {
+    pub integration: crate::IntegrationRequest,
+    pub declaration: DeclarationId,
+    pub validation: Option<ValidationId>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationOutcome {
+    Pass,
+    Fail,
+    Timeout,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationRecord {
+    pub operation: OperationId,
+    pub replica: ReplicaId,
+    pub declaration: DeclarationId,
+    pub expected_head: HeadToken,
+    pub validator: String,
+    pub version: String,
+    pub executable_hash: crate::ObjectId,
+    pub inputs: ViewBinding,
+    pub output: ReceiptId,
+    pub outcome: ValidationOutcome,
 }

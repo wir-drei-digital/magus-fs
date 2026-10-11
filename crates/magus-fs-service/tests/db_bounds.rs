@@ -115,6 +115,7 @@ async fn backend_error<T>(operation: impl std::future::Future<Output = Result<T>
 }
 fn records() -> Vec<auth::Provision> {
     vec![auth::Provision {
+        validator_policy: None,
         authority: None,
         root_policy: None,
         merge_policy: None,

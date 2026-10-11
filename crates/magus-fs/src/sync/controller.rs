@@ -531,12 +531,20 @@ impl SyncController {
     ) -> Result<SyncProgress, FsError> {
         let mut p = p;
         if let Some(old) = p.integration.clone() {
-            if old.expected_head == expected_head {
+            if old.expected_head == expected_head
+                && !matches!(
+                    p.error.as_deref(),
+                    Some("dependency_changed" | "recompute_required")
+                )
+            {
                 return Ok(p);
             }
             // Only a definitively stale attempt may be replaced, and it stays on record.
             if p.state != SubmissionState::Failed
-                || p.error.as_deref() != Some("stale_head")
+                || !matches!(
+                    p.error.as_deref(),
+                    Some("stale_head" | "dependency_changed" | "recompute_required")
+                )
                 || p.superseded.len() >= MAX_SUPERSEDED_INTEGRATIONS
             {
                 return Err(FsError::OperationMismatch);

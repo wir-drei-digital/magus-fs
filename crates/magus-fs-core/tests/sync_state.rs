@@ -948,3 +948,192 @@ fn incoming_cursor_and_safe_diagnostics_survive_owner_restart() {
         .unwrap()
         .contains("private.invalid"));
 }
+
+#[test]
+fn validation_hold_keeps_private_receipt_and_allows_fresh_publication_attempt() {
+    let (_d, rep, _w, base) = setup();
+    let b = binding(base.clone());
+    rep.configure_sync(b.clone()).unwrap();
+    let pending = pending(&rep, &b, base);
+    rep.enqueue_submission(pending.clone()).unwrap();
+    let mut p = rep.sync_status().unwrap().submissions.remove(0);
+    private(&rep, &b, &mut p);
+    let first = integration(&p, &b, b.view.head.clone());
+    p.integration = Some(first.clone());
+    p.state = SubmissionState::Uncertain;
+    p.remote_outcome_unknown = true;
+    rep.record_sync_progress(&p.operation, SubmissionState::PrivateRemote, p.clone())
+        .unwrap();
+    // An attempt cannot be replaced while its outcome is unknown.
+    let mut early = p.clone();
+    early.superseded = vec![first.clone()];
+    early.integration = None;
+    err(
+        rep.record_sync_progress(&p.operation, SubmissionState::Uncertain, early),
+        "operation_mismatch",
+    );
+    p.state = SubmissionState::Failed;
+    p.error = Some("recompute_required".into());
+    p.remote_outcome_unknown = false;
+    rep.record_sync_progress(&p.operation, SubmissionState::Uncertain, p.clone())
+        .unwrap();
+    // Replacing without recording the stale attempt, or reordering history, is rejected.
+    let mut silent = p.clone();
+    silent.integration = Some(integration(&p, &b, HeadToken::random().unwrap()));
+    err(
+        rep.record_sync_progress(&p.operation, SubmissionState::Failed, silent),
+        "operation_mismatch",
+    );
+    let mut reused = p.clone();
+    reused.superseded = vec![first.clone()];
+    reused.integration = Some(first.clone());
+    err(
+        rep.record_sync_progress(&p.operation, SubmissionState::Failed, reused),
+        "operation_mismatch",
+    );
+    let mut next = p.clone();
+    next.superseded = vec![first.clone()];
+    next.integration = Some(integration(&p, &b, HeadToken::random().unwrap()));
+    next.state = SubmissionState::Uncertain;
+    next.remote_outcome_unknown = true;
+    next.error = None;
+    rep.record_sync_progress(&p.operation, SubmissionState::Failed, next.clone())
+        .unwrap();
+    // A retained conflict is a definitive service outcome; the history stays immutable.
+    next.state = SubmissionState::Failed;
+    next.error = Some("conflicted".into());
+    next.remote_outcome_unknown = false;
+    rep.record_sync_progress(&p.operation, SubmissionState::Uncertain, next.clone())
+        .unwrap();
+    let mut rewrite = next.clone();
+    rewrite.superseded.clear();
+    err(
+        rep.record_sync_progress(&p.operation, SubmissionState::Failed, rewrite),
+        "operation_mismatch",
+    );
+    let stored = rep.sync_status().unwrap().submissions.remove(0);
+    assert_eq!(stored.superseded, vec![first]);
+    assert_eq!(stored.error.as_deref(), Some("conflicted"));
+    assert_eq!(rep.pending_submissions().unwrap(), vec![pending]);
+}
+
+#[test]
+fn shared_descendant_covers_only_definitive_dependency_held_ancestors() {
+    for (code, ancestor, published) in [
+        ("dependency_changed", true, true),
+        ("recompute_required", true, true),
+        ("dependency_changed", false, true),
+        ("dependency_changed", true, false),
+        ("conflicted", true, true),
+        ("unknown_causality", true, true),
+    ] {
+        let (d, rep, w, base) = setup();
+        let mut b = binding(base.clone());
+        b.publication = PublicationMode::SharedLive;
+        rep.configure_sync(b.clone()).unwrap();
+        let mut revision = rep.revision(&base).unwrap();
+        revision.parents = vec![base.clone()];
+        revision.operation = OperationId::random().unwrap();
+        let old_id = import(&rep, &revision, ChunkSource::Unavailable);
+        rep.enqueue_submission(pending(&rep, &b, old_id.clone()))
+            .unwrap();
+        let mut old = rep.sync_status().unwrap().submissions.remove(0);
+        private(&rep, &b, &mut old);
+        old.integration = Some(integration(&old, &b, b.view.head.clone()));
+        old.state = SubmissionState::Failed;
+        old.error = Some(code.into());
+        rep.record_sync_progress(&old.operation, SubmissionState::PrivateRemote, old.clone())
+            .unwrap();
+        revision.parents = vec![if ancestor { old_id } else { base.clone() }];
+        revision.operation = OperationId::random().unwrap();
+        let new_id = import(&rep, &revision, ChunkSource::Unavailable);
+        rep.enqueue_submission(pending(&rep, &b, new_id)).unwrap();
+        let mut new = rep
+            .sync_status()
+            .unwrap()
+            .submissions
+            .into_iter()
+            .find(|x| x.operation != old.operation)
+            .unwrap();
+        private(&rep, &b, &mut new);
+        let request = integration(&new, &b, b.view.head.clone());
+        new.shared_receipt = published.then(|| SharedReceipt {
+            receipt: ReceiptId::random().unwrap(),
+            operation: request.operation.clone(),
+            replica: request.replica.clone(),
+            submitted_revision: new.local_revision.clone(),
+            branch: b.branch.clone(),
+            head: HeadToken::random().unwrap(),
+        });
+        new.integration = Some(request);
+        new.state = if published {
+            SubmissionState::Shared
+        } else {
+            SubmissionState::PrivateRemote
+        };
+        rep.record_sync_progress(&new.operation, SubmissionState::PrivateRemote, new.clone())
+            .unwrap();
+        let pending = rep.pending_submissions().unwrap();
+        assert_eq!(
+            pending.len(),
+            usize::from(
+                !(ancestor
+                    && published
+                    && matches!(code, "dependency_changed" | "recompute_required"))
+            ) + usize::from(!published),
+            "{code}"
+        );
+        let retained = rep
+            .sync_status()
+            .unwrap()
+            .submissions
+            .into_iter()
+            .find(|x| x.operation == old.operation)
+            .unwrap();
+        assert_eq!(retained.private_receipt, old.private_receipt);
+        assert_eq!(retained.error, old.error);
+        assert!(retained.shared_receipt.is_none());
+        let before = rep.sync_status().unwrap().submissions;
+        rep.record_sync_progress(&new.operation, new.state, new.clone())
+            .unwrap();
+        assert_eq!(rep.sync_status().unwrap().submissions, before);
+        drop(w);
+        drop(rep);
+        let reopened = Replica::reopen(d.path().join("state")).unwrap();
+        assert_eq!(reopened.sync_status().unwrap().submissions, before);
+    }
+}
+
+#[test]
+fn foreign_binding_cannot_cover_dependency_hold() {
+    for field in ["owner", "namespace", "branch"] {
+        let (_d, rep, _w, base) = setup();
+        let mut b = binding(base.clone());
+        b.publication = PublicationMode::SharedLive;
+        rep.configure_sync(b.clone()).unwrap();
+        rep.enqueue_submission(pending(&rep, &b, base)).unwrap();
+        let mut old = rep.sync_status().unwrap().submissions.remove(0);
+        private(&rep, &b, &mut old);
+        old.integration = Some(integration(&old, &b, b.view.head.clone()));
+        old.state = SubmissionState::Failed;
+        old.error = Some("dependency_changed".into());
+        rep.record_sync_progress(&old.operation, SubmissionState::PrivateRemote, old.clone())
+            .unwrap();
+        let before = rep.sync_status().unwrap().submissions;
+        let mut foreign = b.clone();
+        foreign.source = RemoteSourceId::random().unwrap();
+        match field {
+            "owner" => {
+                foreign.transport_identity = TransportIdentity::for_bytes(b"foreign-owner").unwrap()
+            }
+            "namespace" => foreign.id = NamespaceId::random().unwrap(),
+            "branch" => foreign.branch = BranchName::parse("other".into()).unwrap(),
+            _ => unreachable!(),
+        }
+        err(rep.register_sync_source(foreign.clone()), "config_mismatch");
+        assert!(rep.configure_sync(foreign).is_err());
+        assert_eq!(rep.sync_status().unwrap().submissions, before);
+        assert_eq!(rep.pending_submissions().unwrap().len(), 1);
+        assert!(before[0].dependency_superseded_by.is_none());
+    }
+}

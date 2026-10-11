@@ -679,6 +679,7 @@ pub(crate) async fn resolve(
                 return Err(Error::conflict());
             }
             if !stale {
+                crate::dependencies::check_publication(&tx,s,Some(&req.replacement),resolved_tree,None).await?;
                 let all: Vec<String> = ids.iter().chain(superseded.iter()).cloned().collect();
                 let open: i64 = tx.query_one("SELECT count(*) FROM conflicts c WHERE c.namespace=$1 AND c.id=ANY($2) AND NOT EXISTS(SELECT 1 FROM conflict_resolutions x WHERE x.conflict=c.id)",&[&current.namespace,&all]).await?.get(0);
                 if open != all.len() as i64 {

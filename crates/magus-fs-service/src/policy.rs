@@ -83,6 +83,9 @@ pub async fn merge_policy<C: tokio_postgres::GenericClient + Sync>(
     }
 }
 pub fn validate(r: &Provision) -> Result<()> {
+    if let Some(p) = &r.validator_policy {
+        p.validate()?;
+    }
     if let Some(m) = &r.merge_policy {
         m.policy()?;
     }
@@ -114,6 +117,10 @@ pub fn validate(r: &Provision) -> Result<()> {
 }
 pub async fn install(tx: &tokio_postgres::Transaction<'_>, r: &Provision) -> Result<()> {
     let ns = r.namespace.as_str();
+    if let Some(p) = &r.validator_policy {
+        let value = crate::revisions::json(p)?;
+        tx.execute("INSERT INTO branch_validator_policy(namespace,branch,policy) VALUES($1,$2,$3) ON CONFLICT(namespace,branch) DO UPDATE SET policy=excluded.policy", &[&ns,&p.branch.as_str(),&value]).await?;
+    }
     if let Some(a) = &r.authority {
         let value = serde_json::to_string(a).map_err(|_| Error::invalid("invalid_policy"))?;
         let previous = tx
