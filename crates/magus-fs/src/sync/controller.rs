@@ -97,8 +97,8 @@ pub(crate) fn admit_engine_checkpoint(rep: &Replica) -> Result<(), FsError> {
     let Some(binding) = sync.binding else {
         return Ok(());
     };
-    let status = rep.status()?;
-    let Some(head) = status.head else {
+    let snapshot = rep.scheduling_snapshot()?;
+    let Some(head) = snapshot.head else {
         return Ok(());
     };
     if head == binding.view.revision || sync.submissions.iter().any(|p| p.local_revision == head) {
@@ -112,6 +112,12 @@ pub(crate) fn admit_engine_checkpoint(rep: &Replica) -> Result<(), FsError> {
         || revision.provenance != "engine_observed"
     {
         return Ok(());
+    }
+    // Only a novel eligible local checkpoint pays full body verification. Neither
+    // a metadata snapshot nor eligibility is authority to admit unchecked bytes.
+    let status = rep.status()?;
+    if status.head.as_ref() != Some(&head) || status.generation != snapshot.generation {
+        return Err(FsError::GenerationMismatch);
     }
     rep.enqueue_submission(PendingSubmission {
         operation: revision.operation,

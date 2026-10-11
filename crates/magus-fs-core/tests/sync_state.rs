@@ -1137,3 +1137,35 @@ fn foreign_binding_cannot_cover_dependency_hold() {
         assert!(before[0].dependency_superseded_by.is_none());
     }
 }
+
+#[test]
+fn scheduling_snapshot_is_atomic_metadata_and_stale_admission_still_fails() {
+    let (_d, rep, w, base) = setup();
+    let b = binding(base.clone());
+    rep.configure_sync(b.clone()).unwrap();
+    let original = rep.scheduling_snapshot().unwrap();
+    assert_eq!(original.head, Some(base));
+    assert!(!original.dirty);
+    let h = w.create("scheduler", 0o600).unwrap();
+    w.write(&h, 0, b"captured").unwrap();
+    let dirty = rep.scheduling_snapshot().unwrap();
+    assert!(dirty.dirty && dirty.generation > original.generation);
+    let operation = OperationId::random().unwrap();
+    let revision = w.checkpoint(&operation, dirty.generation, attr()).unwrap();
+    let captured = rep.scheduling_snapshot().unwrap();
+    assert_eq!(captured.head, Some(revision.clone()));
+    assert!(!captured.dirty);
+    assert_eq!(captured.generation, rep.status().unwrap().generation);
+    w.write(&h, 0, b"changed!").unwrap();
+    err(
+        rep.enqueue_submission(PendingSubmission {
+            operation,
+            local_revision: revision,
+            original_view: b.view.view,
+            original_head: b.view.head,
+            expected_local_generation: captured.generation,
+        }),
+        "generation_mismatch",
+    );
+    assert!(rep.pending_submissions().unwrap().is_empty());
+}

@@ -30,6 +30,13 @@ pub enum OpenMode {
     ReadWrite,
     Append,
 }
+/// Atomic working metadata for scheduling only; does not verify content or readiness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchedulingSnapshot {
+    pub head: Option<RevisionId>,
+    pub generation: u64,
+    pub dirty: bool,
+}
 #[derive(Clone, Debug)]
 pub struct ReplicaStatus {
     pub head: Option<RevisionId>,
@@ -822,6 +829,17 @@ impl Replica {
             }
         }
         Ok(ws)
+    }
+    /// Inspect scheduling metadata under the owner lock without inventorying cached
+    /// bodies. Callers must retain verification at capture/admission/use boundaries.
+    pub fn scheduling_snapshot(&self) -> Result<SchedulingSnapshot, FsError> {
+        let core = lock(&self.core)?;
+        let working = core.working.as_ref();
+        Ok(SchedulingSnapshot {
+            head: working.map(|w| w.head.clone()),
+            generation: working.map(|w| w.generation).unwrap_or(0),
+            dirty: working.is_some_and(|w| w.dirty),
+        })
     }
     pub fn status(&self) -> Result<ReplicaStatus, FsError> {
         let mut core = lock(&self.core)?;

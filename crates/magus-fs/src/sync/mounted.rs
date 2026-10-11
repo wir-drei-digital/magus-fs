@@ -33,7 +33,7 @@ impl MountedCapture {
             return Ok(None);
         };
         self.admit()?;
-        let status = self.rep.status()?;
+        let status = self.rep.scheduling_snapshot()?;
         if !status.dirty {
             self.observed = None;
             return Ok(None);
@@ -148,6 +148,23 @@ mod tests {
                 },
             )
         };
+        // A clean scheduler must not inventory/rehash resident bodies. A deliberately
+        // corrupted owned chunk makes the old idle verification deterministic.
+        let original_object = dir
+            .join("state/objects")
+            .join(ObjectId::for_bytes(b"old").unwrap().as_str());
+        fs::write(&original_object, b"bad").unwrap();
+        for _ in 0..3 {
+            assert!(capture
+                .tick(checkpoint)
+                .expect("idle tick must use metadata only")
+                .is_none());
+        }
+        assert!(
+            matches!(rep.status(), Err(FsError::CorruptObject)),
+            "public status still verifies cached bodies"
+        );
+        fs::write(&original_object, b"old").unwrap();
         assert!(capture.tick(checkpoint).unwrap().is_none());
         assert!(
             rep.pending_submissions().unwrap().is_empty(),
@@ -170,6 +187,20 @@ mod tests {
         ws.write(&h, 0, b"restart").unwrap();
         let operation = OperationId::random().unwrap();
         let frozen = checkpoint(&operation, rep.status().unwrap().generation).unwrap();
+        let candidate_object = dir
+            .join("state/objects")
+            .join(ObjectId::for_bytes(b"restart").unwrap().as_str());
+        fs::write(&candidate_object, b"invalid").unwrap();
+        assert!(
+            matches!(capture.tick(checkpoint), Err(FsError::CorruptObject)),
+            "novel checkpoint admission must still verify bodies"
+        );
+        assert!(!rep
+            .pending_submissions()
+            .unwrap()
+            .iter()
+            .any(|p| p.local_revision == frozen));
+        fs::write(&candidate_object, b"restart").unwrap();
         drop(capture);
         drop(h);
         drop(ws);
