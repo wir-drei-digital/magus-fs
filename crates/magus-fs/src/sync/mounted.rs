@@ -21,33 +21,7 @@ impl MountedCapture {
     }
     /// Admission always precedes another capture, including after owner restart.
     fn admit(&self) -> Result<(), FsError> {
-        let sync = self.rep.sync_status()?;
-        let binding = sync.binding.ok_or(FsError::ConfigMismatch)?;
-        let status = self.rep.status()?;
-        let Some(head) = status.head else {
-            return Ok(());
-        };
-        if head == binding.view.revision
-            || sync.submissions.iter().any(|p| p.local_revision == head)
-        {
-            return Ok(());
-        }
-        let revision = self.rep.revision(&head)?;
-        // Issued projections and foreign revisions are not local saves. In particular,
-        // reconnect must not echo an adopted revision as a fresh private submission.
-        if revision.replica != self.rep.configuration()?.replica
-            || revision.parents.is_empty()
-            || revision.provenance != "engine_observed"
-        {
-            return Ok(());
-        }
-        self.rep.enqueue_submission(PendingSubmission {
-            operation: revision.operation,
-            local_revision: head,
-            original_view: binding.view.view,
-            original_head: binding.view.head,
-            expected_local_generation: status.generation,
-        })
+        super::admit_engine_checkpoint(&self.rep)
     }
     /// The callback takes only the short adapter lock for checkpoint; no HTTP runs here.
     pub(crate) fn tick(

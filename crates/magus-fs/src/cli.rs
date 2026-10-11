@@ -461,6 +461,9 @@ pub(crate) fn control(
                 .acquire(std::time::Instant::now() + std::time::Duration::from_secs(5))
                 .map_err(|e| (1, e))?
                 .ok_or((1, FsError::Backpressure))?;
+            // Gate ownership alone is insufficient: replacing an unadmitted head would
+            // strand its original operation. Admission failure must leave that head intact.
+            crate::sync::admit_engine_checkpoint(rep).map_err(|e| (1, e))?;
             let status = rep.status().map_err(|e| (1, e))?;
             let base = status.head.ok_or((2, FsError::NotFound))?;
             let workspace = rep.begin(&base, actor, false).map_err(|e| (1, e))?;
@@ -982,5 +985,279 @@ mod sync_tests {
                 "{bad:?}"
             );
         }
+    }
+    fn admission_fixture(bound: bool) -> (PathBuf, Replica, Workspace, Actor, Option<SyncBinding>) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = PathBuf::from(if cfg!(target_os = "macos") {
+            "/private/tmp"
+        } else {
+            "/tmp"
+        })
+        .join(format!(
+            "checkpoint-order-{}",
+            OperationId::random().unwrap().as_str()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let principal = PrincipalId::random().unwrap();
+        let group = GroupId::random().unwrap();
+        let actor = Actor::new(principal.clone());
+        let replica = ReplicaId::random().unwrap();
+        let rep = Replica::open(
+            root.join("state"),
+            ReplicaConfig {
+                replica: replica.clone(),
+                authorities: vec![Authority {
+                    principal: principal.clone(),
+                    uid: unsafe { libc::geteuid() },
+                    gid: unsafe { libc::getegid() },
+                    primary_group: group.clone(),
+                    groups: vec![group.clone()],
+                    dac_override: false,
+                    ownership_transfer: false,
+                }],
+                content_roots: vec![],
+                cache_bytes: 1024 * 1024,
+                history_administrators: vec![],
+                retained_history_grants: vec![],
+            },
+        )
+        .unwrap();
+        let r = Revision {
+            format: FORMAT.into(),
+            hash: HASH.into(),
+            layout: LAYOUT.into(),
+            parents: vec![],
+            operation: OperationId::random().unwrap(),
+            replica: replica.clone(),
+            principal: principal.clone(),
+            captured_at_ns: 0,
+            coverage: vec!["".into()],
+            provenance: "explicit".into(),
+            restoration: None,
+            tree: Tree {
+                root: Root {
+                    id: EntryId::random().unwrap(),
+                    owner: principal.clone(),
+                    group,
+                    mode: 0o755,
+                },
+                entries: vec![],
+            },
+        };
+        let base = revision_id(&r).unwrap();
+        rep.import_revision(
+            ImportDescriptor {
+                expected: base.clone(),
+                bytes: encode_revision(&r).unwrap(),
+            },
+            ChunkSource::Unavailable,
+        )
+        .unwrap();
+        let binding = if bound {
+            let private = |name: &str, bytes: &[u8]| {
+                let p = root.join(name);
+                std::fs::write(&p, bytes).unwrap();
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+                p
+            };
+            let namespace = NamespaceId::random().unwrap();
+            let profile = serde_json::json!({"endpoint":"https://localhost:9","namespace":namespace,"replica":replica,"ca_file":private("ca",include_bytes!("../tests/fixtures/client-ca.pem")),"token_file":private("token", "a".repeat(64).as_bytes()),"publication_principal":principal});
+            let profile_bytes = serde_json::to_vec(&profile).unwrap();
+            let path = private("profile", &profile_bytes);
+            // Same canonical immutable profile identity as production load(), without network.
+            #[derive(serde::Serialize, serde::Deserialize)]
+            struct ProfileIdentity {
+                endpoint: String,
+                namespace: NamespaceId,
+                replica: ReplicaId,
+                ca_file: PathBuf,
+                token_file: PathBuf,
+                publication_principal: PrincipalId,
+            }
+            let normalized: ProfileIdentity = serde_json::from_value(profile).unwrap();
+            let ca =
+                ObjectId::for_bytes(include_bytes!("../tests/fixtures/client-ca.pem")).unwrap();
+            let identity =
+                TransportIdentity::for_bytes(&serde_json::to_vec(&(normalized, ca)).unwrap())
+                    .unwrap();
+            let b = SyncBinding {
+                id: namespace,
+                branch: BranchName::parse("main".into()).unwrap(),
+                publication: PublicationMode::SharedLive,
+                source: RemoteSourceId::random().unwrap(),
+                view: ViewBinding {
+                    view: ViewId::random().unwrap(),
+                    head: HeadToken::random().unwrap(),
+                    revision: base.clone(),
+                },
+                transport_profile: path,
+                transport_identity: identity,
+            };
+            rep.configure_sync(b.clone()).unwrap();
+            Some(b)
+        } else {
+            None
+        };
+        let ws = rep.begin(&base, actor.clone(), false).unwrap();
+        (root, rep, ws, actor, binding)
+    }
+    fn explicit_checkpoint(rep: &Replica, actor: Actor, operation: OperationId) -> Result<Value> {
+        control(
+            rep,
+            actor,
+            "checkpoint",
+            &BTreeMap::from([("operation-id".into(), operation.as_str().into())]),
+        )
+    }
+    #[test]
+    fn checkpoint_admission_orders_two_controls_and_control_first_after_restart() {
+        let (root, rep, ws, actor, binding) = admission_fixture(true);
+        let binding = binding.unwrap();
+        let operation = OperationId::random().unwrap();
+        let first = explicit_checkpoint(&rep, actor.clone(), operation.clone()).unwrap();
+        let first = RevisionId::parse(first["revision"].as_str().unwrap().to_owned()).unwrap();
+        assert!(rep.pending_submissions().unwrap().is_empty());
+        drop(ws);
+        drop(rep);
+        let rep = Replica::reopen(root.join("state")).unwrap();
+        let second =
+            explicit_checkpoint(&rep, actor.clone(), OperationId::random().unwrap()).unwrap();
+        let pending = rep.pending_submissions().unwrap();
+        assert!(
+            pending.iter().any(|p| p.operation == operation
+                && p.local_revision == first
+                && p.original_view == binding.view.view
+                && p.original_head == binding.view.head),
+            "control-first checkpoint must admit the original capture before replacing its head"
+        );
+        assert_ne!(second["revision"].as_str().unwrap(), first.as_str());
+        let second_id = RevisionId::parse(second["revision"].as_str().unwrap().to_owned()).unwrap();
+        explicit_checkpoint(&rep, actor, OperationId::random().unwrap()).unwrap();
+        assert!(
+            rep.pending_submissions()
+                .unwrap()
+                .iter()
+                .any(|p| p.local_revision == second_id),
+            "second checkpoint before any capture tick must also survive"
+        );
+        drop(rep);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn checkpoint_admission_backpressure_preserves_head_operation_and_generation() {
+        let (root, rep, ws, actor, binding) = admission_fixture(true);
+        let binding = binding.unwrap();
+        for _ in 0..128 {
+            let mut r = rep.revision(&binding.view.revision).unwrap();
+            r.parents = vec![binding.view.revision.clone()];
+            r.operation = OperationId::random().unwrap();
+            r.provenance = "engine_observed".into();
+            let id = rep
+                .import_revision(
+                    ImportDescriptor {
+                        expected: revision_id(&r).unwrap(),
+                        bytes: encode_revision(&r).unwrap(),
+                    },
+                    ChunkSource::Unavailable,
+                )
+                .unwrap();
+            rep.enqueue_submission(PendingSubmission {
+                operation: r.operation,
+                local_revision: id,
+                original_view: binding.view.view.clone(),
+                original_head: binding.view.head.clone(),
+                expected_local_generation: rep.status().unwrap().generation,
+            })
+            .unwrap();
+        }
+        let original_op = OperationId::random().unwrap();
+        let original = explicit_checkpoint(&rep, actor.clone(), original_op.clone()).unwrap();
+        let generation = rep.status().unwrap().generation;
+        let replacement = OperationId::random().unwrap();
+        let result = explicit_checkpoint(&rep, actor, replacement.clone());
+        assert!(
+            matches!(result, Err((1, FsError::Backpressure))),
+            "checkpoint must fail admission before replacing the captured head: {result:?}"
+        );
+        assert_eq!(rep.status().unwrap().generation, generation);
+        assert_eq!(
+            rep.status().unwrap().head.unwrap().as_str(),
+            original["revision"].as_str().unwrap()
+        );
+        assert!(rep
+            .status()
+            .unwrap()
+            .operations
+            .iter()
+            .all(|o| o.operation != replacement));
+        assert_eq!(
+            rep.revision(&rep.status().unwrap().head.unwrap())
+                .unwrap()
+                .operation,
+            original_op
+        );
+        drop(ws);
+        drop(rep);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn checkpoint_admission_unbound_snapshot_still_accepts_successive_checkpoints() {
+        let (root, rep, ws, actor, _) = admission_fixture(false);
+        explicit_checkpoint(&rep, actor.clone(), OperationId::random().unwrap()).unwrap();
+        explicit_checkpoint(&rep, actor, OperationId::random().unwrap()).unwrap();
+        assert!(rep.pending_submissions().unwrap().is_empty());
+        drop(ws);
+        drop(rep);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_admission_interleaved_write_keeps_admitted_original_and_dirty_bytes() {
+        let (root, rep, ws, actor, binding) = admission_fixture(true);
+        let binding = binding.unwrap();
+        let original_op = OperationId::random().unwrap();
+        let original = explicit_checkpoint(&rep, actor.clone(), original_op.clone()).unwrap();
+        let observed = rep.status().unwrap().generation;
+        let handle = ws.create("interleaved", 0o600).unwrap();
+        ws.write(&handle, 0, b"dirty generation after caller observation")
+            .unwrap();
+        let written = rep.status().unwrap().generation;
+        let replacement = OperationId::random().unwrap();
+        let options = BTreeMap::from([
+            ("operation-id".into(), replacement.as_str().into()),
+            ("expected-generation".into(), observed.to_string()),
+        ]);
+        assert!(matches!(
+            control(&rep, actor, "checkpoint", &options),
+            Err((1, FsError::GenerationMismatch))
+        ));
+        assert_eq!(
+            rep.status().unwrap().head.unwrap().as_str(),
+            original["revision"].as_str().unwrap()
+        );
+        assert_eq!(rep.status().unwrap().generation, written);
+        assert!(rep.status().unwrap().dirty);
+        assert_eq!(
+            ws.read(&handle, 0, 100).unwrap(),
+            b"dirty generation after caller observation"
+        );
+        assert!(rep
+            .pending_submissions()
+            .unwrap()
+            .iter()
+            .any(|p| p.operation == original_op
+                && p.original_view == binding.view.view
+                && p.original_head == binding.view.head));
+        assert!(rep
+            .status()
+            .unwrap()
+            .operations
+            .iter()
+            .all(|o| o.operation != replacement));
+        drop(handle);
+        drop(ws);
+        drop(rep);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

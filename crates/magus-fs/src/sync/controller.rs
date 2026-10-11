@@ -89,6 +89,38 @@ impl SyncExecution {
         Ok(None)
     }
 }
+/// Caller holds SyncExecution. Admit a prior engine checkpoint before replacing its head.
+/// Core generation/queue transactions reject interleaved writes without losing the capture.
+/// Unbound snapshots keep their existing checkpoint semantics; no network runs here.
+pub(crate) fn admit_engine_checkpoint(rep: &Replica) -> Result<(), FsError> {
+    let sync = rep.sync_status()?;
+    let Some(binding) = sync.binding else {
+        return Ok(());
+    };
+    let status = rep.status()?;
+    let Some(head) = status.head else {
+        return Ok(());
+    };
+    if head == binding.view.revision || sync.submissions.iter().any(|p| p.local_revision == head) {
+        return Ok(());
+    }
+    let revision = rep.revision(&head)?;
+    // Issued projections and foreign revisions are not local saves. In particular,
+    // reconnect must not echo an adopted revision as a fresh private submission.
+    if revision.replica != rep.configuration()?.replica
+        || revision.parents.is_empty()
+        || revision.provenance != "engine_observed"
+    {
+        return Ok(());
+    }
+    rep.enqueue_submission(PendingSubmission {
+        operation: revision.operation,
+        local_revision: head,
+        original_view: binding.view.view,
+        original_head: binding.view.head,
+        expected_local_generation: status.generation,
+    })
+}
 pub struct SyncController {
     rep: Replica,
     transport: Transport,

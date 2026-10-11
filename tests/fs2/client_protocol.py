@@ -91,8 +91,9 @@ class Journey(ProtocolJourney):
         row=next(r for r in self.children if r['pid']==p.pid);row['reaped']=True;row['logfile'].close();self.save_children()
     def kill_at(self,state,revision,point,enqueue=False):
         marker=self.i.output/(point+'-'+secrets.token_hex(3));env=dict(os.environ,MAGUS_TEST_FAULT_POINT=point,MAGUS_TEST_FAULT_ACTION='pause',MAGUS_TEST_FAULT_MARKER=str(marker))
-        op=self.operations[revision];args=[ROOT/'target/debug/magus-fs-client-faults','sync','run','--state',state]
-        if enqueue:args+=['--revision',revision,'--operation-id',op]
+        op=self.operations[revision]
+        if enqueue:args=[ROOT/'target/debug/magus-fs-client-faults','sync','run','--state',state,'--revision',revision,'--operation-id',op]
+        else:args=[ROOT/'target/debug/magus-fs-client-faults','sync','drain','--state',state,'--revision',revision,'--level','private-remote','--deadline-ms','60000']
         p=self.spawn(args,point+'-'+secrets.token_hex(3),env)
         deadline=time.monotonic()+65
         while not marker.exists() and p.poll() is None and time.monotonic()<deadline:time.sleep(.05)
@@ -177,15 +178,40 @@ class Journey(ProtocolJourney):
         denied_op,unknown=self.kill_at(state,denied_rev,'sync-lost-ack')
         assert self.i.sql("SELECT count(*) FROM operations WHERE operation='"+denied_op+"';")=='1'
         self.expect('revoke','POST',self.root+'/grants',200,body={'revoke':delegated['credential']})
-        denied=self.cli('sync','run','--state',state)['progress'];assert denied['state']=='Denied' and denied['error']=='invalid_credential' and denied['remote_outcome_unknown'] and denied['request']==unknown['request']
+        denied=self.cli('sync','drain','--state',state,'--revision',denied_rev,'--level','private-remote','--deadline-ms','60000',check=False)['progress'];assert denied['state']=='Denied' and denied['error']=='invalid_credential' and denied['remote_outcome_unknown'] and denied['request']==unknown['request']
         self.expect('revoked-exact-replay','POST',self.root+'/candidates',401,{'code':'invalid_credential'},actor='worker',body=unknown['request'])
         assert self.i.sql("SELECT count(*) FROM operations WHERE operation='"+denied_op+"';")=='1'
         local=self.i.output/'revoked-local.bin';self.probe(state,'read','reports/result',0,4096,local);assert local.read_bytes()==b'revoked local result'
         self.i.write_json('receipts.json',{'private':private,'shared':shared,'pre_send':recovered,'lost_ack_before':before,'lost_ack_after':after,'denied':denied,'stale':stale,'automatic_shared':auto_shared})
         assert shared_restart_ok,'SharedLive restart did not resume integration from private receipt'
+        self.checkpoint_admission()
     def stop_service_process(self):
         script="import os,signal,time; p=int(open('/tmp/service.pid').read()); assert os.readlink('/proc/%d/exe'%p).endswith('/magus-fs-service'); os.kill(p,signal.SIGTERM); end=time.monotonic()+7\nwhile os.path.exists('/proc/%d'%p) and time.monotonic()<end: time.sleep(.05)\nassert not os.path.exists('/proc/%d'%p); print('owned service process stopped; ingress retained')"
         self.i.docker('exec',self.i.service,'python3','-c',script)
+    def checkpoint_admission(self):
+        # Separate real CLI invocations reopen the same owned journal. No serve/tick/run
+        # occurs between checkpoints, so restart/control-first ordering is deterministic.
+        state,profile=self.client('checkpoint-admission',actor='alice')
+        binding=self.attach(state,profile,'shared-live')['binding'];operations=[];revisions=[]
+        for name,body in [('original','original captured bytes'),('second','later captured bytes'),('third','next captured bytes')]:
+            self.probe(state,'write','reports/order-'+name,body)
+            operation=identity('operation');revision=self.cli('checkpoint','--state',state,'--operation-id',operation)['revision'];operations.append(operation);revisions.append(revision)
+            status=self.cli('sync','status','--state',state)['status']
+            for i in range(len(revisions)-1):
+                p=next((p for p in status['submissions'] if p['operation']==operations[i]),None)
+                assert p and p['local_revision']==revisions[i] and p['private_receipt'] is None and p['shared_receipt'] is None,('earlier checkpoint stranded',operations[i],status)
+        # Progress can now resume on each original target despite a newer working head.
+        receipts=[]
+        for operation,revision in zip(operations[:2],revisions[:2]):
+            p=self.cli('sync','drain','--state',state,'--revision',revision,'--level','shared','--deadline-ms','60000')['progress']
+            assert p['state']=='Shared' and p['operation']==operation and p['local_revision']==revision
+            assert p['private_receipt']['operation']==operation and p['private_receipt']['submitted_revision']==revision and p['private_receipt']['original_view']==binding['view']['view'] and p['private_receipt']['original_head']==binding['view']['head']
+            assert p['shared_receipt']['submitted_revision']==revision
+            assert self.i.sql("SELECT count(*) FROM operations WHERE operation='"+operation+"';")=='1'
+            assert self.i.sql("SELECT count(*) FROM operations WHERE operation='"+p['integration']['operation']+"';")=='1'
+            receipts.append(p)
+        self.i.write_json('checkpoint-admission.json',{'binding':binding,'operations':operations,'revisions':revisions,'original_receipts':receipts,'working_head':self.cli('status','--state',state)['captured_revision'],'no_tick_between_checkpoints':True})
+        assert self.cli('status','--state',state)['captured_revision']==revisions[-1]
     def owner_control(self,state,receipt,revision):
         p=self.spawn([ROOT/'target/debug/magus-fs','sync','run','--state',state,'--serve','true'],'owner')
         deadline=time.monotonic()+5

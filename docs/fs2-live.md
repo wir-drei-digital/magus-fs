@@ -16,7 +16,7 @@ An attached writable mount observes the engine's dirty generation every 50 ms. A
 
 The separate publisher uses the existing bounded controller every 1 s. `shared-live` explicitly permits automatic integration; `isolated` automatically obtains only a private remote receipt and remains pinned to its input view. Residency does not select policy. Readonly mounts do not capture or submit. Dirty work and unresolved submissions still hold incoming replacement, and conflicts require explicit resolution.
 
-Capture, publication, incoming adoption and explicit checkpoint controls share execution coordination. Network work holds neither the engine nor adapter lock. Stable generation means stable observed engine work, not every application buffer. Local fsync, local checkpoint, private receipt, shared acceptance and received Applied readiness remain separate observations.
+Capture, publication, incoming adoption and explicit checkpoint controls share execution coordination. A bound explicit checkpoint admits an existing eligible captured head before creating the next revision; admission failure or backpressure preserves the prior head/operation. Unbound FS1 snapshots retain their existing checkpoint behavior. Network work holds neither the engine nor adapter lock. Stable generation means stable observed engine work, not every application buffer. Local fsync, local checkpoint, private receipt, shared acceptance and received Applied readiness remain separate observations.
 
 Run the owned Linux A/B plus native Mac observer lifecycle proof on the qualified Mac host:
 
