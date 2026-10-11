@@ -85,6 +85,9 @@ pub(crate) struct RootIntent {
     /// Wall time of the last full (ungated) rehash of the displaced root.
     #[serde(default)]
     pub(crate) full_hash_ns: u64,
+    /// Unsupported retained entries prevent exact settlement; kept for future observation.
+    #[serde(default)]
+    pub(crate) unsupported: Vec<String>,
 }
 impl RootIntent {
     pub(crate) fn exchanged(&self) -> bool {
@@ -589,6 +592,7 @@ fn stage(
         staged_bytes,
         local_changes: vec![],
         full_hash_ns: 0,
+        unsupported: vec![],
     });
     na::save(core, r)?;
     match mkdir(&parent, &stage_leaf) {
@@ -959,6 +963,7 @@ pub(crate) fn rescan(
     };
     let local = |p: &str| !p.is_empty() && !policy.selected(p);
     let mut next = ri.clone();
+    next.unsupported = inventory.unsupported.clone();
     if full {
         next.full_hash_ns = now_ns;
     }
@@ -1065,6 +1070,12 @@ pub(crate) fn rescan(
         next.ambiguous = true;
     }
     r.root = Some(next);
+    if let Some(acknowledged) = &r.settlement {
+        if retained_digest(r)? != *acknowledged {
+            r.settlement = None;
+            changed = true;
+        }
+    }
     na::save(core, r)?;
     na::records_for_versions(core, r)?;
     Ok(if changed {
@@ -1260,4 +1271,26 @@ impl Replica {
         let core = crate::engine::lock(&self.core)?;
         bound_identity(&core)
     }
+}
+
+/// Exact inventory identity excludes only digest-cache times (which are not writer state).
+pub(crate) fn retained_digest(r: &Intent) -> Result<ObjectId, FsError> {
+    let ri = r.root.as_ref().ok_or(FsError::InvalidDescriptor)?;
+    let entries: BTreeMap<_, _> = ri
+        .displaced
+        .iter()
+        .map(|(p, s)| (p, (&s.observation, &s.digest)))
+        .collect();
+    let bytes = crate::engine::json(&(
+        &r.operation,
+        r.generation,
+        &r.base,
+        ri.phase,
+        &ri.parent_identity,
+        &entries,
+        &ri.versions,
+        &ri.local_changes,
+        &ri.unsupported,
+    ))?;
+    ObjectId::for_bytes(&bytes)
 }

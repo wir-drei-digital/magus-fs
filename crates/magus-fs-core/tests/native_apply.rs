@@ -1358,6 +1358,42 @@ fn held_descriptor_and_cwd_writes_land_in_retained_root_and_become_recovery_reco
         "already_exists",
     );
     drop(held);
+    drop(cwd); // Writer has quiesced and future opens bind the current root.
+    let selection = rep
+        .inspect_native_settlement(stale.operation.clone(), actor())
+        .unwrap();
+    let operation = OperationId::random().unwrap();
+    let receipt = rep
+        .settle_native_intent(selection.clone(), operation.clone(), actor())
+        .unwrap();
+    assert_eq!(
+        rep.settle_native_intent(selection, operation, actor())
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(rep.status().unwrap().head, head);
+    assert!(rep.live_status().unwrap().applied);
+    assert_eq!(
+        rep.status().unwrap().generation,
+        generation,
+        "settlement transaction never advances generation"
+    );
+    let mut later = next_of(&rep, &next);
+    entry_mut(&mut later, "a").content = content(b"further independent remote edit");
+    let later = import(
+        &rep,
+        &sorted(later),
+        sources(d.path(), &[b"further independent remote edit"]),
+    );
+    let resumed = apply(&rep, &later);
+    assert!(
+        ready(&resumed),
+        "capture/export must permit explicit settlement and resume: {resumed:?}"
+    );
+    assert_eq!(
+        fs::read(n.root.join("a")).unwrap(),
+        b"further independent remote edit"
+    );
 }
 
 #[test]
@@ -1445,7 +1481,7 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
             .unwrap()
             == 1
     };
-    assert_eq!(version(), 5);
+    assert_eq!(version(), 6);
     // From version 1: every later table is added in place.
     rusqlite::Connection::open(&db_path)
         .unwrap()
@@ -1457,7 +1493,7 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
     assert_eq!(rep.status().unwrap().head, Some(base.clone()));
     assert!(rep.list_native_recovery(actor()).unwrap().is_empty());
     drop(rep);
-    assert_eq!(version(), 5);
+    assert_eq!(version(), 6);
     assert!(table("native_recovery") && table("native_applied"));
     // From version 2 (recovery tables only): the applied-path table is added in place.
     rusqlite::Connection::open(&db_path)
@@ -1467,7 +1503,7 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
     let rep = Replica::reopen(d.path().join("state")).unwrap();
     assert_eq!(rep.status().unwrap().head, Some(base.clone()));
     drop(rep);
-    assert_eq!(version(), 5);
+    assert_eq!(version(), 6);
     assert!(table("native_applied"));
     // From version 3: sync records may now carry collaboration fields; same tables.
     rusqlite::Connection::open(&db_path)
@@ -1477,7 +1513,7 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
     let rep = Replica::reopen(d.path().join("state")).unwrap();
     assert_eq!(rep.status().unwrap().head, Some(base));
     drop(rep);
-    assert_eq!(version(), 5);
+    assert_eq!(version(), 6);
     // From version 4: recovery cursor/import roots are added without losing native work.
     rusqlite::Connection::open(&db_path)
         .unwrap()
@@ -1488,12 +1524,22 @@ fn journal_upgrades_additively_and_newer_schema_fails_closed() {
     let rep = Replica::reopen(d.path().join("state")).unwrap();
     assert_eq!(rep.incoming_recovery().unwrap().cursor, 0);
     drop(rep);
-    assert_eq!(version(), 5);
+    assert_eq!(version(), 6);
     assert!(table("incoming_recovery") && table("recovery_imports"));
+    // From version5: settlement receipt table added without losing native/recovery work.
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch("DROP TABLE native_settlements; PRAGMA user_version=5;")
+        .unwrap();
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    assert!(rep.status().unwrap().head.is_some());
+    drop(rep);
+    assert_eq!(version(), 6);
+    assert!(table("native_settlements"));
     // A newer schema fails closed.
     rusqlite::Connection::open(&db_path)
         .unwrap()
-        .pragma_update(None, "user_version", 6)
+        .pragma_update(None, "user_version", 7)
         .unwrap();
     err(
         Replica::reopen(d.path().join("state")),
@@ -2269,4 +2315,305 @@ fn local_checkpoint_baseline_uses_per_object_remote_source_after_restart() {
     let rep = Replica::reopen(d.path().join("state")).unwrap();
     rep.set_remote_fetcher(Arc::new(Fetch)).unwrap();
     rep.verify_native_baseline(actor()).unwrap();
+}
+
+fn settlement_fixture() -> (
+    tempfile::TempDir,
+    Replica,
+    NativeConfig,
+    OperationId,
+    fs::File,
+    RevisionId,
+) {
+    let (d, rep, n, base) = fixture();
+    let mut held = fs::OpenOptions::new()
+        .write(true)
+        .open(n.root.join("a"))
+        .unwrap();
+    let mut next = next_of(&rep, &base);
+    put_dir(&mut next, "structural", 0o755);
+    let next = import(&rep, &sorted(next), ChunkSource::Unavailable);
+    assert!(ready(&apply(&rep, &next)));
+    held.write_all(b"retained alternative").unwrap();
+    held.sync_all().unwrap();
+    let state = rep.scan_native_status().unwrap();
+    let intent = state
+        .displacements
+        .iter()
+        .find(|r| r.path.is_empty())
+        .unwrap()
+        .operation
+        .clone();
+    (d, rep, n, intent, held, next)
+}
+#[test]
+fn native_settlement_refuses_intervening_generation_and_wrong_selection() {
+    let (_d, rep, n, intent, mut held, next) = settlement_fixture();
+    let selection = rep
+        .inspect_native_settlement(intent.clone(), actor())
+        .unwrap();
+    let mut wrong = selection.clone();
+    wrong.intent_generation += 1;
+    err(
+        rep.settle_native_intent(wrong, OperationId::random().unwrap(), actor()),
+        "generation_mismatch",
+    );
+    let mut wrong = selection.clone();
+    wrong.intent = OperationId::random().unwrap();
+    err(
+        rep.settle_native_intent(wrong, OperationId::random().unwrap(), actor()),
+        "not_found",
+    );
+    let mut wrong = selection.clone();
+    wrong.working_generation += 1;
+    err(
+        rep.settle_native_intent(wrong, OperationId::random().unwrap(), actor()),
+        "generation_mismatch",
+    );
+    held.seek(SeekFrom::Start(0)).unwrap();
+    held.write_all(b"new retained bytes!").unwrap();
+    held.sync_all().unwrap();
+    err(
+        rep.settle_native_intent(selection, OperationId::random().unwrap(), actor()),
+        "generation_mismatch",
+    );
+    assert!(!rep.live_status().unwrap().applied);
+    assert_eq!(rep.status().unwrap().head, Some(next));
+    assert_eq!(fs::read(n.root.join("a")).unwrap(), b"before");
+    assert!(rep
+        .list_native_recovery(actor())
+        .unwrap()
+        .iter()
+        .any(|r| r.observed_digest == sha(b"new retained bytes!e")));
+    let selection = rep.inspect_native_settlement(intent, actor()).unwrap();
+    drop(held);
+    rep.settle_native_intent(selection, OperationId::random().unwrap(), actor())
+        .unwrap();
+    assert!(rep.live_status().unwrap().applied);
+}
+#[test]
+fn native_settlement_restart_replay_never_clears_later_whole_root_changes() {
+    let (d, rep, _n, intent, mut held, _next) = settlement_fixture();
+    let selection = rep
+        .inspect_native_settlement(intent.clone(), actor())
+        .unwrap();
+    let op = OperationId::random().unwrap();
+    let receipt = rep
+        .settle_native_intent(selection.clone(), op.clone(), actor())
+        .unwrap();
+    drop(rep);
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    assert_eq!(
+        rep.settle_native_intent(selection.clone(), op.clone(), actor())
+            .unwrap(),
+        receipt
+    );
+    held.seek(SeekFrom::Start(0)).unwrap();
+    held.write_all(b"late after settlement").unwrap();
+    held.sync_all().unwrap();
+    rep.scan_native_status().unwrap();
+    assert_eq!(
+        rep.settle_native_intent(selection, op, actor()).unwrap(),
+        receipt
+    );
+    assert!(!rep.live_status().unwrap().applied);
+    assert!(rep
+        .native_status()
+        .unwrap()
+        .unwrap()
+        .displacements
+        .iter()
+        .any(|r| r.operation == intent && r.ambiguous));
+    assert!(rep
+        .list_native_recovery(actor())
+        .unwrap()
+        .iter()
+        .any(|r| r.observed_digest == sha(b"late after settlement")));
+}
+#[test]
+fn native_settlement_observes_opaque_content_and_metadata_after_acknowledgment() {
+    let d = scratch();
+    let root = d.path().join("tree");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a"), b"before").unwrap();
+    fs::create_dir(root.join("opaque")).unwrap();
+    fs::write(root.join("opaque/cache"), b"local original").unwrap();
+    let mut c = config();
+    c.authorities.truncate(1);
+    c.authorities[0].uid = unsafe { libc::geteuid() };
+    c.authorities[0].gid = fs::metadata(&root).unwrap().gid();
+    c.content_roots = vec![root.clone()];
+    let rep = Replica::open(d.path().join("state"), c).unwrap();
+    let n = NativeConfig {
+        root,
+        policy: CapturePolicy {
+            included_roots: vec![".".into()],
+            excluded_prefixes: vec!["opaque".into()],
+        },
+        creation_umask: 0o022,
+    };
+    rep.configure_native(n.clone()).unwrap();
+    let base = rep
+        .capture(
+            &n.root,
+            n.policy.clone(),
+            OperationId::random().unwrap(),
+            actor(),
+        )
+        .unwrap();
+    let mut held = fs::OpenOptions::new()
+        .write(true)
+        .open(n.root.join("a"))
+        .unwrap();
+    let opaque = fs::OpenOptions::new()
+        .write(true)
+        .open(n.root.join("opaque/cache"))
+        .unwrap();
+    let mut next = next_of(&rep, &base);
+    put_dir(&mut next, "structural", 0o755);
+    let next = import(&rep, &sorted(next), ChunkSource::Unavailable);
+    assert!(ready(&apply(&rep, &next)));
+    held.write_all(b"managed late").unwrap();
+    held.sync_all().unwrap();
+    rep.scan_native_status().unwrap();
+    let intent = rep
+        .native_status()
+        .unwrap()
+        .unwrap()
+        .displacements
+        .iter()
+        .find(|r| r.path.is_empty())
+        .unwrap()
+        .operation
+        .clone();
+    let settle = |rep: &Replica| {
+        let s = rep
+            .inspect_native_settlement(intent.clone(), actor())
+            .unwrap();
+        rep.settle_native_intent(s, OperationId::random().unwrap(), actor())
+            .unwrap();
+    };
+    settle(&rep);
+    drop(held);
+    let mut opaque = opaque;
+    opaque.write_all(b"opaque late!!!").unwrap();
+    opaque.sync_all().unwrap();
+    rep.scan_native_status().unwrap();
+    assert!(!rep.live_status().unwrap().applied);
+    let records = rep.list_native_recovery(actor()).unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "opaque bytes never become managed candidates"
+    );
+    settle(&rep);
+    opaque
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .unwrap();
+    // Direct apply also detects the late metadata write before any watcher scan.
+    let mut later = next_of(&rep, &next);
+    put_dir(&mut later, "further", 0o755);
+    let later = import(&rep, &sorted(later), ChunkSource::Unavailable);
+    assert!(!ready(&apply(&rep, &later)));
+    assert_eq!(rep.status().unwrap().head, Some(next));
+    assert!(d.path().exists());
+}
+#[test]
+fn native_settlement_cannot_claim_ready_with_another_unobserved_ambiguous_root() {
+    let (d, rep, n, first, mut held_first, next) = settlement_fixture();
+    let s = rep
+        .inspect_native_settlement(first.clone(), actor())
+        .unwrap();
+    rep.settle_native_intent(s, OperationId::random().unwrap(), actor())
+        .unwrap();
+    let mut held_second = fs::OpenOptions::new()
+        .write(true)
+        .open(n.root.join("a"))
+        .unwrap();
+    let mut third = next_of(&rep, &next);
+    put_dir(&mut third, "second-root", 0o755);
+    let third = import(&rep, &sorted(third), ChunkSource::Unavailable);
+    assert!(ready(&apply(&rep, &third)));
+    held_first.seek(SeekFrom::Start(0)).unwrap();
+    held_first.write_all(b"first later retained").unwrap();
+    held_first.sync_all().unwrap();
+    let s = rep.inspect_native_settlement(first, actor()).unwrap();
+    // Another writer changes after selection, without a periodic native scan.
+    held_second.write_all(b"second unobserved write").unwrap();
+    held_second.sync_all().unwrap();
+    rep.settle_native_intent(s, OperationId::random().unwrap(), actor())
+        .unwrap();
+    assert!(
+        !rep.live_status().unwrap().applied,
+        "another root must remain held"
+    );
+    let records = rep.list_native_recovery(actor()).unwrap();
+    assert!(records
+        .iter()
+        .any(|r| r.observed_digest == sha(b"second unobserved write")));
+    assert!(d.path().exists());
+}
+
+#[test]
+fn native_settlement_preserves_unapplied_private_captured_head() {
+    let (_d, rep, n, intent, held, _next) = settlement_fixture();
+    drop(held);
+    fs::write(n.root.join("a"), b"private current native edit").unwrap();
+    let private = rep
+        .capture_native_changes(OperationId::random().unwrap(), actor())
+        .unwrap()
+        .unwrap();
+    let selection = rep.inspect_native_settlement(intent, actor()).unwrap();
+    let generation = rep.status().unwrap().generation;
+    rep.settle_native_intent(selection, OperationId::random().unwrap(), actor())
+        .unwrap();
+    assert_eq!(rep.status().unwrap().head, Some(private));
+    assert_eq!(rep.status().unwrap().generation, generation);
+    assert!(!rep.live_status().unwrap().applied);
+    assert!(rep.pending_submissions().unwrap().is_empty());
+}
+#[test]
+fn native_settlement_cannot_clear_unobserved_retained_file_generation() {
+    let (d, rep, n, base) = fixture();
+    let mut first = fs::OpenOptions::new()
+        .write(true)
+        .open(n.root.join("a"))
+        .unwrap();
+    let next = incoming(d.path(), &rep, &base, false);
+    assert!(ready(&apply(&rep, &next)));
+    let mut second = fs::OpenOptions::new()
+        .write(true)
+        .open(n.root.join("a"))
+        .unwrap();
+    let mut structural = next_of(&rep, &next);
+    put_dir(&mut structural, "structural", 0o755);
+    let structural = import(&rep, &sorted(structural), sources(d.path(), &[b"incoming"]));
+    assert!(ready(&apply(&rep, &structural)));
+    second.write_all(b"second root held").unwrap();
+    second.sync_all().unwrap();
+    rep.scan_native_status().unwrap();
+    let intent = rep
+        .native_status()
+        .unwrap()
+        .unwrap()
+        .displacements
+        .into_iter()
+        .find(|r| r.path.is_empty())
+        .unwrap()
+        .operation;
+    let selection = rep.inspect_native_settlement(intent, actor()).unwrap();
+    first.write_all(b"old file late write").unwrap();
+    first.sync_all().unwrap();
+    rep.settle_native_intent(selection, OperationId::random().unwrap(), actor())
+        .unwrap();
+    assert!(
+        !rep.live_status().unwrap().applied,
+        "independent per-file generation must remain held"
+    );
+    rep.scan_native_status().unwrap();
+    assert!(rep
+        .list_native_recovery(actor())
+        .unwrap()
+        .iter()
+        .any(|r| r.observed_digest == sha(b"old file late write")));
 }

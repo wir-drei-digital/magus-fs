@@ -101,7 +101,10 @@ pub(crate) fn recorded(core: &Core, operation: &OperationId, copy: &Path) -> Res
         .optional()?
         .is_some())
 }
-fn load(core: &Core, id: &NativeRecoveryId) -> Result<(NativeRecoveryRecord, PathBuf), FsError> {
+pub(crate) fn load(
+    core: &Core,
+    id: &NativeRecoveryId,
+) -> Result<(NativeRecoveryRecord, PathBuf), FsError> {
     let (bytes, retained) = core
         .journal
         .db
@@ -136,7 +139,7 @@ pub(crate) fn roots(core: &Core) -> Result<Vec<RevisionId>, FsError> {
     Ok(out)
 }
 /// Read the owner-private retained copy through no-follow descriptors and verify its digest.
-fn retained_bytes(path: &Path, expected: &ObjectId) -> Result<Vec<u8>, FsError> {
+pub(crate) fn retained_bytes(path: &Path, expected: &ObjectId) -> Result<Vec<u8>, FsError> {
     let parent = directory(path.parent().ok_or(FsError::UnsafeStorage)?)?;
     let mut file = open_at(
         parent.as_raw_fd(),

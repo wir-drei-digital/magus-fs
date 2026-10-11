@@ -81,10 +81,13 @@ pub(crate) struct Intent {
     /// Retained displaced data was explicitly released by the operator.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) released: bool,
+    /// Exact acknowledged retained inventory; original ambiguity remains durable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) settlement: Option<ObjectId>,
 }
 impl Intent {
     /// The intent holds an applied or possibly applied native mutation.
-    fn mutating(&self) -> bool {
+    pub(crate) fn mutating(&self) -> bool {
         !self.files.is_empty()
             || self
                 .root
@@ -92,7 +95,11 @@ impl Intent {
                 .is_some_and(|r| r.phase != RootPhase::Abandoned)
     }
     pub(crate) fn ambiguous(&self) -> bool {
-        self.files.iter().any(|f| f.ambiguous) || self.root.as_ref().is_some_and(|r| r.ambiguous)
+        self.files.iter().any(|f| f.ambiguous)
+            || self
+                .root
+                .as_ref()
+                .is_some_and(|r| r.ambiguous && self.settlement.is_none())
     }
 }
 /// The configured root pathname no longer names the verified bound root (or a no-follow walk
@@ -382,7 +389,7 @@ fn displacements(rows: &[Intent]) -> Vec<NativeDisplacement> {
                         path: String::new(),
                         retained_path: x.retained_path(),
                         versions: x.versions.iter().map(|v| v.version.clone()).collect(),
-                        ambiguous: x.ambiguous,
+                        ambiguous: x.ambiguous && r.settlement.is_none(),
                         local_only_changes: x.local_changes.clone(),
                     }
                 }))
@@ -1107,7 +1114,19 @@ impl Replica {
             "INSERT OR IGNORE INTO native_incoming VALUES(?)",
             [revision.as_str()],
         )?;
-        let all = records(&core)?;
+        let mut all = records(&core)?;
+        // Explicit application must observe acknowledged retained roots too; callers need not
+        // run the periodic watcher first. A late change cannot hide behind a prior settlement.
+        for retained in all.iter_mut().filter(|r| r.settlement.is_some()) {
+            if !matches!(
+                crate::native_root::rescan(&core, &n.policy, retained, true)?,
+                crate::native_root::Rescan::Unchanged
+            ) {
+                retained.settlement = None;
+                save(&core, retained)?;
+                clear_applied(&mut core)?;
+            }
+        }
         if let Some(existing) = all.iter().find(|r| r.operation == operation) {
             if existing.revision != *revision
                 || existing.generation != generation
@@ -1347,6 +1366,7 @@ impl Replica {
             status: pending("staging"),
             root: None,
             released: false,
+            settlement: None,
         };
         let result = (|| -> Result<NativeApplyStatus, FsError> {
             let retained = all

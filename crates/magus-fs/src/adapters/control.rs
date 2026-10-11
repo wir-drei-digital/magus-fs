@@ -214,6 +214,8 @@ impl Server {
                                     | "sync-recovery-capture"
                                     | "sync-recovery-export"
                                     | "sync-recovery-release"
+                                    | "sync-recovery-inspect"
+                                    | "sync-recovery-settle"
                                     | "sync-conflicts-list"
                                     | "sync-conflicts-show"
                                     | "sync-conflicts-export"
@@ -234,6 +236,8 @@ impl Server {
                                             | "sync-drain"
                                             | "sync-recovery-capture"
                                             | "sync-recovery-release"
+                                            | "sync-recovery-inspect"
+                                            | "sync-recovery-settle"
                                             | "sync-resolve"
                                     ))
                             {

@@ -217,13 +217,58 @@ open(s['tag']+'-again-done','w').close()"""
         again = self.cli_raw(ep, c, 'sync', 'recovery', 'export', '--id', by['cwd-late']['id'], '--digest', by['cwd-late']['observed_digest'], '--destination', dest)
         assert again['code'] == 1 and json.loads(again['out'])['error'] == 'already_exists', again
         unchanged = ep.cli(c, 'sync', 'recovery', 'list')['records'];assert unchanged == records
+        selected_before_write = ep.cli(c, 'sync', 'recovery', 'inspect', '--intent-id', rec['operation'])['selection']
         ep.stop(c);ep.start(c);self.until(lambda: bool(ep.status(c).get('native')))
         restarted = ep.cli(c, 'sync', 'recovery', 'list')['records'];assert restarted == records
         ep.run("open(s+'-again','w').close();print('{}')", tag);self.until(lambda: ep.exists(tag + '-again-done'));ep.children[-1]['stopped'] = True;ep.save()
         self.until(lambda: len(ep.cli(c, 'sync', 'recovery', 'list')['records']) == len(records) + 1, 10)
         final = ep.cli(c, 'sync', 'recovery', 'list')['records']
         assert final[:len(records)] == records and final[-1]['observed_digest'] == 'sha256:' + sha(b'HELD DESCRIPTOR CHANGED AFTER RESTART')
-        self.record(ep.platform, 'held-fd-cwd-root-exchange-recovery', held=held, status=status, records=records, captured=captured, exported=exported, export_refused=again, after_restart=restarted, changed_after_restart=final[-1])
+        refused = self.cli_raw(ep, c, 'sync', 'recovery', 'settle', '--selection', json.dumps(selected_before_write), '--operation-id', identity('operation'))
+        assert refused['code'] == 1 and json.loads(refused['out'])['error'] == 'generation_mismatch', refused
+        # Holder has exited; future opens bind the current root. Preserve/read back the newer
+        # selected bytes using existing recovery, then acknowledge exact immutable links.
+        self.until(lambda: ep.run("try:os.kill(s,0);alive=True\nexcept ProcessLookupError:alive=False\nprint(json.dumps(not alive))", pid), 10)
+        newer = final[-1];newer_dest = c['path'] + '/exported-newer'
+        ep.cli(c, 'sync', 'recovery', 'export', '--id', newer['id'], '--digest', newer['observed_digest'], '--destination', newer_dest)
+        assert ep.run("print(json.dumps(open(s,'rb').read().hex()))", newer_dest) == b'HELD DESCRIPTOR CHANGED AFTER RESTART'.hex()
+        selection = ep.cli(c, 'sync', 'recovery', 'inspect', '--intent-id', rec['operation'])['selection']
+        before_settle = ep.status(c);settle_op = identity('operation');crashes = []
+        for point in ['native-settlement-before-commit', 'native-settlement-committed']:
+            ep.stop(c);ep.start(c, fault=point)
+            # A pathname may be a stale socket after SIGTERM. Require a listening owner;
+            # otherwise the default CLI can correctly reopen before the fault owner starts.
+            self.until(lambda: ep.run("import socket\nx=socket.socket(socket.AF_UNIX)\ntry:x.connect(s);ready=True\nexcept OSError:ready=False\nx.close();print(json.dumps(ready))", c['state'] + '/control.sock'))
+            command = [ep.binary, 'sync', 'recovery', 'settle', '--state', c['state'], '--selection', json.dumps(selection), '--operation-id', settle_op]
+            tag_settle = c['path'] + '/' + point
+            control_code = "import json,subprocess,sys;args=json.loads(sys.argv[1]);p=subprocess.run(args['command'],capture_output=True,text=True,timeout=30);open(args['tag']+'-result','w').write(json.dumps({'code':p.returncode,'out':p.stdout,'err':p.stderr}))"
+            child = ep.run("code=" + repr(control_code) + "\np=subprocess.Popen(['python3','-c',code,json.dumps(s)],stdout=open(s['tag']+'-log','w'),stderr=subprocess.STDOUT);print(json.dumps(p.pid))", {'command': command, 'tag': tag_settle})
+            ep.children.append({'pid': child, 'tag': tag_settle});ep.save();ep.barrier(c);ep.stop(c, kill=True)
+            self.until(lambda: ep.exists(tag_settle + '-result'), 10);ep.children[-1]['stopped'] = True;ep.save()
+            interrupted = ep.run("print(open(s+'-result').read())", tag_settle)
+            ep.start(c);self.until(lambda: bool(ep.status(c).get('native')))
+            post = ep.status(c)
+            if point.endswith('before-commit'):assert not post['live']['applied'] and any(d['ambiguous'] for d in post['native']['displacements'])
+            else:assert post['live']['applied']
+            crashes.append({'point': point, 'interrupted': interrupted, 'after': post})
+        receipt = ep.cli(c, 'sync', 'recovery', 'settle', '--selection', json.dumps(selection), '--operation-id', settle_op)
+        assert receipt['receipt']['selection'] == selection and receipt['published'] is False
+        replay = ep.cli(c, 'sync', 'recovery', 'settle', '--selection', json.dumps(selection), '--operation-id', settle_op);assert replay == receipt
+        settled = ep.status(c);assert settled['live']['applied'] and len(settled['status']['submissions']) == submissions
+        self.i.write_json(ep.platform + '-settlement-progress.json', {'before': before_settle, 'settled': settled, 'crashes': crashes, 'selection': selection, 'receipt': receipt})
+        assert settled['live']['revision'] == before_settle['live']['revision'], (before_settle['live'], settled['live'])
+        # A normal same-head snapshot refresh after owner restart may advance its epoch.
+        # The direct Core proof checks unchanged generation at the settlement transaction.
+        assert ep.cli(c, 'sync', 'recovery', 'list')['records'] == final
+        owner = c['pid'];root = self.native(ep, c, [])['']['ino']
+        incoming = (ep.platform + ' independent remote edit after settlement').encode();shared = self.publish(incoming)
+        self.until(lambda: ep.ready(c, shared['head']) and ep.read(c) == incoming.hex(), 15)
+        assert c['pid'] == owner and self.native(ep, c, [])['']['ino'] == root
+        # A fresh reread still cannot prove native edit causality; the first edit stays private.
+        assert ep.read(c) == incoming.hex();fresh_edit = b'fresh reread native edit still unknown';ep.write(c, fresh_edit)
+        held_progress = self.until(lambda: next((q for q in ep.status(c)['status']['submissions'] if q.get('error') == 'unknown_causality'), None), 15)
+        assert held_progress['shared_receipt'] is None and self.view()[0]['head'] == shared['head']
+        self.record(ep.platform, 'held-fd-cwd-root-exchange-recovery-settlement-resume', held=held, status=status, records=records, captured=captured, exported=exported, export_refused=again, after_restart=restarted, changed_after_restart=final[-1], intervening_write_refused=refused, selection=selection, receipt=receipt, crashes=crashes, settled=settled, resumed_owner=owner, resumed_root_inode=root, remote_sha256=sha(incoming), unknown_after_fresh_reread=held_progress)
         ep.stop(c)
 
     # ---- stale RAM save and readonly root parent (both OSes) ----

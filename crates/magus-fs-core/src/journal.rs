@@ -19,7 +19,9 @@ use std::{
 /// durable applied-path table for unknown-causality detection; 3 -> 4 lets sync records
 /// carry collaboration fields (superseded integrations, resolution targets/requests and
 /// resolved links) that an older binary must not misread as ordinary pending work.
-pub(crate) const SCHEMA_VERSION: u32 = 5;
+/// 4 -> 5 adds recovery cursor/import roots; 5 -> 6 adds native settlement receipts and
+/// acknowledged inventory state that older binaries must not silently ignore.
+pub(crate) const SCHEMA_VERSION: u32 = 6;
 pub(crate) struct Journal {
     pub db: Connection,
     control: ObjectStore,
@@ -159,7 +161,8 @@ impl Journal {
   CREATE TABLE IF NOT EXISTS native_recovery_captures (operation TEXT PRIMARY KEY, id TEXT NOT NULL REFERENCES native_recovery(id), digest TEXT NOT NULL, revision TEXT NOT NULL REFERENCES revisions(id));
   CREATE TABLE IF NOT EXISTS incoming_recovery (singleton INTEGER PRIMARY KEY CHECK(singleton=1), record BLOB NOT NULL);
   CREATE TABLE IF NOT EXISTS recovery_imports (operation TEXT PRIMARY KEY, source TEXT NOT NULL REFERENCES revisions(id), revision TEXT NOT NULL REFERENCES revisions(id), record BLOB NOT NULL);
-  PRAGMA user_version=5;")?;
+  CREATE TABLE IF NOT EXISTS native_settlements (operation TEXT PRIMARY KEY, record BLOB NOT NULL);
+  PRAGMA user_version=6;")?;
         let encoded = serde_json::to_vec(&config).map_err(|_| FsError::InvalidDescriptor)?;
         if let Some(existing) = tx
             .query_row(

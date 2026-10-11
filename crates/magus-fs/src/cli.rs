@@ -42,6 +42,8 @@ fn args(mut argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
         "sync-recovery-capture" => vec!["state", "id", "digest", "operation-id"],
         "sync-recovery-export" => vec!["state", "id", "digest", "destination"],
         "sync-recovery-release" => vec!["state", "operation-id"],
+        "sync-recovery-inspect" => vec!["state", "intent-id"],
+        "sync-recovery-settle" => vec!["state", "selection", "operation-id"],
         "sync-conflicts-list" => vec!["state", "cursor"],
         "sync-conflicts-show" => vec!["state", "conflict"],
         "sync-conflicts-export" => vec!["state", "conflict", "alternative", "destination"],
@@ -783,6 +785,22 @@ fn recovery_control(
             rep.export_native_recovery(id()?, digest()?, destination, actor)
                 .map_err(|e| (1, e))?;
             Ok(json!({"ok":true,"destination":destination}))
+        }
+        "inspect" => {
+            let intent = OperationId::parse(required(options, "intent-id")?).map_err(|e| (2, e))?;
+            let selection = rep
+                .inspect_native_settlement(intent, actor)
+                .map_err(|e| (1, e))?;
+            Ok(json!({"ok":true,"selection":selection,"published":false}))
+        }
+        "settle" => {
+            let selection: NativeSettlementSelection =
+                serde_json::from_str(required(options, "selection")?)
+                    .map_err(|_| (2, FsError::InvalidDescriptor))?;
+            let receipt = rep
+                .settle_native_intent(selection, operation(options)?, actor)
+                .map_err(|e| (1, e))?;
+            Ok(json!({"ok":true,"receipt":receipt,"published":false}))
         }
         "release" => {
             let freed = rep

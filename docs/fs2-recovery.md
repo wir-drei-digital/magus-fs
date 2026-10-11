@@ -97,3 +97,53 @@ conditional-create generation by hash and size, then atomically rebinds retained
 Canonical descriptors and recorded receipts remain intact. An interrupted attempt never
 exposes unverified bytes; its proposed generation remains durably owned for resume.
 Quarantine/unfinished repair storage is retained without pruning in this PoC.
+
+## Settle one retained native root and resume
+
+A completed structural native application can retain an ambiguous displaced root when an
+old file descriptor or working directory writes after root exchange. Capture/export alone
+preserves an alternative and leaves that hold active. The owner can explicitly acknowledge
+one exact preserved retained inventory:
+
+```text
+magus-fs sync recovery inspect --state STATE --intent-id ORIGINAL_APPLICATION_OPERATION
+magus-fs sync recovery settle --state STATE --selection EXACT_SELECTION_JSON --operation-id NEW_OPERATION
+```
+
+First quiesce or rebind the affected writers so future opens/writes use the current root.
+`inspect` performs a complete no-follow rescan and returns `selection`, including the original
+intent/generation, exact retained digest, working generation and immutable recovery links.
+Use existing `capture` or `export` to preserve/read back selected alternatives as needed;
+settlement verifies every linked owner-private copy's digest. It does not require a separate
+captured revision for every historical alternative. Copy bytes, immutable records, original
+base and unknown-causality provenance remain retained, with the existing recovery GC roots.
+This preservation depends on the local private copies until explicitly captured/exported;
+it adds no remote durability promise.
+
+Pass the exact selection as JSON to `settle`. A changed retained inventory, wrong generation,
+unsupported entry, changed bound root, dirty working tree or ownership/authority mismatch
+refuses. The operation supports completed ambiguous structural roots only; incomplete and
+file-only intents retain their existing recovery route. Both controls use the existing owner
+and private peer-credential socket; readonly owners refuse them. Large JSON selections remain
+subject to that socket's existing64KiB request bound.
+
+One FULL/WAL journal transaction appends an immutable receipt and acknowledges only that
+selected blocking state. Original ambiguity and alternatives remain durable. Current readiness
+is restored only when the already applied current target/root still verifies and no other
+intent holds it. A clean private captured working head may acknowledge retained data, but
+stays pending until the existing explicit publication/recovery path establishes an applied
+current target; acknowledgment cannot turn it into a ready shared view. Working head/generation/tree, submissions and publication do not advance.
+An exact operation replay returns its original receipt after current owner checks and never
+clears a later hold. Crash before commit leaves the hold; crash after commit preserves the
+receipt and acknowledgment together. Local journal schema6 migrates earlier versions
+additively; older schema5 binaries refuse it. Canonical revision descriptors/hashes are unchanged.
+
+The entire retained root remains observed, including local-only files, directory names and
+metadata. Any later difference from the acknowledged inventory restores a recoverable hold;
+managed changes get new immutable recovery records, while opaque content remains in its
+retained root. Settlement cannot prove arbitrary writer closure. Retained data still consumes
+the existing512MiB/128generation budget; settlement never releases or deletes it automatically.
+
+After a further remote edit, even a freshly reread native file's first subsequent edit still
+uses `native_unknown_causality`; publication requires the existing explicit recovery/conflict
+path. Linux mounted roots remain the supported active agent surface for base-aware writes.
