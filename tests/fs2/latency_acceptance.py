@@ -5,9 +5,74 @@ import math
 import secrets
 import statistics
 import time
+import re
 from collections import Counter
 from service_protocol import identity, file_entry, GROUP, REPLICA, WORKER
 from service_storage import NS, ALICE, object_id
+
+
+def native_startup(mac, client, infra, report, save, budget=60):
+    """Untimed fixture supervision; the default native CLI still exits on pressure."""
+    from full_native import Endpoint
+    started=time.monotonic();deadline=started+budget;original=mac.i
+    records=report.setdefault('native_startup_attempts',[])
+    client['startup_attempts']=[]
+    class DeadlineInfra:
+        def __getattr__(self,name):return getattr(original,name)
+        def run(self,argv,**kw):
+            remaining=deadline-time.monotonic()
+            if remaining<=0:raise TimeoutError('native startup total deadline')
+            kw['timeout']=min(kw.get('timeout',120),remaining)
+            return original.run(argv,**kw)
+    def fields():
+        return mac.run("from pathlib import Path\np=json.loads(Path(s['path']+'/profile').read_text());st=os.stat(s['root']);print(json.dumps({'root':s['root'],'root_identity':[st.st_dev,st.st_ino],'profile_sha256':hashlib.sha256(Path(s['path']+'/profile').read_bytes()).hexdigest(),'ca_sha256':hashlib.sha256(Path(p['ca_file']).read_bytes()).hexdigest(),'token_sha256':hashlib.sha256(Path(p['token_file']).read_bytes()).hexdigest()}))",client)
+    def log(offset):
+        return mac.run("p=s['path']+'/daemon.log'\nif os.path.exists(p):\n with open(p,'rb') as f:f.seek(s['offset']);text=f.read().decode(errors='replace')\nelse:text=''\nprint(json.dumps(text))",{'path':client['path'],'offset':offset})
+    mac.i=DeadlineInfra()
+    try:
+        before=fields();base=client['binding']
+        for number in range(1,4):
+            if deadline-time.monotonic()<=.25:raise TimeoutError('native startup total deadline')
+            offset=mac.run("p=s+'/daemon.log';print(json.dumps(os.path.getsize(p) if os.path.exists(p) else 0))",client['path'])
+            attempt={'client':client['path'],'number':number,'before':before,'binding_before':base,'started_elapsed_seconds':time.monotonic()-started}
+            records.append(attempt);client['startup_attempts'].append(attempt);save()
+            Endpoint.start(mac,client);attempt['pid']=client['pid'];mac.save();save()
+            while time.monotonic()<deadline:
+                observed=mac.run("import socket\nalive=True\ntry:os.kill(s['pid'],0)\nexcept ProcessLookupError:alive=False\nready=False\nif alive:\n sock=socket.socket(socket.AF_UNIX)\n try:sock.connect(s['state']+'/control.sock');ready=True\n except (FileNotFoundError,ConnectionRefusedError):pass\n finally:sock.close()\nprint(json.dumps({'alive':alive,'control_ready':ready}))",client)
+                if not observed['alive']:
+                    attempt.update(exited=True,new_log=log(offset),after=fields(),elapsed_seconds=time.monotonic()-started)
+                    errors=[]
+                    for line in attempt['new_log'].splitlines():
+                        try:value=json.loads(line)
+                        except ValueError:continue
+                        if isinstance(value,dict) and value.get('error'):errors.append(value)
+                    error=errors[-1] if errors else None
+                    pressure=bool(error and error['error']=='base_unavailable' and re.search(r'cause: Transport \{ kind: "backpressure" \}',error.get('details','')))
+                    attempt.update(error=error,retryable_pressure=pressure);save();mac.save()
+                    if not pressure:raise AssertionError('native startup exited with non-pressure error')
+                    mac.stop(client)
+                    if number==3:raise AssertionError('native startup pressure exhausted three starts')
+                    break
+                if observed['control_ready']:
+                    status=mac.status(client)
+                    if status.get('native') and 'Ready' in status['native']['status'] and status['live']['applied'] and status['live']['authorized']:
+                        after=fields();binding=status['status']['binding']
+                        assert all(binding[k]==v for k,v in base.items() if k!='source'),'native startup base/trust changed'
+                        assert all(after[k]==v for k,v in before.items() if k!='root_identity'),'native startup profile/trust/root path changed'
+                        attempt.update(ready=True,new_log=log(offset),after=after,binding_after=binding,elapsed_seconds=time.monotonic()-started,current_authorized=True)
+                        assert time.monotonic()<=deadline,'native startup total deadline'
+                        save();mac.save();return status
+                time.sleep(min(.08,max(0,deadline-time.monotonic())))
+            else:raise TimeoutError('native startup total deadline; live owner not restarted')
+        raise AssertionError('native startup failed')
+    finally:
+        mac.i=original
+        if records and records[-1].get('client')==client['path']:
+            records[-1].setdefault('elapsed_seconds',time.monotonic()-started)
+            if 'new_log' not in records[-1]:
+                try:records[-1]['new_log']=log(offset)
+                except Exception as error:records[-1]['log_error']=str(error)
+        save();mac.save()
 
 
 def acceptance_s3_capacity(phase, kind, suffix, args):
@@ -315,7 +380,7 @@ def acceptance_type(Profile, DiskLazy, TraceMac, infra, image, report, save, val
                 client = None
                 for route in ['mounted', 'native']:
                     if route == 'native':
-                        client = mac.create('acceptance-' + background); mac.start(client); self.until(lambda: mac.ready(client), 60); self.settle(mac, client)
+                        client = mac.create('acceptance-' + background); native_startup(mac,client,infra,report,save); self.settle(mac, client)
                     for pattern in ['in-place', 'atomic']:
                         rows = []
                         for n in range(count):
