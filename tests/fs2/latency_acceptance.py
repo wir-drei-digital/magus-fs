@@ -66,13 +66,14 @@ def native_startup(mac, client, infra, report, save, budget=60):
             else:raise TimeoutError('native startup total deadline; live owner not restarted')
         raise AssertionError('native startup failed')
     finally:
-        mac.i=original
-        if records and records[-1].get('client')==client['path']:
-            records[-1].setdefault('elapsed_seconds',time.monotonic()-started)
-            if 'new_log' not in records[-1]:
-                try:records[-1]['new_log']=log(offset)
-                except Exception as error:records[-1]['log_error']=str(error)
-        save();mac.save()
+        try:
+            if records and records[-1].get('client')==client['path']:
+                records[-1].setdefault('elapsed_seconds',time.monotonic()-started)
+                if 'new_log' not in records[-1]:
+                    try:records[-1]['new_log']=log(offset)
+                    except Exception as error:records[-1]['log_error']=str(error)
+            save();mac.save()
+        finally:mac.i=original
 
 
 def acceptance_s3_capacity(phase, kind, suffix, args):

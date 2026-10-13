@@ -23,6 +23,7 @@ if sys.argv[1:3]==['sync','run']:
  if scenario!='live':
   sock=socket.socket(socket.AF_UNIX);sock.bind(str(state/'control.sock'));sock.listen()
  while True:time.sleep(.02)
+if scenario.startswith('status-timeout'):time.sleep(2)
 print(json.dumps({'native':{'status':{'Ready':{'revision':'revision'}}},'live':{'applied':True,'authorized':True},'status':{'binding':{'source':'normal-source','view':{'view':'view','head':'head','revision':'revision'}}}}))
 '''
 
@@ -37,7 +38,10 @@ class NativeStartupTests(unittest.TestCase):
         binary=root/'owner';binary.write_text(OWNER);binary.chmod(0o755)
         report={};client={'path':str(root),'root':str(tree),'state':str(state),'binding':{'source':'initial-source','view':{'view':'view','head':'head','revision':'revision'}}}
         class Infra:
-            def run(self,argv,**kw):return subprocess.run(argv,text=True,capture_output=True,**kw)
+            calls=[]
+            def run(self,argv,**kw):
+                self.calls.append({'argv':argv,'timeout':kw['timeout']})
+                return subprocess.run(argv,text=True,capture_output=True,**kw)
             def write_json(self,name,value):(root/name).write_text(json.dumps(value))
         infra=Infra()
         class Mac:
@@ -55,7 +59,8 @@ class NativeStartupTests(unittest.TestCase):
                 if p.returncode:raise AssertionError(p.stderr)
                 return json.loads(p.stdout)
             def status(self,c):
-                p=self.i.run([self.binary,'sync','status','--state',c['state']],timeout=12);return json.loads(p.stdout)
+                if scenario=='status-timeout-denied-log':(root/'daemon.log').chmod(0)
+                p=self.i.run([self.binary,'sync','status','--state',c['state']],timeout=.03 if scenario.startswith('status-timeout') else 12);return json.loads(p.stdout)
             def save(self):infra.write_json('ownership.json',client)
             def stop(self,c):
                 pid=c.pop('pid');c['stopped_pid']=pid
@@ -92,6 +97,20 @@ class NativeStartupTests(unittest.TestCase):
         mac,c,i,report,save=self.fixture('live');original=mac.i;start=time.monotonic()
         with self.assertRaises((TimeoutError,subprocess.TimeoutExpired)):native_startup(mac,c,i,report,save,budget=.35)
         self.assertEqual(len(report['native_startup_attempts']),1);self.assertLess(time.monotonic()-start,.6);self.assertIs(mac.i,original)
+
+    def test_status_timeout_fallback_log_keeps_remaining_command_deadline(self):
+        mac,c,i,report,save=self.fixture('status-timeout');original=mac.i
+        with self.assertRaises(subprocess.TimeoutExpired):native_startup(mac,c,i,report,save,budget=3)
+        logs=[q for q in i.calls if any('f.seek' in a for a in q['argv'])]
+        self.assertEqual(len(logs),1);self.assertLess(logs[0]['timeout'],3)
+        self.assertIn('new_log',report['native_startup_attempts'][0]);self.assertIs(mac.i,original)
+
+    def test_failed_timeout_log_still_restores_original_endpoint(self):
+        mac,c,i,report,save=self.fixture('status-timeout-denied-log');original=mac.i
+        with self.assertRaises(subprocess.TimeoutExpired):native_startup(mac,c,i,report,save,budget=3)
+        logs=[q for q in i.calls if any('f.seek' in a for a in q['argv'])]
+        self.assertEqual(len(logs),1);self.assertLess(logs[0]['timeout'],3)
+        self.assertIn('PermissionError',report['native_startup_attempts'][0]['log_error']);self.assertIs(mac.i,original)
 
 
 if __name__=='__main__':unittest.main()
