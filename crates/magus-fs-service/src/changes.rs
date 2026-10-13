@@ -129,12 +129,13 @@ pub(crate) async fn notifications(
     let c = state.auth(&headers, &ns, "read").await?;
     let ws = ws.map_err(|_| Error::invalid("invalid_request"))?;
     let mut q = query(raw)?;
+    let mut committed = state.shared_changes.subscribe();
     page(&state, &c, &q).await?;
     Ok(ws.max_message_size(1024).max_frame_size(1024).on_upgrade(move|socket|async move {
   let (mut sink,mut stream)=socket.split();let mut tick=tokio::time::interval(std::time::Duration::from_secs(1));
   loop{tokio::select!{
    message=stream.next()=>{match message{Some(Ok(Message::Close(_)))|None|Some(Err(_))=>break,_=>{}}},
-   _=tick.tick()=>{match page(&state,&c,&q).await{Ok(page)=>{q.after=page.cursor;if !page.events.is_empty(){let hint=format!("{{\"cursor\":{}}}",page.cursor);if sink.send(Message::Text(hint.into())).await.is_err(){break}}},Err(_)=>{let _=sink.send(Message::Close(None)).await;break}}}
+   hint=async { tokio::select! { _=tick.tick()=>Some(()), changed=committed.changed()=>changed.ok() } }=>{if hint.is_none(){break} match page(&state,&c,&q).await{Ok(page)=>{q.after=page.cursor;if !page.events.is_empty(){let hint=format!("{{\"cursor\":{}}}",page.cursor);if sink.send(Message::Text(hint.into())).await.is_err(){break}}},Err(_)=>{let _=sink.send(Message::Close(None)).await;break}}}
   }}
  }))
 }

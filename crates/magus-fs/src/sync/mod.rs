@@ -12,3 +12,5 @@ pub(crate) mod watch;
 pub(crate) mod mounted;
 
 pub(crate) mod dependencies;
+
+pub(crate) mod wakeup;

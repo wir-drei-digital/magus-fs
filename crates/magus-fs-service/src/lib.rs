@@ -103,6 +103,7 @@ pub struct ServiceState {
     pub objects: Arc<storage::VerifiedObjects>,
     requests: Arc<tokio::sync::Semaphore>,
     revision_work: Arc<tokio::sync::Semaphore>,
+    shared_changes: tokio::sync::watch::Sender<u64>,
 }
 impl ServiceState {
     pub async fn open(config: config::Config) -> Result<Self> {
@@ -113,7 +114,28 @@ impl ServiceState {
             objects,
             requests: Arc::new(tokio::sync::Semaphore::new(32)),
             revision_work: Arc::new(tokio::sync::Semaphore::new(2)),
+            shared_changes: tokio::sync::watch::channel(0).0,
         })
+    }
+    /// Postcommit advice cannot fail an already committed publication.
+    pub(crate) fn shared_committed(
+        &self,
+        receipt: &magus_fs_core::protocol::SharedReceipt,
+        revision: &magus_fs_core::RevisionId,
+    ) {
+        self.shared_changes
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        if std::env::var_os("MAGUS_LATENCY_TRACE").is_some() {
+            let mut stamp = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut stamp) } == 0 {
+                let ns = stamp.tv_sec as u128 * 1_000_000_000 + stamp.tv_nsec as u128;
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr().lock(), "latency stage=shared_committed monotonic_ns={ns} operation={} revision={} head={}", receipt.operation.as_str(), revision.as_str(), receipt.head.as_str());
+            }
+        }
     }
     pub(crate) fn revision_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
         self.revision_work

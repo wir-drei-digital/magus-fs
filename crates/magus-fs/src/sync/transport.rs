@@ -213,7 +213,7 @@ pub struct Transport {
     pub binding: SyncBinding,
     roots: Vec<PathBuf>,
     principals: Vec<PrincipalId>,
-    replica: ReplicaId,
+    pub(super) replica: ReplicaId,
     dns_lookup: DnsLookup,
     pub counters: Arc<Mutex<Counters>>,
 }
@@ -649,6 +649,7 @@ impl Transport {
     pub(super) fn hints(
         &self,
         stop: &std::sync::atomic::AtomicBool,
+        wakeup: &dyn Fn(),
     ) -> std::result::Result<(), FsError> {
         use futures_util::StreamExt;
         use reqwest::dns::Resolve;
@@ -742,6 +743,7 @@ impl Transport {
                             eprintln!("test_drop_wss_hint cursor={}", hint.cursor);
                             continue;
                         }
+                        wakeup();
                         eprintln!("live_hint cursor={}", hint.cursor);
                     }
                     Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))))

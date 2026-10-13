@@ -56,6 +56,8 @@ impl UploadStatus {
 /// Incoming view advancement must acquire this gate too. Never hold Core's mutex while waiting.
 pub(crate) struct SyncExecution {
     active: Mutex<()>,
+    pub(crate) publisher: Arc<super::wakeup::Wakeup>,
+    pub(crate) incoming: Arc<super::wakeup::Wakeup>,
 }
 impl SyncExecution {
     pub(crate) fn for_replica(replica: &ReplicaId) -> Result<Arc<Self>, FsError> {
@@ -70,6 +72,8 @@ impl SyncExecution {
         }
         let owner = Arc::new(Self {
             active: Mutex::new(()),
+            publisher: Arc::default(),
+            incoming: Arc::default(),
         });
         owners.insert(replica.clone(), Arc::downgrade(&owner));
         Ok(owner)
@@ -119,13 +123,32 @@ pub(crate) fn admit_engine_checkpoint(rep: &Replica) -> Result<(), FsError> {
     if status.head.as_ref() != Some(&head) || status.generation != snapshot.generation {
         return Err(FsError::GenerationMismatch);
     }
-    rep.enqueue_submission(PendingSubmission {
-        operation: revision.operation,
-        local_revision: head,
-        original_view: binding.view.view,
-        original_head: binding.view.head,
-        expected_local_generation: status.generation,
-    })
+    enqueue_submission(
+        rep,
+        PendingSubmission {
+            operation: revision.operation,
+            local_revision: head,
+            original_view: binding.view.view,
+            original_head: binding.view.head,
+            expected_local_generation: status.generation,
+        },
+    )
+}
+pub(crate) fn enqueue_submission(rep: &Replica, pending: PendingSubmission) -> Result<(), FsError> {
+    let config = rep.configuration()?;
+    let owner = SyncExecution::for_replica(&config.replica)?;
+    let operation = pending.operation.clone();
+    let revision = pending.local_revision.clone();
+    rep.enqueue_submission(pending)?;
+    super::wakeup::trace(
+        "admitted",
+        config.replica.as_str(),
+        operation.as_str(),
+        revision.as_str(),
+        "-",
+    );
+    owner.publisher.notify();
+    Ok(())
 }
 pub struct SyncController {
     rep: Replica,
@@ -158,12 +181,17 @@ impl SyncController {
             .find(|p| &p.local_revision == revision)
             .ok_or(FsError::NotFound)
     }
+    pub(crate) fn wakeup(&self) -> Arc<super::wakeup::Wakeup> {
+        self.execution.publisher.clone()
+    }
     pub fn tick(&self) -> Result<SyncProgress, FsError> {
         let deadline = Instant::now() + Duration::from_secs(60);
+        let gate_started = Instant::now();
         let _execution = self
             .execution
             .acquire(deadline)?
             .ok_or(FsError::Backpressure)?;
+        let gate_wait = gate_started.elapsed();
         // A shared resolution whose local links were interrupted (e.g. owner crash) is
         // completed idempotently so its resolved candidates stop blocking application.
         for p in self.rep.sync_status()?.submissions {
@@ -190,6 +218,16 @@ impl SyncController {
                                 && !held(p)))
             })
             .ok_or(FsError::NotFound)?;
+        if std::env::var_os("MAGUS_LATENCY_TRACE").is_some() {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "latency_wait stage=publisher_execution operation={} revision={} wait_ns={}",
+                p.operation.as_str(),
+                p.local_revision.as_str(),
+                gate_wait.as_nanos()
+            );
+        }
         self.target_tick(p, deadline)
     }
     fn target_tick(&self, p: SyncProgress, deadline: Instant) -> Result<SyncProgress, FsError> {
@@ -217,7 +255,21 @@ impl SyncController {
             if Instant::now() >= deadline {
                 break;
             }
-            match self.attempt(p.clone(), deadline) {
+            let attempt_result = self.attempt(p.clone(), deadline).and_then(|result| {
+                if p.private_receipt.is_none()
+                    && result.private_receipt.is_some()
+                    && result.shared_receipt.is_none()
+                    && !held(&result)
+                    && (result.resolves.is_some()
+                        || self.transport.binding.publication == PublicationMode::SharedLive)
+                    && Instant::now() < deadline
+                {
+                    self.attempt(result, deadline)
+                } else {
+                    Ok(result)
+                }
+            });
+            match attempt_result {
                 Ok(result) => return Ok(result),
                 Err(error) => {
                     // Reload: the attempt may have durably crossed the uncertain boundary.
@@ -478,7 +530,23 @@ impl SyncController {
         }
         next.error = None;
         next.remote_outcome_unknown = false;
-        Ok(self.save(&p, next)?)
+        let saved = self.save(&p, next)?;
+        super::wakeup::trace(
+            if saved.shared_receipt.is_some() {
+                "shared_receipt"
+            } else {
+                "private_receipt"
+            },
+            self.transport.replica.as_str(),
+            saved.operation.as_str(),
+            saved.local_revision.as_str(),
+            saved
+                .shared_receipt
+                .as_ref()
+                .map(|r| r.head.as_str())
+                .unwrap_or("-"),
+        );
+        Ok(saved)
     }
     fn current_head(&self, deadline: Instant) -> Result<HeadToken, Failure> {
         let view: ViewBinding = self.transport.json(
@@ -808,6 +876,15 @@ mod upload_tests {
         let first = SyncExecution::for_replica(&replica).unwrap();
         let second = SyncExecution::for_replica(&replica).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
+        let publisher_epoch = second.publisher.epoch();
+        let incoming_epoch = second.incoming.epoch();
+        first.publisher.notify();
+        assert_ne!(publisher_epoch, second.publisher.epoch());
+        assert_eq!(
+            incoming_epoch,
+            second.incoming.epoch(),
+            "publisher and incoming are independent"
+        );
         let guard = first
             .acquire(Instant::now() + Duration::from_secs(1))
             .unwrap()
@@ -820,6 +897,13 @@ mod upload_tests {
         assert!(started.elapsed() < Duration::from_millis(500));
         assert!(second.active.try_lock().is_err());
         let other = SyncExecution::for_replica(&ReplicaId::random().unwrap()).unwrap();
+        let other_epoch = other.publisher.epoch();
+        first.publisher.notify();
+        assert_eq!(
+            other_epoch,
+            other.publisher.epoch(),
+            "replica wakeups are isolated"
+        );
         assert!(other
             .acquire(Instant::now() + Duration::from_secs(1))
             .unwrap()

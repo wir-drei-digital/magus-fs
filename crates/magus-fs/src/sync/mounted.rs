@@ -41,7 +41,7 @@ impl MountedCapture {
         let now = Instant::now();
         match self.observed {
             Some((generation, since)) if generation == status.generation => {
-                if now.duration_since(since) < Duration::from_millis(100) {
+                if now.duration_since(since) < Duration::from_millis(25) {
                     return Ok(None);
                 }
             }
@@ -173,13 +173,13 @@ mod tests {
         let h = ws.open("file", OpenMode::Write).unwrap();
         ws.write(&h, 0, b"first").unwrap();
         assert!(capture.tick(checkpoint).unwrap().is_none());
-        std::thread::sleep(Duration::from_millis(110));
+        std::thread::sleep(Duration::from_millis(30));
         ws.write(&h, 0, b"later").unwrap();
         assert!(
             capture.tick(checkpoint).unwrap().is_none(),
             "new generation restarts debounce"
         );
-        std::thread::sleep(Duration::from_millis(110));
+        std::thread::sleep(Duration::from_millis(30));
         let first = capture.tick(checkpoint).unwrap().unwrap();
         assert_eq!(rep.pending_submissions().unwrap().len(), 1);
         assert!(capture.tick(checkpoint).unwrap().is_none());

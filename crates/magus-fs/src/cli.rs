@@ -587,13 +587,16 @@ fn sync_control(rep: &Replica, command: &str, options: &BTreeMap<String, String>
                     }
                 } else {
                     let binding = status.binding.ok_or((1, FsError::ConfigMismatch))?;
-                    rep.enqueue_submission(PendingSubmission {
-                        operation,
-                        local_revision: target,
-                        original_view: binding.view.view,
-                        original_head: binding.view.head,
-                        expected_local_generation: rep.status().map_err(|e| (1, e))?.generation,
-                    })
+                    crate::sync::enqueue_submission(
+                        rep,
+                        PendingSubmission {
+                            operation,
+                            local_revision: target,
+                            original_view: binding.view.view,
+                            original_head: binding.view.head,
+                            expected_local_generation: rep.status().map_err(|e| (1, e))?.generation,
+                        },
+                    )
                     .map_err(|e| (1, e))?;
                 }
                 if options.get("enqueue-only").map(String::as_str) == Some("true") {

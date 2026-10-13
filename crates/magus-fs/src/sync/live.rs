@@ -51,6 +51,9 @@ impl Incoming {
             pending_source: None,
         })
     }
+    pub(crate) fn wakeup(&self) -> Arc<super::wakeup::Wakeup> {
+        self.execution.incoming.clone()
+    }
     /// A native consumer that cleared readiness must reverify even an unchanged head.
     pub fn request_refresh(&mut self) {
         self.needs_refresh = true;
@@ -120,6 +123,13 @@ impl Incoming {
                 }
                 Err(error) => return Err(error),
             };
+            super::wakeup::trace(
+                "discovered",
+                transport.replica.as_str(),
+                "-",
+                "-",
+                page.events.last().map(|e| e.head.as_str()).unwrap_or("-"),
+            );
             self.cursor = page.cursor;
             let mut recovery = self.rep.incoming_recovery()?;
             recovery.cursor = self.cursor;
@@ -238,7 +248,9 @@ pub(crate) fn subscribe(
                 if let Some(binding) = status.binding {
                     if let Ok(config) = rep.configuration() {
                         if let Ok(transport) = Transport::new(binding, &config) {
-                            let _ = transport.hints(&stop);
+                            if let Ok(owner) = SyncExecution::for_replica(&config.replica) {
+                                let _ = transport.hints(&stop, &|| owner.incoming.notify());
+                            }
                         }
                     }
                 }

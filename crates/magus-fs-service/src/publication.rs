@@ -96,6 +96,7 @@ pub(crate) async fn seed(
         .acquire()
         .await?
         .run(|db| {
+            let state = &state;
             Box::pin(async move {
                 let tx = db.transaction().await?;
                 let current = r::recheck(&tx, &s, "admin").await?;
@@ -143,6 +144,7 @@ pub(crate) async fn seed(
                 )
                 .await?;
                 tx.commit().await?;
+                state.shared_committed(&receipt, &req.revision);
                 Ok(([("content-type", "application/json")], result).into_response())
             })
         })
@@ -371,7 +373,7 @@ async fn integrate_request(
         };
         let root = current.tree.root.id.clone();
         barrier("integration").await;
-        let commit=state.db.acquire().await?.run(|db|{let req=&req;let serialized=&serialized;let s=&s;let receipt=&receipt;let original=&original;let decision=&decision;let published=&published;let derived_id=&derived_id;let current_id=&current_id;let base_id=&base_id;let root=&root;let explicit=&explicit;Box::pin(async move {
+        let commit=state.db.acquire().await?.run(|db|{let state=&state;let req=&req;let serialized=&serialized;let s=&s;let receipt=&receipt;let original=&original;let decision=&decision;let published=&published;let derived_id=&derived_id;let current_id=&current_id;let base_id=&base_id;let root=&root;let explicit=&explicit;Box::pin(async move {
    let tx=db.transaction().await?;let current=r::recheck(&tx,s,"integrate").await?;
    if tx.query_opt("SELECT operation FROM operations WHERE namespace=$1 AND replica=$2 AND operation=$3",&[&current.namespace,&current.replica,&req.operation.as_str()]).await?.is_some(){return Err(Error::conflict())}
    let mut result = match decision {
@@ -397,7 +399,7 @@ async fn integrate_request(
     result=r::json(&ConflictedIntegration{code:CONFLICTED.into(),conflicts:ids})?;
     tx.execute("UPDATE operations SET result=$4 WHERE namespace=$1 AND replica=$2 AND operation=$3",&[&current.namespace,&current.replica,&req.operation.as_str(),&result]).await?;
    }
-   tx.commit().await?;Ok((axum::http::StatusCode::from_u16(if matches!(decision,Decision::Publish{..}){200}else{409}).map_err(|_|Error::backend())?,[("content-type","application/json")],result).into_response())
+   tx.commit().await?;if matches!(decision,Decision::Publish{..}) {state.shared_committed(receipt, derived_id);} Ok((axum::http::StatusCode::from_u16(if matches!(decision,Decision::Publish{..}){200}else{409}).map_err(|_|Error::backend())?,[("content-type","application/json")],result).into_response())
   })}).await;
         match commit {
             Err(e) if e.code == "conflict" && attempt < 2 => {

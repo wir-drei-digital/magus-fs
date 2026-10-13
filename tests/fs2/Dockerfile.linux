@@ -10,6 +10,7 @@ COPY tests ./tests
 ARG VERIFY=1
 ARG BUILD_PROFILE=dev
 ARG BIN_DIR=debug
+RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target if [ "$VERIFY" = latency ]; then rustc --version --verbose && cargo fmt --all --check && cargo clippy --locked -p magus-fs -p magus-fs-service --all-targets --all-features -- -D warnings && cargo test --locked -p magus-fs -p magus-fs-service --all-features; fi
 RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target if [ "$VERIFY" = service ]; then rustc --version --verbose && cargo fmt --all --check && cargo clippy --locked --workspace --all-targets --all-features -- -D warnings && cargo test --locked -p magus-fs-service --all-features; fi
 RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target if [ "$VERIFY" = client-fix ]; then rustc --version --verbose && cargo fmt --all --check && cargo clippy --locked -p magus-fs-core -p magus-fs --all-targets --all-features -- -D warnings && cargo test --locked -p magus-fs-core -p magus-fs --all-targets --all-features; fi
 RUN --mount=type=cache,id=fs2-registry,target=/usr/local/cargo/registry --mount=type=cache,id=fs2-target,target=/src/target if [ "$VERIFY" = client ]; then rustc --version --verbose && cargo fmt --all --check && cargo clippy --locked -p magus-fs --all-targets --all-features -- -D warnings && cargo test --locked -p magus-fs --all-targets --all-features; fi

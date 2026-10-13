@@ -672,7 +672,7 @@ pub(crate) async fn resolve(
         let bytes = r::encode(&resolved)?;
         let resolved_tree = resolved.tree.clone();
         barrier("resolution").await;
-        let commit = state.db.acquire().await?.run(|db| { let req=&req; let serialized=&serialized; let ids=&ids; let candidate=&candidate; let original=&original; let receipt=&receipt; let result=&result; let paths=&paths; let required=&required; let bytes=&bytes; let resolved_id=&resolved_id; let derived_id=&derived_id; let provenance=&provenance; let s=&s; let superseded=&superseded; let resolved_tree=&resolved_tree; Box::pin(async move {
+        let commit = state.db.acquire().await?.run(|db| { let state=&state; let req=&req; let serialized=&serialized; let ids=&ids; let candidate=&candidate; let original=&original; let receipt=&receipt; let result=&result; let paths=&paths; let required=&required; let bytes=&bytes; let resolved_id=&resolved_id; let derived_id=&derived_id; let provenance=&provenance; let s=&s; let superseded=&superseded; let resolved_tree=&resolved_tree; Box::pin(async move {
             let tx = db.transaction().await?;
             let current = r::recheck(&tx, s, "integrate").await?;
             if tx.query_opt("SELECT operation FROM operations WHERE namespace=$1 AND replica=$2 AND operation=$3",&[&current.namespace,&current.replica,&req.operation.as_str()]).await?.is_some() {
@@ -706,6 +706,7 @@ pub(crate) async fn resolve(
                 tx.execute("INSERT INTO revision_provenance(namespace,revision,kind,operation,payload,digest) VALUES($1,$2,'resolution',$3,$4,$5)",&[&current.namespace,&resolved_id.as_str(),&req.operation.as_str(),provenance,&digest(provenance.as_bytes())]).await?;
             }
             tx.commit().await?;
+            if !stale { state.shared_committed(receipt, resolved_id); }
             Ok((if stale { StatusCode::CONFLICT } else { StatusCode::OK }, [("content-type","application/json")], result.clone()).into_response())
         })}).await;
         match commit {

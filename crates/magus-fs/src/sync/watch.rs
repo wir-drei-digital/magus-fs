@@ -136,7 +136,8 @@ impl NativeWatch {
     fn admit(&self) -> Result<(), FsError> {
         let status = self.rep.sync_status()?;
         let binding = status.binding.ok_or(FsError::ConfigMismatch)?;
-        let Some(head) = self.rep.status()?.head else {
+        let snapshot = self.rep.scheduling_snapshot()?;
+        let Some(head) = snapshot.head else {
             return Ok(());
         };
         if head == binding.view.revision
@@ -144,18 +145,26 @@ impl NativeWatch {
         {
             return Ok(());
         }
+        let verified = self.rep.status()?;
+        if verified.head.as_ref() != Some(&head) || verified.generation != snapshot.generation {
+            return Err(FsError::GenerationMismatch);
+        }
         let revision = self.rep.revision(&head)?;
-        self.rep.enqueue_submission(PendingSubmission {
-            operation: revision.operation,
-            local_revision: head,
-            original_view: binding.view.view,
-            original_head: binding.view.head,
-            expected_local_generation: self.rep.status()?.generation,
-        })
+        super::enqueue_submission(
+            &self.rep,
+            PendingSubmission {
+                operation: revision.operation,
+                local_revision: head,
+                original_view: binding.view.view,
+                original_head: binding.view.head,
+                expected_local_generation: snapshot.generation,
+            },
+        )
     }
 }
 
 pub(crate) fn serve(rep: &Replica) -> Result<(), FsError> {
+    let replica_id = rep.configuration()?.replica;
     let actor = super::publication_actor(rep, rep.actor_for_uid(unsafe { libc::geteuid() })?)?;
     let mut watch = NativeWatch::new(rep, actor.clone())?;
     let watch_rep = rep.clone();
@@ -166,20 +175,37 @@ pub(crate) fn serve(rep: &Replica) -> Result<(), FsError> {
         std::thread::sleep(Duration::from_millis(50));
     });
     let publisher = super::SyncController::new(rep)?;
+    let publication_wakeup = publisher.wakeup();
     std::thread::spawn(move || loop {
+        let observed = publication_wakeup.epoch();
         let _ = publisher.tick();
-        std::thread::sleep(Duration::from_secs(1));
+        publication_wakeup.wait_until(observed, Instant::now() + Duration::from_secs(1));
     });
     let _hints = super::subscribe(rep.clone(), Arc::new(AtomicBool::new(false)));
     let mut incoming = super::Incoming::new(rep)?;
+    let incoming_wakeup = incoming.wakeup();
     loop {
+        let observed = incoming_wakeup.epoch();
         if let Err(e) = incoming.poll(|binding, generation| {
-            rep.apply_native_view(binding, generation, OperationId::random()?, actor.clone())
+            let revision = binding.view.revision.clone();
+            let head = binding.view.head.clone();
+            let result =
+                rep.apply_native_view(binding, generation, OperationId::random()?, actor.clone())?;
+            if matches!(result, NativeApplyStatus::Ready { .. }) {
+                super::wakeup::trace(
+                    "applied_native",
+                    replica_id.as_str(),
+                    "-",
+                    revision.as_str(),
+                    head.as_str(),
+                );
+            }
+            Ok(result)
         }) {
             incoming.request_refresh();
             rep.record_native_error(&e)?;
         }
-        std::thread::sleep(Duration::from_secs(1));
+        incoming_wakeup.wait_until(observed, Instant::now() + Duration::from_secs(1));
     }
 }
 #[cfg(test)]

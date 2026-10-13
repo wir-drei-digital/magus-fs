@@ -755,6 +755,7 @@ pub fn mount(
         })),
         read_only,
     };
+    let replica_id = rep.configuration()?.replica;
     let _control = super::control::Server::start(rep.clone(), state, read_only)?;
     std::fs::create_dir(mountpoint)?;
     rep.check_content_path(mountpoint)?;
@@ -812,19 +813,19 @@ pub fn mount(
                 std::thread::sleep(Duration::from_millis(50));
             }
         });
+        let publication_wakeup = publisher.wakeup();
         let publish_stop = stop.clone();
         let publish_thread = std::thread::spawn(move || {
             while !publish_stop.load(Ordering::Relaxed) {
+                let observed = publication_wakeup.epoch();
                 if let Err(error) = publisher.tick() {
                     if !matches!(error, FsError::NotFound) {
                         eprintln!("mounted_publication_error code={}", error.code());
                     }
                 }
-                for _ in 0..10 {
-                    if publish_stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
+                if !publish_stop.load(Ordering::Relaxed) {
+                    publication_wakeup
+                        .wait_until(observed, std::time::Instant::now() + Duration::from_secs(1));
                 }
             }
         });
@@ -836,12 +837,14 @@ pub fn mount(
         let stop = stop.clone();
         let rep = rep.clone();
         let mountpoint = mountpoint.to_path_buf();
+        let replica_id = replica_id.clone();
         Some(std::thread::spawn(move || {
             let hints = crate::sync::subscribe(rep.clone(), stop.clone());
             let mut incoming = match crate::sync::Incoming::new(&rep) {
                 Ok(v) => v,
                 Err(_) => return,
             };
+            let incoming_wakeup = incoming.wakeup();
             let mut pending = rep
                 .live_status()
                 .ok()
@@ -854,6 +857,7 @@ pub fn mount(
                     })
                 });
             while !stop.load(Ordering::Relaxed) {
+                let observed = incoming_wakeup.epoch();
                 let result = incoming.poll(|binding, generation| {
                     let mut state = live_state.lock().map_err(|_| FsError::ReplicaBusy)?;
                     let actor = Actor::new(state.config.authorities[0].principal.clone());
@@ -927,14 +931,25 @@ pub fn mount(
                             adoption.revision.as_str(),
                             started.elapsed().as_micros()
                         );
+                        if std::env::var_os("MAGUS_LATENCY_TRACE").is_some() {
+                            if let Ok(status) = rep.sync_status() {
+                                if let Some(binding) = status.binding {
+                                    crate::sync::wakeup::trace(
+                                        "applied",
+                                        replica_id.as_str(),
+                                        "-",
+                                        adoption.revision.as_str(),
+                                        binding.view.head.as_str(),
+                                    );
+                                }
+                            }
+                        }
                         pending = None;
                     }
                 }
-                for _ in 0..10 {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
+                if !stop.load(Ordering::Relaxed) {
+                    incoming_wakeup
+                        .wait_until(observed, std::time::Instant::now() + Duration::from_secs(1));
                 }
             }
             let _ = hints.join();
@@ -944,6 +959,10 @@ pub fn mount(
     };
     let result = session.run();
     stop.store(true, Ordering::Relaxed);
+    if let Ok(owner) = crate::sync::SyncExecution::for_replica(&replica_id) {
+        owner.publisher.notify();
+        owner.incoming.notify();
+    }
     if let Some((capture, publish)) = outgoing {
         let _ = capture.join();
         let _ = publish.join();
