@@ -220,7 +220,7 @@ def acceptance_type(Profile, DiskLazy, TraceMac, infra, image, report, save, val
             for actor,name,replica in [('alice','a',REPLICA),('worker','b',WORKER)]:
                 digest=hashlib.sha256(self.tokens[actor].encode()).hexdigest()
                 sql="SELECT json_build_object('replica',c.replica,'principal',c.principal,'expires',extract(epoch FROM c.expires)::bigint,'actions',g.actions,'branches',g.branches,'prefixes',g.prefixes) FROM credentials c JOIN grants g ON g.credential=c.id WHERE c.token_hash='"+digest+"';"
-                policy=json.loads(self.sql(sql));policies[name]=policy
+                policy=json.loads(infra.sql(sql));policies[name]=policy
                 assert policy['replica']==replica and policy['principal']==ALICE and policy['branches']==['main'] and policy['prefixes']==['']
                 assert set(policy['actions'])==({'admin','read','write','integrate','history'} if name=='a' else {'read','write','integrate','history'})
                 profile=self.lazy.execute("import json,hashlib,sys;from pathlib import Path;name=json.load(sys.stdin);p=json.loads(Path('/private/'+name+'/profile').read_text());print(json.dumps({'namespace':p['namespace'],'replica':p['replica'],'principal':p['publication_principal'],'token_sha256':hashlib.sha256(Path(p['token_file']).read_bytes()).hexdigest()}))",name)
