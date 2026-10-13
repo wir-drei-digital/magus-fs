@@ -10,6 +10,14 @@ from service_protocol import identity, file_entry, GROUP, REPLICA, WORKER
 from service_storage import NS, ALICE, object_id
 
 
+def acceptance_s3_capacity(phase, kind, suffix, args):
+    # One default seven-volume grow batch plus the distinct filer-log collection.
+    if phase=='acceptance' and kind=='container' and suffix=='s3':
+        assert args.count('-volume.max=1')==1 and '-master.volumeSizeLimitMB=1024' in args
+        return ['-volume.max=8' if arg=='-volume.max=1' else arg for arg in args]
+    return args
+
+
 def backend_diagnostics(infra, label):
     """Bounded best-effort evidence from recorded owned resources before cleanup."""
     result={'owner':infra.owner,'before_cleanup':True,'containers':[],'errors':[]}
@@ -31,6 +39,11 @@ def backend_diagnostics(infra, label):
             except Exception as error:result['errors'].append({'name':resource['name'],'step':step,'error':str(error)})
         infra.write_json(label+'-backends.json',result)
     infra.write_json(label+'-backends.json',result)
+    if hasattr(infra,'backend_http'):
+        for name,port,path in [('volumes',8080,'/status'),('topology',9333,'/dir/status')]:
+            try:result[name]=infra.backend_http(port,path)
+            except Exception as error:result['errors'].append({'step':name,'error':str(error)})
+        infra.write_json(label+'-backends.json',result)
     return result
 
 

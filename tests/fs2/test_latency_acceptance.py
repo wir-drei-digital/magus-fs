@@ -11,6 +11,17 @@ from latency_acceptance import WATCH, WRITE, distribution
 
 
 class AcceptanceTests(unittest.TestCase):
+    def test_capacity_override_is_confined_to_acceptance_s3_creation(self):
+        from latency_acceptance import acceptance_s3_capacity
+        original=['--memory','1g','--cpus','2','--pids-limit','256','-v','owned:/data','-volume.max=1','-master.volumeSizeLimitMB=1024']
+        for phase in ['wakeups','reuse','pooled','backend-preflight']:
+            self.assertEqual(acceptance_s3_capacity(phase,'container','s3',original),original)
+        for kind,suffix in [('volume','s3'),('container','service'),('container','acceptance-sender')]:
+            self.assertEqual(acceptance_s3_capacity('acceptance',kind,suffix,original),original)
+        accepted=acceptance_s3_capacity('acceptance','container','s3',original)
+        self.assertEqual(accepted,original[:-2]+['-volume.max=8',original[-1]])
+        self.assertEqual(original[-2],'-volume.max=1','baseline configuration must remain intact')
+
     def test_backend_diagnostics_continue_after_missing_log_and_exclude_credentials(self):
         from latency_acceptance import backend_diagnostics
         with tempfile.TemporaryDirectory(prefix='latency-backend-diagnostics-') as temporary:

@@ -28,6 +28,9 @@ assert a.image.startswith('sha256:') and len(a.image)==71,'immutable image requi
 IMAGE=a.image
 BASELINE_DRIVER_SHA256='dac32ce23852f4a5146528675058d8f406ac9fc6e529037d9804e2a189c6cbc9'
 class TraceInfra(OwnedInfra):
+ def create(self,kind,suffix,args):
+  from latency_acceptance import acceptance_s3_capacity
+  return super().create(kind,suffix,acceptance_s3_capacity(a.phase,kind,suffix,args))
  def docker(self,*args,**kw):
   if args[:2]==('exec','-d'):args=('exec','-d','-e','MAGUS_LATENCY_TRACE=1',*args[2:])
   return super().docker(*args,**kw)
