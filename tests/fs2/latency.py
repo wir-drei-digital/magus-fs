@@ -22,7 +22,7 @@ def validate_receipts(progress,binding,replica):
  assert shared['operation']==integration['operation'] and shared['operation']!=private['operation']
  assert shared['branch']==integration['branch']==binding['branch']
 
-p=argparse.ArgumentParser();p.add_argument('--output',required=True);p.add_argument('--image',required=True);p.add_argument('--phase',choices=['wakeups','reuse'],required=True);p.add_argument('--skip-boundaries',action='store_true');p.add_argument('--skip-native-small',action='store_true');a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--output',required=True);p.add_argument('--image',required=True);p.add_argument('--phase',choices=['wakeups','reuse','pooled','acceptance'],required=True);p.add_argument('--skip-boundaries',action='store_true');p.add_argument('--skip-native-small',action='store_true');a=p.parse_args()
 assert Path(a.output).is_absolute()
 assert a.image.startswith('sha256:') and len(a.image)==71,'immutable image required'
 IMAGE=a.image
@@ -44,14 +44,16 @@ class TraceMac(Mac):
 
 class DiskLazy(Lazy):
  def execute(self,code,settings=None,user='0:0',check=True):
-  return super().execute("import os;os.environ['MAGUS_LATENCY_TRACE']='1'\n"+code,settings,user,check)
+  try:return super().execute("import os;os.environ['MAGUS_LATENCY_TRACE']='1'\n"+code,settings,user,check)
+  finally:self.i.write_json(self.record_label+'-commands.json',self.commands)
 
- def __init__(self,j):
+ def __init__(self,j,suffix='disk-mounted'):
+  self.record_label=suffix
   self.commands=[];self.i=j.i;self.image=j.image;self.tokens=j.tokens;self.mounts=[];self.holders=[];self.evidence={};self.owner=j
-  volume=self.i.create('volume','profile-replica-state',[])
-  self.daemon=self.i.create('container','disk-mounted',['--network',self.i.ingress,'--cap-drop','ALL','--cap-add','SYS_ADMIN','--cap-add','DAC_OVERRIDE','--cap-add','SYS_CHROOT','--security-opt','apparmor=unconfined','--security-opt','no-new-privileges','--device','/dev/fuse','--memory','512m','--cpus','2','--pids-limit','256','-v',volume+':/private','--tmpfs','/shared:rw,nosuid,nodev,mode=755,size=16m',self.image,'python3','-c',"import os,signal,time;os.chmod('/private',0o700)\ndef reap(*a):\n while True:\n  try:p,s=os.waitpid(-1,os.WNOHANG)\n  except ChildProcessError:return\n  if p==0:return\nsignal.signal(signal.SIGCHLD,reap)\nwhile True:time.sleep(.2)"])
+  volume=self.i.create('volume',suffix+'-state',[])
+  self.daemon=self.i.create('container',suffix,['--network',self.i.ingress,'--cap-drop','ALL','--cap-add','SYS_ADMIN','--cap-add','DAC_OVERRIDE','--cap-add','SYS_CHROOT','--security-opt','apparmor=unconfined','--security-opt','no-new-privileges','--device','/dev/fuse','--memory','512m','--cpus','2','--pids-limit','256','-v',volume+':/private','--tmpfs','/shared:rw,nosuid,nodev,mode=755,size=16m',self.image,'python3','-c',"import os,signal,time;os.chmod('/private',0o700)\ndef reap(*a):\n while True:\n  try:p,s=os.waitpid(-1,os.WNOHANG)\n  except ChildProcessError:return\n  if p==0:return\nsignal.signal(signal.SIGCHLD,reap)\nwhile True:time.sleep(.2)"])
   self.i.docker('start',self.daemon)
-  mounts=self.i.inspect('container',self.daemon)['Mounts'];assert any(m['Type']=='volume' and m['Destination']=='/private' and m['Name']==volume for m in mounts);self.i.write_json('disk-state-mount.json',{'state_volume':volume,'mounts':mounts,'scope':'Rancher VM-backed disk; no host/VM power-loss qualification'})
+  mounts=self.i.inspect('container',self.daemon)['Mounts'];assert any(m['Type']=='volume' and m['Destination']=='/private' and m['Name']==volume for m in mounts);self.i.write_json(suffix+'-disk-state-mount.json',{'state_volume':volume,'mounts':mounts,'scope':'Rancher VM-backed disk; no host/VM power-loss qualification'})
 
 class Profile(NativeJourney):
  def __init__(self):super().__init__(i,IMAGE,['linux','macos']);self.lazy=None;self.rows=[]
@@ -170,7 +172,7 @@ else:print(json.dumps({'timeout':True,'save_started_ns':start_ns,'elapsed':time.
   work=[dict(field.split('=',1) for field in line.split()[1:]) for line in log.splitlines() if line.startswith('object_work ')]
   for row in rows:
    row['object_work']=[event for event in work if event['revision']==row['revision']]
-   if a.phase=='reuse':assert len(row['object_work'])==1 and row['object_work'][0]['success']=='true','missing exact native capture work counters'
+   if a.phase in ['reuse','pooled']:assert len(row['object_work'])==1 and row['object_work'][0]['success']=='true','missing exact native capture work counters'
   mac.stop(c);save();print(label,json.dumps(report['phases'][label]['save_to_visible_upper']),flush=True)
  def run(self):
   i.start_service();self.wait();authority={'principal':ALICE,'uid':1001,'gid':1001,'primary_group':GROUP,'groups':[GROUP],'dac_override':False,'ownership_transfer':False}
@@ -194,7 +196,13 @@ else:print(json.dumps({'timeout':True,'save_started_ns':start_ns,'elapsed':time.
   report['background']={'bytes':64*1024*1024,'sha256':expected,'both_mounted_caches_fully_hydrated':True}
 
 try:
- i.setup(IMAGE);i.isolate_service_control();verify_image(i,source,host_profile='release');j=Profile();j.run();assert sources()==source['sha256'];code=0
+ i.setup(IMAGE);i.isolate_service_control();verify_image(i,source,host_profile='release')
+ if a.phase=='acceptance':
+  from latency_acceptance import acceptance_type
+  Acceptance=acceptance_type(Profile,DiskLazy,TraceMac,i,IMAGE,report,save,validate_receipts)
+  j=Acceptance()
+ else:j=Profile()
+ j.run();assert sources()==source['sha256'];code=0
 except Exception as error:
  report['failures'].append({'reason':str(error),'trace':traceback.format_exc()});save()
  if j:

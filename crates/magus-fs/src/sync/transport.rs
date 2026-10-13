@@ -15,6 +15,9 @@ mod tests {
     }
 }
 use magus_fs_core::{protocol::*, *};
+#[cfg(test)]
+#[path = "transport_pool_tests.rs"]
+mod pool_tests;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -40,6 +43,7 @@ pub struct Profile {
 }
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Counters {
+    pub client_setups: u64,
     pub requests: u64,
     pub downloaded_body_bytes: u64,
     pub uploaded_body_bytes: u64,
@@ -160,8 +164,45 @@ pub fn load(
         .map_err(|_| FsError::InvalidDescriptor)?;
     Ok((p, TransportIdentity::for_bytes(&bytes)?, ca, token))
 }
+#[path = "executor.rs"]
+mod executor;
+#[derive(Debug)]
+struct DnsAdmission;
+impl std::fmt::Display for DnsAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DNS admission exhausted")
+    }
+}
+impl std::error::Error for DnsAdmission {}
+#[derive(Clone)]
+struct Authorization {
+    binding: SyncBinding,
+    roots: Vec<PathBuf>,
+    principals: Vec<PrincipalId>,
+    replica: ReplicaId,
+}
+impl Authorization {
+    fn credentials(&self) -> std::result::Result<(Profile, Vec<u8>, String), FsError> {
+        let (p, id, ca, token) = load(&self.binding.transport_profile, &self.roots)?;
+        if id != self.binding.transport_identity
+            || p.namespace != self.binding.id
+            || p.replica != self.replica
+        {
+            return Err(FsError::ConfigMismatch);
+        }
+        if p.publication_principal
+            .as_ref()
+            .is_some_and(|p| !self.principals.contains(p))
+        {
+            return Err(FsError::UnknownPrincipal);
+        }
+        Ok((p, ca, token))
+    }
+}
 type DnsLookup = fn(&str) -> std::io::Result<Vec<std::net::SocketAddr>>;
 static DNS_OUTSTANDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static NETWORK_TEST: Mutex<()> = Mutex::new(());
 struct DnsPermit;
 impl Drop for DnsPermit {
     fn drop(&mut self) {
@@ -174,7 +215,6 @@ fn system_lookup(host: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
 }
 struct BoundedResolver {
     lookup: DnsLookup,
-    exhausted: Arc<std::sync::atomic::AtomicBool>,
 }
 impl reqwest::dns::Resolve for BoundedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
@@ -185,13 +225,8 @@ impl reqwest::dns::Resolve for BoundedResolver {
             })
             .is_err()
         {
-            self.exhausted.store(true, Ordering::SeqCst);
             return Box::pin(async {
-                Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "DNS admission exhausted",
-                ))
-                    as Box<dyn std::error::Error + Send + Sync>)
+                Err(Box::new(DnsAdmission) as Box<dyn std::error::Error + Send + Sync>)
             });
         }
         let permit = DnsPermit;
@@ -216,6 +251,7 @@ pub struct Transport {
     pub(super) replica: ReplicaId,
     dns_lookup: DnsLookup,
     pub counters: Arc<Mutex<Counters>>,
+    executor: Arc<executor::Executor>,
 }
 pub const MAX_UPLOAD_LIST_RESPONSE: usize = 512 * 1024;
 impl Transport {
@@ -231,25 +267,21 @@ impl Transport {
             replica: config.replica.clone(),
             dns_lookup: system_lookup,
             counters: Arc::new(Mutex::new(Counters::default())),
+            executor: executor::Executor::for_replica(&config.replica)?,
         };
         t.credentials()?;
         Ok(t)
     }
+    fn authorization(&self) -> Authorization {
+        Authorization {
+            binding: self.binding.clone(),
+            roots: self.roots.clone(),
+            principals: self.principals.clone(),
+            replica: self.replica.clone(),
+        }
+    }
     fn credentials(&self) -> std::result::Result<(Profile, Vec<u8>, String), FsError> {
-        let (p, id, ca, token) = load(&self.binding.transport_profile, &self.roots)?;
-        if id != self.binding.transport_identity
-            || p.namespace != self.binding.id
-            || p.replica != self.replica
-        {
-            return Err(FsError::ConfigMismatch);
-        }
-        if p.publication_principal
-            .as_ref()
-            .is_some_and(|p| !self.principals.contains(p))
-        {
-            return Err(FsError::UnknownPrincipal);
-        }
-        Ok((p, ca, token))
+        self.authorization().credentials()
     }
     pub(super) fn credential_stamp(&self) -> std::result::Result<ObjectId, FsError> {
         ObjectId::for_bytes(self.credentials()?.2.as_bytes())
@@ -277,171 +309,31 @@ impl Transport {
                 retryable: true,
             });
         }
-        let (profile, ca, token) = self.credentials()?;
-        // Own the async runtime on an ordinary thread, including when called from a
-        // native adapter's Tokio runtime. Bounded shutdown never joins stalled DNS.
-        std::thread::scope(|scope| {
-            scope
-                .spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .max_blocking_threads(4)
-                        .build()
-                        .map_err(|_| Failure {
-                            code: "transport",
-                            retryable: true,
-                        })?;
-                    let result = runtime.block_on(async {
-                        match tokio::time::timeout_at(
-                            tokio::time::Instant::from_std(deadline),
-                            async {
-                                let remaining = deadline.saturating_duration_since(Instant::now());
-                                if remaining.is_zero() {
-                                    return Err(Failure {
-                                        code: "deadline",
-                                        retryable: true,
-                                    });
-                                }
-                                let cert =
-                                    reqwest::Certificate::from_pem(&ca).map_err(|_| Failure {
-                                        code: "invalid_source",
-                                        retryable: false,
-                                    })?;
-                                let exhausted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                                let network_error = |error: reqwest::Error| Failure {
-                                    code: if exhausted.load(std::sync::atomic::Ordering::SeqCst) {
-                                        "backpressure"
-                                    } else if error.is_timeout() {
-                                        "deadline"
-                                    } else {
-                                        "transport"
-                                    },
-                                    retryable: true,
-                                };
-                                let client = reqwest::Client::builder()
-                                    .dns_resolver(Arc::new(BoundedResolver {
-                                        lookup: self.dns_lookup,
-                                        exhausted: exhausted.clone(),
-                                    }))
-                                    .no_proxy()
-                                    .retry(reqwest::retry::never())
-                                    .redirect(reqwest::redirect::Policy::none())
-                                    .tls_certs_only([cert])
-                                    .connect_timeout(Duration::from_secs(2).min(remaining))
-                                    .timeout(remaining)
-                                    .build()
-                                    .map_err(network_error)?;
-                                let url = format!(
-                                    "{}/v1/n/{}{}",
-                                    profile.endpoint,
-                                    profile.namespace.as_str(),
-                                    path
-                                );
-                                let method = reqwest::Method::from_bytes(method.as_bytes())
-                                    .map_err(|_| Failure {
-                                        code: "invalid_descriptor",
-                                        retryable: false,
-                                    })?;
-                                {
-                                    let mut c = self.counters.lock().unwrap();
-                                    c.requests += 1;
-                                    if object_body && method == reqwest::Method::PUT {
-                                        c.uploaded_body_bytes += body.len() as u64;
-                                    }
-                                }
-                                let download = object_body && method == reqwest::Method::GET;
-                                let mut response = client
-                                    .request(method, url)
-                                    .bearer_auth(token)
-                                    .header("content-type", "application/json")
-                                    .body(body)
-                                    .send()
-                                    .await
-                                    .map_err(network_error)?;
-                                let status = response.status();
-                                let max = if status.is_success() {
-                                    limit
-                                } else {
-                                    MAX_CONTROL
-                                };
-                                if response.content_length().is_some_and(|n| n > max as u64) {
-                                    return Err(Failure {
-                                        code: "limit_exceeded",
-                                        retryable: false,
-                                    });
-                                }
-                                let mut bytes = vec![];
-                                while let Some(chunk) =
-                                    response.chunk().await.map_err(network_error)?
-                                {
-                                    if download {
-                                        self.counters.lock().unwrap().downloaded_body_bytes +=
-                                            chunk.len() as u64;
-                                    }
-                                    if bytes.len().saturating_add(chunk.len()) > max {
-                                        return Err(Failure {
-                                            code: "limit_exceeded",
-                                            retryable: false,
-                                        });
-                                    }
-                                    bytes.extend_from_slice(&chunk);
-                                }
-                                if !status.is_success() {
-                                    let value: serde_json::Value =
-                                        serde_json::from_slice(&bytes).unwrap_or_default();
-                                    let code = match value["code"].as_str() {
-                                        Some("stale_head") => "stale_head",
-                                        Some("dependency_changed") => "dependency_changed",
-                                        Some("recompute_required") => "recompute_required",
-                                        Some("invalid_credential") => "invalid_credential",
-                                        Some("backpressure") => "backpressure",
-                                        Some("unsupported_operation") => "unsupported_operation",
-                                        Some("expired_upload") => "expired_upload",
-                                        // Collaboration-v1 definitive outcomes (FS2-B Task 2).
-                                        Some("conflicted") => "conflicted",
-                                        Some("already_resolved") => "already_resolved",
-                                        Some("incomplete_resolution") => "incomplete_resolution",
-                                        Some("invalid_resolution") => "invalid_resolution",
-                                        Some("absent_alternative") => "absent_alternative",
-                                        Some("invalid_cursor") => "invalid_cursor",
-                                        Some("cursor_expired") => "cursor_expired",
-                                        Some("base_unavailable") => "base_unavailable",
-                                        _ => match status.as_u16() {
-                                            401 => "invalid_credential",
-                                            404 => "denied",
-                                            409 => "conflict",
-                                            413 => "limit_exceeded",
-                                            503 => "backend_unavailable",
-                                            _ => "invalid_response",
-                                        },
-                                    };
-                                    return Err(Failure {
-                                        code,
-                                        retryable: status.as_u16() == 503,
-                                    });
-                                }
-                                Ok(bytes)
-                            },
-                        )
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => Err(Failure {
-                                code: "deadline",
-                                retryable: true,
-                            }),
-                        }
-                    });
-                    runtime.shutdown_timeout(deadline.saturating_duration_since(Instant::now()));
-                    result
-                })
-                .join()
-                .map_err(|_| Failure {
-                    code: "transport",
-                    retryable: true,
-                })?
+        self.credentials()?;
+        let maximum = if object_body && method == "PUT" {
+            MAX_CHUNK as usize
+        } else {
+            MAX_DESCRIPTOR
+        };
+        if body.len() > maximum {
+            return Err(Failure {
+                code: "limit_exceeded",
+                retryable: false,
+            });
+        }
+        self.executor.submit(executor::Job {
+            authorization: self.authorization(),
+            method: method.to_owned(),
+            path: path.to_owned(),
+            body,
+            limit,
+            deadline,
+            object_body,
+            dns_lookup: self.dns_lookup,
+            counters: self.counters.clone(),
         })
     }
+
     /// Only the owned completed-object listing has this larger control response bound.
     pub fn upload_listing<T: serde::de::DeserializeOwned>(
         &self,
@@ -538,6 +430,7 @@ mod dns_tests {
     }
     #[test]
     fn dns_deadline_and_admission_survive_timed_out_resolver_work() {
+        let _network = NETWORK_TEST.lock().unwrap();
         let dir = PathBuf::from(if cfg!(target_os = "macos") {
             "/private/tmp"
         } else {
@@ -700,7 +593,6 @@ impl Transport {
             let connect = async {
                 let resolver = BoundedResolver {
                     lookup: self.dns_lookup,
-                    exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 };
                 let mut addresses = resolver
                     .resolve(host.parse().map_err(|_| FsError::InvalidSource)?)
