@@ -284,9 +284,20 @@ def acceptance_type(Profile, DiskLazy, TraceMac, infra, image, report, save, val
                                    timing='host-observed save through exact receipt/Applied/read upper bound; no host/VM clock subtraction')
                 else:
                     attempt.update(self.stages(attempt, progress, after)); attempt['seconds'] = attempt['save_to_exact_applied_and_read']
+                    applied = [e for e in attempt['events'] if e['owner']=='b' and e['stage']=='applied'
+                               and e['head']==attempt['peer_shared_head'] and e['revision']==attempt['peer_projected_revision']]
+                    committed = [e for e in attempt['events'] if e['owner']=='service' and e['stage']=='shared_committed'
+                                 and e['operation']==progress['shared_receipt']['operation']]
+                # Untimed evidence closure: the first read may precede the Applied log.
+                # Preserve its metric, then prove a new ordinary UID1001 read afterwards.
+                qualification = endpoint.execute("import hashlib,json,os,time;value=open('/shared/b/reports/bench','rb').read();print(json.dumps({'fresh_after_applied_ns':time.monotonic_ns(),'sha256':hashlib.sha256(value).hexdigest(),'bytes':len(value),'uid':os.geteuid()}))", user='1001:1001')
+                attempt['post_applied_read'] = qualification
+                assert qualification['uid']==1001 and qualification['bytes']==len(body) and qualification['sha256']==hashlib.sha256(body).hexdigest(), 'post-Applied ordinary read identity mismatch'
+                assert qualification['fresh_after_applied_ns']>=min(int(e['monotonic_ns']) for e in applied)
+                assert qualification['fresh_after_applied_ns']>=int(committed[0]['monotonic_ns'])
                 attempt['target_pass'] = attempt['seconds'] <= .5
             except Exception as error:
-                attempt.update(error=str(error), seconds=time.monotonic() - host_start, target_pass=False)
+                attempt.update(error=str(error), seconds=attempt.get('seconds',time.monotonic() - host_start), target_pass=False)
                 report['failures'].append({'workload': tag, 'error': str(error)})
                 save()
                 # The failed sample remains raw. Unsafe/nonsettled state fails the cohort;

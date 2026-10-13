@@ -303,25 +303,7 @@ impl Transport {
         deadline: Instant,
         object_body: bool,
     ) -> Result<Vec<u8>> {
-        if Instant::now() >= deadline {
-            return Err(Failure {
-                code: "deadline",
-                retryable: true,
-            });
-        }
-        self.credentials()?;
-        let maximum = if object_body && method == "PUT" {
-            MAX_CHUNK as usize
-        } else {
-            MAX_DESCRIPTOR
-        };
-        if body.len() > maximum {
-            return Err(Failure {
-                code: "limit_exceeded",
-                retryable: false,
-            });
-        }
-        self.executor.submit(executor::Job {
+        self.dispatch(executor::Job {
             authorization: self.authorization(),
             method: method.to_owned(),
             path: path.to_owned(),
@@ -331,7 +313,32 @@ impl Transport {
             object_body,
             dns_lookup: self.dns_lookup,
             counters: self.counters.clone(),
+            source_retry: false,
         })
+        .map_err(|error| error.failure)
+    }
+    fn dispatch(&self, job: executor::Job) -> executor::DispatchResult<Vec<u8>> {
+        if Instant::now() >= job.deadline {
+            return Err(Failure {
+                code: "deadline",
+                retryable: true,
+            }
+            .into());
+        }
+        self.credentials()?;
+        let maximum = if job.object_body && job.method == "PUT" {
+            MAX_CHUNK as usize
+        } else {
+            MAX_DESCRIPTOR
+        };
+        if job.body.len() > maximum {
+            return Err(Failure {
+                code: "limit_exceeded",
+                retryable: false,
+            }
+            .into());
+        }
+        self.executor.submit(job)
     }
 
     /// Only the owned completed-object listing has this larger control response bound.
@@ -392,18 +399,43 @@ impl RemoteFetcher for Transport {
         if *source != self.binding.source || size > MAX_CHUNK {
             return Err(FsError::InvalidSource);
         }
-        let result = self.bytes(
-            "GET",
-            &format!(
-                "/views/{}/objects/{}",
-                self.binding.view.view.as_str(),
-                id.as_str()
-            ),
-            vec![],
-            size as usize,
-            deadline.min(Instant::now() + Duration::from_millis(4500)),
-            true,
+        let deadline = deadline.min(Instant::now() + Duration::from_millis(4500));
+        let path = format!(
+            "/views/{}/objects/{}",
+            self.binding.view.view.as_str(),
+            id.as_str()
         );
+        let mut source_retry = false;
+        let result = loop {
+            let result = self.dispatch(executor::Job {
+                authorization: self.authorization(),
+                method: "GET".into(),
+                path: path.clone(),
+                body: vec![],
+                limit: size as usize,
+                deadline,
+                object_body: true,
+                dns_lookup: self.dns_lookup,
+                counters: self.counters.clone(),
+                source_retry,
+            });
+            match result {
+                Err(error) if error.origin == executor::FailureOrigin::ServiceAdmission => {
+                    // Only this immutable GET handles explicit service admission pressure.
+                    // The same absolute deadline covers every validation, wait and body.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break Err(Failure {
+                            code: "deadline",
+                            retryable: true,
+                        });
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(25)));
+                    source_retry = true;
+                }
+                other => break other.map_err(|error| error.failure),
+            }
+        };
         let bytes = result.map_err(|e| FsError::BaseUnavailable {
             object: id.clone(),
             cause: SourceFailure::Transport {

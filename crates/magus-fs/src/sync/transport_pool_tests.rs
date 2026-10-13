@@ -1,9 +1,25 @@
 use super::*;
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+struct Reply {
+    status: u16,
+    body: Vec<u8>,
+    before_response: Option<Box<dyn FnOnce() + Send>>,
+}
+impl Reply {
+    fn new(status: u16, body: &[u8]) -> Self {
+        Self {
+            status,
+            body: body.to_vec(),
+            before_response: None,
+        }
+    }
+}
 
 pub(super) struct Fixture {
     _network: std::sync::MutexGuard<'static, ()>,
@@ -12,6 +28,7 @@ pub(super) struct Fixture {
     config: ReplicaConfig,
     accepted: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<String>>>,
+    replies: Arc<Mutex<VecDeque<Reply>>>,
     bodies: Arc<Mutex<Vec<Vec<u8>>>>,
     stop: Arc<AtomicBool>,
     server: Option<std::thread::JoinHandle<()>>,
@@ -38,6 +55,7 @@ impl Fixture {
         let accepted = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let bodies = Arc::new(Mutex::new(Vec::new()));
+        let replies = Arc::new(Mutex::new(VecDeque::<Reply>::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let (count, seen, stopping, body_seen) = (
             accepted.clone(),
@@ -45,6 +63,7 @@ impl Fixture {
             stop.clone(),
             bodies.clone(),
         );
+        let scripted = replies.clone();
         let server = std::thread::spawn(move || {
             for socket in listener.incoming() {
                 if stopping.load(Ordering::SeqCst) {
@@ -55,7 +74,12 @@ impl Fixture {
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
                 count.fetch_add(1, Ordering::SeqCst);
-                let (tls, seen, body_seen) = (tls.clone(), seen.clone(), body_seen.clone());
+                let (tls, seen, body_seen, scripted) = (
+                    tls.clone(),
+                    seen.clone(),
+                    body_seen.clone(),
+                    scripted.clone(),
+                );
                 std::thread::spawn(move || {
                     let conn = rustls::ServerConnection::new(tls).unwrap();
                     let stream = rustls::StreamOwned::new(conn, socket);
@@ -93,10 +117,21 @@ impl Fixture {
                         if request.contains("/stall ") {
                             std::thread::sleep(Duration::from_millis(500));
                         }
-                        if reader
-                            .get_mut()
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                            .is_err()
+                        let reply = scripted
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .unwrap_or_else(|| Reply::new(200, b"ok"));
+                        if let Some(action) = reply.before_response {
+                            action();
+                        }
+                        let header = format!(
+                            "HTTP/1.1 {} fixture\r\nContent-Length: {}\r\n\r\n",
+                            reply.status,
+                            reply.body.len()
+                        );
+                        if reader.get_mut().write_all(header.as_bytes()).is_err()
+                            || reader.get_mut().write_all(&reply.body).is_err()
                         {
                             return;
                         }
@@ -162,6 +197,7 @@ impl Fixture {
             config,
             accepted,
             requests,
+            replies,
             bodies,
             stop,
             server: Some(server),
@@ -193,6 +229,199 @@ impl Drop for Fixture {
         self.server.take().unwrap().join().unwrap();
         std::fs::remove_dir_all(&self.dir).unwrap();
     }
+}
+
+fn fetch_fixture(f: &Fixture, deadline: Instant) -> std::result::Result<Vec<u8>, FsError> {
+    f.transport.fetch(
+        &f.transport.binding.source,
+        &ObjectId::for_bytes(b"ok").unwrap(),
+        2,
+        deadline,
+    )
+}
+
+#[test]
+fn immutable_get_retries_only_service_admission_and_reuses_connection() {
+    let f = Fixture::new();
+    f.replies.lock().unwrap().extend([
+        Reply::new(503, br#"{"code":"backpressure"}"#),
+        Reply::new(200, b"ok"),
+    ]);
+    assert_eq!(
+        fetch_fixture(&f, Instant::now() + Duration::from_secs(1)).unwrap(),
+        b"ok"
+    );
+    let requests = f.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    assert!(requests.iter().all(|r| r.starts_with("GET ")));
+    assert_eq!(f.accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(f.transport.counters.lock().unwrap().retries, 1);
+}
+
+#[test]
+fn immutable_get_persistent_admission_keeps_original_absolute_deadline() {
+    let f = Fixture::new();
+    f.replies
+        .lock()
+        .unwrap()
+        .extend((0..300).map(|_| Reply::new(503, br#"{"code":"backpressure"}"#)));
+    let start = Instant::now();
+    let error = fetch_fixture(&f, start + Duration::from_millis(120)).unwrap_err();
+    assert!(
+        matches!(error,FsError::BaseUnavailable{cause:SourceFailure::Transport{ref kind},..} if kind=="deadline")
+    );
+    assert!(start.elapsed() < Duration::from_millis(300));
+    assert!(f.requests.lock().unwrap().len() > 1);
+    let start = Instant::now();
+    let error = fetch_fixture(&f, start + Duration::from_secs(6)).unwrap_err();
+    assert!(
+        matches!(error,FsError::BaseUnavailable{cause:SourceFailure::Transport{ref kind},..} if kind=="deadline")
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(4400)
+            && start.elapsed() < Duration::from_millis(4800)
+    );
+}
+
+#[test]
+fn immutable_get_revalidates_rotated_and_revoked_credentials_after_admission() {
+    let f = Fixture::new();
+    let token = f.dir.join("token");
+    let mut first = Reply::new(503, br#"{"code":"backpressure"}"#);
+    first.before_response = Some(Box::new(move || {
+        std::fs::write(token, "b".repeat(64)).unwrap()
+    }));
+    f.replies
+        .lock()
+        .unwrap()
+        .extend([first, Reply::new(200, b"ok")]);
+    assert_eq!(
+        fetch_fixture(&f, Instant::now() + Duration::from_secs(1)).unwrap(),
+        b"ok"
+    );
+    let requests = f.requests.lock().unwrap();
+    assert!(requests[0].contains(&format!("Bearer {}", "a".repeat(64))));
+    assert!(requests[1].contains(&format!("Bearer {}", "b".repeat(64))));
+    drop(requests);
+    let token = f.dir.join("token");
+    let mut denial = Reply::new(503, br#"{"code":"backpressure"}"#);
+    denial.before_response = Some(Box::new(move || {
+        std::fs::set_permissions(token, std::fs::Permissions::from_mode(0o644)).unwrap()
+    }));
+    f.replies.lock().unwrap().push_back(denial);
+    let error = fetch_fixture(&f, Instant::now() + Duration::from_secs(1)).unwrap_err();
+    assert!(
+        matches!(error,FsError::BaseUnavailable{cause:SourceFailure::Transport{ref kind},..} if kind=="unsafe_storage")
+    );
+    assert_eq!(f.requests.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn immutable_get_hard_failures_and_post_are_never_retried() {
+    let f = Fixture::new();
+    for (status, body) in [
+        (401, br#"{"code":"invalid_credential"}"#.as_slice()),
+        (404, br#"{"code":"denied"}"#.as_slice()),
+        (503, br#"{"code":"backend_unavailable"}"#.as_slice()),
+        (404, br#"{"code":"backpressure"}"#.as_slice()),
+        (200, b"no".as_slice()),
+    ] {
+        let count = f.requests.lock().unwrap().len();
+        f.replies
+            .lock()
+            .unwrap()
+            .push_back(Reply::new(status, body));
+        assert!(fetch_fixture(&f, Instant::now() + Duration::from_secs(1)).is_err());
+        assert_eq!(f.requests.lock().unwrap().len(), count + 1);
+    }
+    f.replies
+        .lock()
+        .unwrap()
+        .push_back(Reply::new(503, br#"{"code":"backpressure"}"#));
+    assert_eq!(
+        f.transport
+            .bytes(
+                "POST",
+                "/candidates",
+                b"{}".to_vec(),
+                64,
+                Instant::now() + Duration::from_secs(1),
+                false
+            )
+            .unwrap_err()
+            .code,
+        "backpressure"
+    );
+    assert_eq!(f.requests.lock().unwrap().len(), 6);
+    assert_eq!(f.transport.counters.lock().unwrap().retries, 0);
+}
+
+#[test]
+fn immutable_get_service_revocation_and_changed_trust_fail_after_admission() {
+    let f = Fixture::new();
+    f.replies.lock().unwrap().extend([
+        Reply::new(503, br#"{"code":"backpressure"}"#),
+        Reply::new(401, br#"{"code":"invalid_credential"}"#),
+    ]);
+    let error = fetch_fixture(&f, Instant::now() + Duration::from_secs(1)).unwrap_err();
+    assert!(
+        matches!(error,FsError::BaseUnavailable{cause:SourceFailure::Transport{ref kind},..} if kind=="invalid_credential")
+    );
+    assert_eq!(f.requests.lock().unwrap().len(), 2);
+    let ca = f.dir.join("ca");
+    let mut first = Reply::new(503, br#"{"code":"backpressure"}"#);
+    first.before_response = Some(Box::new(move || {
+        let mut bytes = std::fs::read(&ca).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(ca, bytes).unwrap();
+    }));
+    f.replies.lock().unwrap().push_back(first);
+    let error = fetch_fixture(&f, Instant::now() + Duration::from_secs(1)).unwrap_err();
+    assert!(
+        matches!(error,FsError::BaseUnavailable{cause:SourceFailure::Transport{ref kind},..} if kind=="config_mismatch")
+    );
+    assert_eq!(f.requests.lock().unwrap().len(), 3);
+    assert_eq!(f.transport.counters.lock().unwrap().retries, 1);
+    assert!(matches!(
+        f.transport.fetch(
+            &RemoteSourceId::random().unwrap(),
+            &ObjectId::for_bytes(b"ok").unwrap(),
+            2,
+            Instant::now() + Duration::from_secs(1)
+        ),
+        Err(FsError::InvalidSource)
+    ));
+    assert_eq!(f.requests.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn immutable_get_local_dns_admission_is_not_retried() {
+    fn stalled(_: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        std::thread::sleep(Duration::from_secs(1));
+        Ok(vec![])
+    }
+    fn resolved(addr: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        let port = addr.rsplit(':').next().unwrap().parse::<u16>().unwrap();
+        Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))])
+    }
+    let mut f = Fixture::new();
+    f.transport.dns_lookup = stalled;
+    for _ in 0..4 {
+        assert_eq!(
+            Fixture::call(&f.transport, "/ok", 40).unwrap_err().code,
+            "deadline"
+        );
+    }
+    f.transport.dns_lookup = resolved;
+    let result = fetch_fixture(&f, Instant::now() + Duration::from_millis(200));
+    // Wait for actual lookup work to release permits even when an assertion fails.
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(
+        matches!(result,Err(FsError::BaseUnavailable{cause:SourceFailure::Transport{ref kind},..}) if kind=="backpressure")
+    );
+    assert_eq!(f.transport.counters.lock().unwrap().retries, 0);
+    assert!(f.requests.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -387,7 +616,12 @@ fn saturated_executor_returns_backpressure_and_queued_deadline_expires_before_di
                 let t = &f.transport;
                 scope.spawn(move || {
                     barrier.wait();
-                    Fixture::call(t, "/ok", 2000)
+                    t.fetch(
+                        &t.binding.source,
+                        &ObjectId::for_bytes(b"ok").unwrap(),
+                        2,
+                        Instant::now() + Duration::from_millis(2000),
+                    )
                 })
             })
             .collect();
@@ -396,13 +630,14 @@ fn saturated_executor_returns_backpressure_and_queued_deadline_expires_before_di
         assert!(
             outcomes
                 .iter()
-                .any(|r| r.as_ref().is_err_and(|e| e.code == "backpressure")),
+                .any(|r| matches!(r,Err(FsError::BaseUnavailable{cause:SourceFailure::Transport{kind},..}) if kind=="backpressure")),
             "bounded queue must reject pressure"
         );
         for h in active {
             h.join().unwrap().unwrap();
         }
     });
+    assert_eq!(f.transport.counters.lock().unwrap().retries, 0);
 }
 #[test]
 fn queued_request_revalidates_private_credentials_at_dispatch() {

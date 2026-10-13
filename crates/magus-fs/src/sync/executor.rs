@@ -18,6 +18,30 @@ fn failure(code: &'static str) -> Failure {
         retryable: true,
     }
 }
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FailureOrigin {
+    Other,
+    ServiceAdmission,
+}
+#[derive(Debug)]
+pub(super) struct DispatchFailure {
+    pub(super) failure: Failure,
+    pub(super) origin: FailureOrigin,
+}
+impl From<Failure> for DispatchFailure {
+    fn from(failure: Failure) -> Self {
+        Self {
+            failure,
+            origin: FailureOrigin::Other,
+        }
+    }
+}
+impl From<FsError> for DispatchFailure {
+    fn from(error: FsError) -> Self {
+        Failure::from(error).into()
+    }
+}
+pub(super) type DispatchResult<T> = std::result::Result<T, DispatchFailure>;
 pub(super) struct Job {
     pub authorization: Authorization,
     pub method: String,
@@ -28,6 +52,7 @@ pub(super) struct Job {
     pub object_body: bool,
     pub dns_lookup: DnsLookup,
     pub counters: Arc<Mutex<Counters>>,
+    pub source_retry: bool,
 }
 struct OwnedJob {
     job: Job,
@@ -35,7 +60,7 @@ struct OwnedJob {
 }
 struct Pending {
     job: Arc<Mutex<Option<OwnedJob>>>,
-    reply: mpsc::Sender<Result<Vec<u8>>>,
+    reply: mpsc::Sender<DispatchResult<Vec<u8>>>,
 }
 pub(super) struct Executor {
     sender: async_mpsc::Sender<Pending>,
@@ -121,7 +146,7 @@ impl Executor {
                             Event::Completed => {}
                             Event::Next(Some(pending)) => {
                                 let Some(owned) = pending.job.lock().unwrap().take() else {
-                                    let _ = pending.reply.send(Err(failure("deadline")));
+                                    let _ = pending.reply.send(Err(failure("deadline").into()));
                                     continue;
                                 };
                                 let pool = pool.clone();
@@ -137,7 +162,7 @@ impl Executor {
                                     .await
                                     {
                                         Ok(result) => result,
-                                        Err(_) => Err(failure("deadline")),
+                                        Err(_) => Err(failure("deadline").into()),
                                     };
                                     let _ = pending.reply.send(result);
                                 });
@@ -147,7 +172,7 @@ impl Executor {
                     receiver.close();
                     while let Ok(pending) = receiver.try_recv() {
                         pending.job.lock().unwrap().take();
-                        let _ = pending.reply.send(Err(failure("transport")));
+                        let _ = pending.reply.send(Err(failure("transport").into()));
                     }
                     active.abort_all();
                     while active.join_next().await.is_some() {}
@@ -166,10 +191,10 @@ impl Executor {
         registry.insert(replica.as_str().to_owned(), Arc::downgrade(&executor));
         Ok(executor)
     }
-    pub fn submit(&self, job: Job) -> Result<Vec<u8>> {
+    pub fn submit(&self, job: Job) -> DispatchResult<Vec<u8>> {
         let deadline = job.deadline;
         if Instant::now() >= deadline {
-            return Err(failure("deadline"));
+            return Err(failure("deadline").into());
         }
         let bytes = job.body.len();
         self.body_bytes
@@ -285,9 +310,9 @@ fn network_error(error: reqwest::Error) -> Failure {
         "transport"
     })
 }
-async fn run(job: Job, pool: Arc<Mutex<Pool>>) -> Result<Vec<u8>> {
+async fn run(job: Job, pool: Arc<Mutex<Pool>>) -> DispatchResult<Vec<u8>> {
     if Instant::now() >= job.deadline {
-        return Err(failure("deadline"));
+        return Err(failure("deadline").into());
     }
     let credentials = job.authorization.credentials();
     let (profile, ca, token) = match credentials {
@@ -308,11 +333,14 @@ async fn run(job: Job, pool: Arc<Mutex<Pool>>) -> Result<Vec<u8>> {
     // Private-file validation and client construction are synchronous. The outer
     // Tokio timeout polls this future first, so recheck before any late dispatch.
     if Instant::now() >= job.deadline {
-        return Err(failure("deadline"));
+        return Err(failure("deadline").into());
     }
     {
         let mut counters = job.counters.lock().unwrap();
         counters.requests += 1;
+        if job.source_retry {
+            counters.retries += 1;
+        }
         if job.object_body && method == reqwest::Method::PUT {
             counters.uploaded_body_bytes += job.body.len() as u64;
         }
@@ -343,7 +371,8 @@ async fn run(job: Job, pool: Arc<Mutex<Pool>>) -> Result<Vec<u8>> {
         return Err(Failure {
             code: "limit_exceeded",
             retryable: false,
-        });
+        }
+        .into());
     }
     let mut bytes = vec![];
     while let Some(chunk) = response.chunk().await.map_err(network_error)? {
@@ -354,7 +383,8 @@ async fn run(job: Job, pool: Arc<Mutex<Pool>>) -> Result<Vec<u8>> {
             return Err(Failure {
                 code: "limit_exceeded",
                 retryable: false,
-            });
+            }
+            .into());
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -385,9 +415,16 @@ async fn run(job: Job, pool: Arc<Mutex<Pool>>) -> Result<Vec<u8>> {
                 _ => "invalid_response",
             },
         };
-        return Err(Failure {
-            code,
-            retryable: status.as_u16() == 503,
+        return Err(DispatchFailure {
+            failure: Failure {
+                code,
+                retryable: status.as_u16() == 503,
+            },
+            origin: if status.as_u16() == 503 && code == "backpressure" {
+                FailureOrigin::ServiceAdmission
+            } else {
+                FailureOrigin::Other
+            },
         });
     }
     Ok(bytes)
@@ -464,6 +501,7 @@ mod lifecycle_tests {
                 object_body: false,
                 dns_lookup: transport.dns_lookup,
                 counters: transport.counters.clone(),
+                source_retry: false,
             };
             let (reply, receive) = mpsc::channel();
             assert!(executor
