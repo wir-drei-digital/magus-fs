@@ -710,6 +710,8 @@ impl Replica {
         absolute_native(root)?;
         policy.validate()?;
         let mut core = lock(&self.core)?;
+        let work_before = core.objects.work();
+        let mut source_read_bytes = 0u64;
         core.journal.check_content_path(root)?;
         let config: NativeConfig = from_json(&core.journal.db.query_row(
             "SELECT configuration FROM native WHERE singleton=1",
@@ -829,6 +831,16 @@ impl Replica {
                 .map(|w| perm::root_entry(&w.tree))
                 .unwrap_or_else(|| perm::root_entry(&tree));
             perm::access(&authority, &authority_root, 5)?;
+            // This snapshot is confined to one capture attempt under the Core lock.
+            // Include abandoned staging files, then conservatively add every new id.
+            let (inventory, staged) = core.objects.inventory_detail()?;
+            let mut resident: BTreeMap<_, _> = inventory.into_iter().collect();
+            let mut occupied = resident.values().try_fold(staged, |n, size| {
+                n.checked_add(*size).ok_or(FsError::Backpressure)
+            })?;
+            if occupied > core.config.cache_bytes {
+                return Err(FsError::Backpressure);
+            }
             let mut changed = false;
             for (path, node) in &mut scan.nodes {
                 if path.is_empty() {
@@ -902,9 +914,18 @@ impl Replica {
                             changed = true;
                             break;
                         }
+                        source_read_bytes += length as u64;
                         let object = ObjectId::for_bytes(&bytes)?;
-                        core.reserve(&BTreeMap::from([(object.clone(), length as u64)]))?;
-                        core.objects.install(&bytes)?;
+                        if !resident.contains_key(&object) {
+                            occupied = occupied
+                                .checked_add(length as u64)
+                                .ok_or(FsError::Backpressure)?;
+                            if occupied > core.config.cache_bytes {
+                                return Err(FsError::Backpressure);
+                            }
+                            resident.insert(object.clone(), length as u64);
+                        }
+                        core.objects.prepare_capture_chunk(&bytes)?;
                         extents.push(Extent::Chunk {
                             object,
                             object_size: length as u64,
@@ -1068,8 +1089,12 @@ impl Replica {
             )?;
             tx.commit()?;
             let result = (|| {
-                for (object, _) in crate::cache::closure(&revision.tree) {
-                    core.objects.sync_object(&object)?;
+                core.objects
+                    .sync_objects(crate::cache::closure(&revision.tree).keys())?;
+                // External additions/replacements/stages cannot bypass the quota
+                // through this attempt's snapshot. Reconcile before acknowledgement.
+                if core.objects.occupied_bytes()? > core.config.cache_bytes {
+                    return Err(FsError::Backpressure);
                 }
                 crate::faults::hit("before-transaction")?;
                 let tx = core
@@ -1100,6 +1125,11 @@ impl Replica {
             })();
             if let Err(e) = &result {
                 core.failed(&operation, e)?;
+            }
+            if std::env::var_os("MAGUS_LATENCY_TRACE").is_some() {
+                let after = core.objects.work();
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr().lock(), "object_work operation={} revision={} success={} source_read_bytes={} verified_bytes={} staged_bytes={} stages={} file_syncs={} directory_syncs={} inventories={}", operation.as_str(), id.as_str(), result.is_ok(), source_read_bytes, after.verified_bytes-work_before.verified_bytes, after.staged_bytes-work_before.staged_bytes, after.stages-work_before.stages, after.file_syncs-work_before.file_syncs, after.directory_syncs-work_before.directory_syncs, after.inventories-work_before.inventories);
             }
             return result;
         }

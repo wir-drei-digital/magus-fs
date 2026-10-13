@@ -11,6 +11,7 @@ use std::{
         },
     },
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 #[derive(Clone, Debug)]
@@ -30,6 +31,49 @@ impl Default for ObjectLimits {
 pub struct ObjectStore {
     dir: File,
     limits: ObjectLimits,
+    work: ObjectWorkCounters,
+}
+
+/// Cumulative local object work, for opt-in latency diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObjectWork {
+    pub verified_bytes: u64,
+    pub staged_bytes: u64,
+    pub stages: u64,
+    pub file_syncs: u64,
+    pub directory_syncs: u64,
+    pub inventories: u64,
+}
+#[derive(Default)]
+struct ObjectWorkCounters {
+    verified_bytes: AtomicU64,
+    staged_bytes: AtomicU64,
+    stages: AtomicU64,
+    file_syncs: AtomicU64,
+    directory_syncs: AtomicU64,
+    inventories: AtomicU64,
+}
+impl ObjectStore {
+    pub fn work(&self) -> ObjectWork {
+        ObjectWork {
+            verified_bytes: self.work.verified_bytes.load(Ordering::Relaxed),
+            staged_bytes: self.work.staged_bytes.load(Ordering::Relaxed),
+            stages: self.work.stages.load(Ordering::Relaxed),
+            file_syncs: self.work.file_syncs.load(Ordering::Relaxed),
+            directory_syncs: self.work.directory_syncs.load(Ordering::Relaxed),
+            inventories: self.work.inventories.load(Ordering::Relaxed),
+        }
+    }
+    fn sync_file(&self, file: &File) -> Result<(), FsError> {
+        self.work.file_syncs.fetch_add(1, Ordering::Relaxed);
+        file.sync_all()?;
+        Ok(())
+    }
+    fn sync_directory(&self) -> Result<(), FsError> {
+        self.work.directory_syncs.fetch_add(1, Ordering::Relaxed);
+        self.dir.sync_all()?;
+        Ok(())
+    }
 }
 
 pub(crate) fn name(value: &OsStr) -> Result<CString, FsError> {
@@ -277,21 +321,29 @@ impl ObjectStore {
                     .last()
                     .ok_or(FsError::UnsafeStorage)?
                     .sync_all()?;
-                return Ok(Self { dir: child, limits });
+                return Ok(Self {
+                    dir: child,
+                    limits,
+                    work: ObjectWorkCounters::default(),
+                });
             }
             let child = open_at(dir.as_raw_fd(), &n, libc::O_RDONLY | libc::O_DIRECTORY)?;
             storage.directories.push(child);
         }
         Err(FsError::UnsafeStorage)
     }
-    fn read_file(&self, id: &ObjectId) -> Result<(Vec<u8>, File), FsError> {
+    fn read_file(
+        &self,
+        id: &ObjectId,
+    ) -> Result<(Vec<u8>, File, crate::capture::Observation), FsError> {
         let mut file = open_at(
             self.dir.as_raw_fd(),
             &name(OsStr::new(id.as_str()))?,
             libc::O_RDONLY | libc::O_NONBLOCK,
         )?;
         private(&file, false)?;
-        let size = file.metadata()?.len();
+        let before = crate::capture::Observation::metadata(&file.metadata()?);
+        let size = before.size;
         if size > self.limits.max_chunk_size {
             return Err(FsError::LimitExceeded);
         }
@@ -300,13 +352,19 @@ impl ObjectStore {
         (&mut file)
             .take(self.limits.max_chunk_size + 1)
             .read_to_end(&mut bytes)?;
+        self.work
+            .verified_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         if bytes.len() as u64 > self.limits.max_chunk_size {
             return Err(FsError::LimitExceeded);
         }
-        if ObjectId::for_bytes(&bytes)? != *id {
+        if crate::capture::Observation::metadata(&file.metadata()?) != before
+            || bytes.len() as u64 != size
+            || ObjectId::for_bytes(&bytes)? != *id
+        {
             return Err(FsError::CorruptObject);
         }
-        Ok((bytes, file))
+        Ok((bytes, file, before))
     }
     pub fn read_verified(&self, id: &ObjectId) -> Result<Vec<u8>, FsError> {
         Ok(self.read_file(id)?.0)
@@ -316,6 +374,31 @@ impl ObjectStore {
             return Err(FsError::LimitExceeded);
         }
         let id = ObjectId::for_bytes(bytes)?;
+        match self.sync_object(&id) {
+            Ok(()) => return Ok(id),
+            Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        self.install_new(bytes, id)
+    }
+    /// Preparation is private to a Core-locked capture attempt. Existing content
+    /// is verified, but this is NOT a durable acknowledgement. Capture must call
+    /// sync_objects on the entire final closure before committing its journal.
+    pub(crate) fn prepare_capture_chunk(&self, bytes: &[u8]) -> Result<ObjectId, FsError> {
+        if bytes.len() as u64 > self.limits.max_chunk_size {
+            return Err(FsError::LimitExceeded);
+        }
+        let id = ObjectId::for_bytes(bytes)?;
+        match self.read_file(&id) {
+            Ok((existing, _, _)) if existing.len() == bytes.len() => Ok(id),
+            Ok(_) => Err(FsError::CorruptObject),
+            Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.install_new(bytes, id)
+            }
+            Err(e) => Err(e),
+        }
+    }
+    fn install_new(&self, bytes: &[u8], id: ObjectId) -> Result<ObjectId, FsError> {
         let destination = name(OsStr::new(id.as_str()))?;
         let stage_name = name(OsStr::new(&format!(
             ".stage-{}",
@@ -332,9 +415,13 @@ impl ObjectStore {
             present: true,
         };
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        self.work.stages.fetch_add(1, Ordering::Relaxed);
+        self.work
+            .staged_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         file.write_all(bytes)?;
         crate::faults::hit("object-sync")?;
-        file.sync_all()?;
+        self.sync_file(&file)?;
         // Verify the staged bytes through the same open file before publication.
         use std::io::{Seek, SeekFrom};
         file.seek(SeekFrom::Start(0))?;
@@ -342,6 +429,9 @@ impl ObjectStore {
         (&mut file)
             .take(self.limits.max_chunk_size + 1)
             .read_to_end(&mut check)?;
+        self.work
+            .verified_bytes
+            .fetch_add(check.len() as u64, Ordering::Relaxed);
         if ObjectId::for_bytes(&check)? != id {
             return Err(FsError::CorruptObject);
         }
@@ -359,12 +449,12 @@ impl ObjectStore {
             if std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
                 return Err(syscall_error());
             }
-            let (_, existing) = self.read_file(&id)?;
-            existing.sync_all()?;
+            let (_, existing, _) = self.read_file(&id)?;
+            self.sync_file(&existing)?;
         }
-        self.dir.sync_all()?;
+        self.sync_directory()?;
         stage.remove()?;
-        self.dir.sync_all()?;
+        self.sync_directory()?;
         Ok(id)
     }
 }
@@ -393,8 +483,8 @@ impl ObjectStore {
         if file.metadata()?.nlink() != 1 {
             return Err(FsError::UnsafeStorage);
         }
-        file.sync_all()?;
-        self.dir.sync_all()?;
+        self.sync_file(&file)?;
+        self.sync_directory()?;
         Ok(file)
     }
     /// Enumerate published chunks through the opened directory; stages and control files are excluded.
@@ -407,7 +497,8 @@ impl ObjectStore {
             total.checked_add(*size).ok_or(FsError::Backpressure)
         })
     }
-    fn inventory_detail(&self) -> Result<(Vec<(ObjectId, u64)>, u64), FsError> {
+    pub(crate) fn inventory_detail(&self) -> Result<(Vec<(ObjectId, u64)>, u64), FsError> {
+        self.work.inventories.fetch_add(1, Ordering::Relaxed);
         let directory = open_at(
             self.dir.as_raw_fd(),
             &name(OsStr::new("."))?,
@@ -477,7 +568,7 @@ impl ObjectStore {
         Ok((result, staged))
     }
     pub(crate) fn evict(&self, id: &ObjectId) -> Result<(), FsError> {
-        let (_, file) = self.read_file(id)?;
+        let (_, file, _) = self.read_file(id)?;
         let _ = file;
         // SAFETY: validated object name and live directory; never traverses a pathname.
         if unsafe {
@@ -490,15 +581,44 @@ impl ObjectStore {
         {
             return Err(syscall_error());
         }
-        self.dir.sync_all()?;
+        self.sync_directory()?;
         Ok(())
     }
-    pub(crate) fn sync_object(&self, id: &ObjectId) -> Result<(), FsError> {
-        let (_, file) = self.read_file(id)?;
+    /// Verify and sync a file without the directory barrier. A caller using this
+    /// internal batch primitive must finish_object_sync before acknowledging.
+    pub(crate) fn sync_object_file(&self, id: &ObjectId) -> Result<(), FsError> {
+        private(&self.dir, true)?;
+        let (_, file, before) = self.read_file(id)?;
         crate::faults::hit("object-sync")?;
-        file.sync_all()?;
-        self.dir.sync_all()?;
+        self.sync_file(&file)?;
+        let current = open_at(
+            self.dir.as_raw_fd(),
+            &name(OsStr::new(id.as_str()))?,
+            libc::O_RDONLY | libc::O_NONBLOCK,
+        )?;
+        private(&current, false)?;
+        if crate::capture::Observation::metadata(&file.metadata()?) != before
+            || crate::capture::Observation::metadata(&current.metadata()?) != before
+        {
+            return Err(FsError::CorruptObject);
+        }
         Ok(())
+    }
+    pub(crate) fn finish_object_sync(&self) -> Result<(), FsError> {
+        private(&self.dir, true)?;
+        self.sync_directory()
+    }
+    pub(crate) fn sync_objects<'a>(
+        &self,
+        objects: impl IntoIterator<Item = &'a ObjectId>,
+    ) -> Result<(), FsError> {
+        for id in objects {
+            self.sync_object_file(id)?;
+        }
+        self.finish_object_sync()
+    }
+    pub(crate) fn sync_object(&self, id: &ObjectId) -> Result<(), FsError> {
+        self.sync_objects(std::iter::once(id))
     }
 }
 impl ObjectStore {
@@ -520,7 +640,11 @@ impl ObjectStore {
         check_content_roots(&native, &roots)?;
         let dir = native.directories.pop().ok_or(FsError::UnsafeStorage)?;
         private(&dir, true)?;
-        Ok(Self { dir, limits })
+        Ok(Self {
+            dir,
+            limits,
+            work: ObjectWorkCounters::default(),
+        })
     }
 }
 

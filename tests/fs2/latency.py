@@ -22,7 +22,7 @@ def validate_receipts(progress,binding,replica):
  assert shared['operation']==integration['operation'] and shared['operation']!=private['operation']
  assert shared['branch']==integration['branch']==binding['branch']
 
-p=argparse.ArgumentParser();p.add_argument('--output',required=True);p.add_argument('--image',required=True);p.add_argument('--phase',choices=['wakeups'],required=True);p.add_argument('--skip-boundaries',action='store_true');p.add_argument('--skip-native-small',action='store_true');a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--output',required=True);p.add_argument('--image',required=True);p.add_argument('--phase',choices=['wakeups','reuse'],required=True);p.add_argument('--skip-boundaries',action='store_true');p.add_argument('--skip-native-small',action='store_true');a=p.parse_args()
 assert Path(a.output).is_absolute()
 assert a.image.startswith('sha256:') and len(a.image)==71,'immutable image required'
 IMAGE=a.image
@@ -165,7 +165,13 @@ else:print(json.dumps({'timeout':True,'save_started_ns':start_ns,'elapsed':time.
   # Time diagnostic observation while idle, separately from every save interval.
   costs=[]
   for _ in range(3):t=time.monotonic();mac.status(c);costs.append(time.monotonic()-t)
-  report['phases'][label]['idle_status_command']=stats(costs);mac.stop(c);save();print(label,json.dumps(report['phases'][label]['save_to_visible_upper']),flush=True)
+  report['phases'][label]['idle_status_command']=stats(costs)
+  log=mac.run("print(json.dumps(open(s+'/daemon.log').read()))",c['path']);i.write_json('trace-'+label+'.json',{'log':log})
+  work=[dict(field.split('=',1) for field in line.split()[1:]) for line in log.splitlines() if line.startswith('object_work ')]
+  for row in rows:
+   row['object_work']=[event for event in work if event['revision']==row['revision']]
+   if a.phase=='reuse':assert len(row['object_work'])==1 and row['object_work'][0]['success']=='true','missing exact native capture work counters'
+  mac.stop(c);save();print(label,json.dumps(report['phases'][label]['save_to_visible_upper']),flush=True)
  def run(self):
   i.start_service();self.wait();authority={'principal':ALICE,'uid':1001,'gid':1001,'primary_group':GROUP,'groups':[GROUP],'dac_override':False,'ownership_transfer':False}
   i.provision([{'namespace':NS,'principal':ALICE,'replica':REPLICA,'token':secrets.token_hex(32),'expires':int(time.time())+3600,'actions':['admin','read','write','integrate','history'],'branches':['main'],'prefixes':[''],'authority':authority,'root_policy':self.tree_root}])

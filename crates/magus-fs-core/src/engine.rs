@@ -1850,7 +1850,7 @@ impl Workspace {
         core.journal.db.execute("INSERT INTO operations VALUES(?,?,'pending',NULL,NULL,?) ON CONFLICT(operation) DO UPDATE SET state='pending',error=NULL",params![operation.as_str(),digest.as_str(),&descriptor])?;
         let result = (|| {
             for (object, size) in cache::closure(&revision.tree) {
-                match core.objects.sync_object(&object) {
+                match core.objects.sync_object_file(&object) {
                     Ok(()) => {}
                     Err(FsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                         if core.source(&object)?.is_none_or(|(s, _)| s != size) {
@@ -1860,6 +1860,7 @@ impl Workspace {
                     Err(e) => return Err(e),
                 }
             }
+            core.objects.finish_object_sync()?;
             crate::faults::hit("before-transaction")?;
             let mut next = working;
             next.head = id.clone();
@@ -2236,5 +2237,12 @@ impl Replica {
         revision: &RevisionId,
     ) -> Result<Option<RestoreProvenance>, FsError> {
         Ok(lock(&self.core)?.revision(revision)?.restoration)
+    }
+}
+
+impl Replica {
+    /// Cumulative object work; does not inspect or grant access to content.
+    pub fn object_work(&self) -> Result<ObjectWork, FsError> {
+        Ok(lock(&self.core)?.objects.work())
     }
 }
