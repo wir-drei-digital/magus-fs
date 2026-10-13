@@ -11,6 +11,27 @@ from latency_acceptance import WATCH, WRITE, distribution
 
 
 class AcceptanceTests(unittest.TestCase):
+    def test_backend_diagnostics_continue_after_missing_log_and_exclude_credentials(self):
+        from latency_acceptance import backend_diagnostics
+        with tempfile.TemporaryDirectory(prefix='latency-backend-diagnostics-') as temporary:
+            root=Path(temporary)
+            class Infra:
+                owner='owned';resources=[{'kind':'container','name':'owned-s3','id':'original-id'}]
+                def inspect(self,kind,name):
+                    return {'Id':'original-id','State':{'OOMKilled':True,'ExitCode':137},'HostConfig':{'Memory':1024},'Config':{'Env':['secret=private']}}
+                def validate_owned(self,row,data):
+                    assert data['Id']==row['id']
+                def docker(self,*args,**kw):
+                    if args[0]=='logs':raise RuntimeError('log unavailable')
+                    return subprocess.CompletedProcess(args,0,'retained resource diagnostic','')
+                def write_json(self,name,value):(root/name).write_text(json.dumps(value))
+            result=backend_diagnostics(Infra(),'failure')
+            self.assertEqual(result['containers'][0]['state']['ExitCode'],137)
+            self.assertIn('log unavailable',str(result['errors']))
+            self.assertTrue(result['containers'][0]['stats']['stdout'])
+            self.assertTrue(result['containers'][0]['disk']['stdout'])
+            self.assertNotIn('secret', (root/'failure-backends.json').read_text())
+
     def denied_observer(self, persistent):
         with tempfile.TemporaryDirectory(prefix='latency-denied-observer-') as temporary:
             root=Path(temporary);uid=1001 if os.geteuid()==0 else os.geteuid()

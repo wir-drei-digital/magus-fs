@@ -10,6 +10,30 @@ from service_protocol import identity, file_entry, GROUP, REPLICA, WORKER
 from service_storage import NS, ALICE, object_id
 
 
+def backend_diagnostics(infra, label):
+    """Bounded best-effort evidence from recorded owned resources before cleanup."""
+    result={'owner':infra.owner,'before_cleanup':True,'containers':[],'errors':[]}
+    for resource in infra.resources:
+        if resource['kind']!='container' or resource.get('removed'):continue
+        row={'name':resource['name'],'id':resource['id']};result['containers'].append(row)
+        try:
+            data=infra.inspect('container',resource['name']);infra.validate_owned(resource,data)
+            row['state']=data['State']
+            row['limits']={k:data['HostConfig'].get(k) for k in ['Memory','MemorySwap','NanoCpus','CpuQuota','CpuPeriod','PidsLimit']}
+        except Exception as error:
+            result['errors'].append({'name':resource['name'],'step':'inspect','error':str(error)});continue
+        for step,args in [('logs',('logs','--tail','2000',resource['name'])),
+                          ('stats',('stats','--no-stream','--format','{{json .}}',resource['name'])),
+                          ('disk',('exec',resource['name'],'df','-h'))]:
+            try:
+                response=infra.docker(*args,check=False,evidence=False,timeout=10)
+                row[step]={'status':response.returncode,'stdout':response.stdout,'stderr':response.stderr}
+            except Exception as error:result['errors'].append({'name':resource['name'],'step':step,'error':str(error)})
+        infra.write_json(label+'-backends.json',result)
+    infra.write_json(label+'-backends.json',result)
+    return result
+
+
 def distribution(rows, key):
     values = sorted(row[key] * 1000 for row in rows)
     return {'n': len(rows), 'p50_ms': statistics.median(values),
@@ -46,7 +70,7 @@ print(json.dumps({'save_started_ns':start,'save_finished_ns':time.monotonic_ns()
 '''
 
 
-def acceptance_type(Profile, DiskLazy, TraceMac, infra, image, report, save, validate_receipts):
+def acceptance_type(Profile, DiskLazy, TraceMac, infra, image, report, save, validate_receipts, preflight=False):
     class Separate:
         def __init__(self, journey):
             self.i = infra
@@ -229,6 +253,44 @@ def acceptance_type(Profile, DiskLazy, TraceMac, infra, image, report, save, val
             assert policies['a']['expires']==parent_expiry and policies['b']['expires']==parent_expiry-3600
             infra.write_json('credential-preflight-audit.json',{'verified':True,'before_timers':True,'actual_profile_tokens_match_chosen_credentials':True,'policies':policies,'profiles':profiles})
             mac = TraceMac(self, 'macos', image); self.endpoints.append(mac)
+            if preflight:
+                report['kind']='focused warm64 nativeAtomic16K backend failure/recovery; not acceptance cohort'
+                self.background('64MiB')
+                client=mac.create('backend-preflight-64MiB');mac.start(client);self.until(lambda:mac.ready(client),60);self.settle(mac,client)
+                backend_diagnostics(infra,'healthy-preflight')
+                before=self.settle(mac,client);prior={p['operation'] for p in before['mac']['status']['submissions']}
+                probe_upload=self.create('alice')
+                body=b'owned backend recovery '+secrets.token_bytes(32)+b'x'*16384
+                infra.docker('pause',infra.s3)
+                try:
+                    mac.run(WRITE.replace("s=json.load(sys.stdin);", ""),{'body':body.hex(),'atomic':True,'path':client['root']+'/reports/bench'})
+                    failed=None;deadline=time.monotonic()+30
+                    while time.monotonic()<deadline:
+                        submissions=[p for p in mac.status(client)['status']['submissions'] if p['operation'] not in prior]
+                        if len(submissions)==1 and submissions[0].get('error')=='backend_unavailable':failed=submissions[0];break
+                        time.sleep(.2)
+                    assert failed and not failed['private_receipt'] and not failed['shared_receipt'],'missing bounded backend failure with no receipt'
+                    infra.write_json('backend-failure-submission.json',failed)
+                    # Retain an authenticated original service response while this owned backend is paused.
+                    probe=b'owned backend unavailable response probe'
+                    path=self.root+'/uploads/'+probe_upload+'/objects/'+object_id(probe)
+                    response=self.request('PUT',path,raw=probe,timeout=10)
+                    infra.write_json('paused-service-response.json',{'method':'PUT','path':path,'body_sha256':hashlib.sha256(probe).hexdigest(),'status':response[0],'body':response[1]})
+                    assert response==(503,{'code':'backend_unavailable'}),response
+                    backend_diagnostics(infra,'paused-preflight')
+                finally:infra.docker('unpause',infra.s3)
+                marker,pid=self.observe(body,'backend-recovery')
+                self.until(lambda:self.lazy.right.execute("import os,json,sys;print(json.dumps(os.path.exists(json.load(sys.stdin)+'-result')))",marker),27)
+                observed=self.lazy.right.execute("import json,sys;print(open(json.load(sys.stdin)+'-result').read())",marker)
+                infra.write_json('backend-recovery-fresh-read.json',observed)
+                assert not observed.get('timeout') and not observed.get('error') and observed['sha256']==hashlib.sha256(body).hexdigest(),'bounded recovered ordinary fresh read failed'
+                if self.lazy.right.execute("import json,os,sys;print(json.dumps(not os.path.exists('/proc/'+str(json.load(sys.stdin)))))",pid):self.lazy.right.holders.remove(pid)
+                after=self.settle(mac,client);recovered=next(p for p in after['mac']['status']['submissions'] if p['operation']==failed['operation'])
+                assert recovered['request']==failed['request'] and recovered['request_digest']==failed['request_digest'] and recovered['local_revision']==failed['local_revision']
+                validate_receipts(recovered,before['mac']['status']['binding'],client['replica'])
+                infra.write_json('backend-recovered-submission.json',recovered)
+                report['backend_recovery']={'same_original_operation_request_digest_and_base':True,'no_private_or_shared_ack_while_failed':True,'ordinary_peer_bytes_verified':True,'operation':failed['operation']}
+                backend_diagnostics(infra,'recovered-preflight');mac.stop(client);save();return
             for background, count in [('tiny', 34), ('64MiB', 33), ('500-files', 33)]:
                 if background != 'tiny': self.background(background)
                 client = None

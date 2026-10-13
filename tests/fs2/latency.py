@@ -22,7 +22,7 @@ def validate_receipts(progress,binding,replica):
  assert shared['operation']==integration['operation'] and shared['operation']!=private['operation']
  assert shared['branch']==integration['branch']==binding['branch']
 
-p=argparse.ArgumentParser();p.add_argument('--output',required=True);p.add_argument('--image',required=True);p.add_argument('--phase',choices=['wakeups','reuse','pooled','acceptance'],required=True);p.add_argument('--skip-boundaries',action='store_true');p.add_argument('--skip-native-small',action='store_true');a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--output',required=True);p.add_argument('--image',required=True);p.add_argument('--phase',choices=['wakeups','reuse','pooled','acceptance','backend-preflight'],required=True);p.add_argument('--skip-boundaries',action='store_true');p.add_argument('--skip-native-small',action='store_true');a=p.parse_args()
 assert Path(a.output).is_absolute()
 assert a.image.startswith('sha256:') and len(a.image)==71,'immutable image required'
 IMAGE=a.image
@@ -197,9 +197,9 @@ else:print(json.dumps({'timeout':True,'save_started_ns':start_ns,'elapsed':time.
 
 try:
  i.setup(IMAGE);i.isolate_service_control();verify_image(i,source,host_profile='release')
- if a.phase=='acceptance':
+ if a.phase in ['acceptance','backend-preflight']:
   from latency_acceptance import acceptance_type
-  Acceptance=acceptance_type(Profile,DiskLazy,TraceMac,i,IMAGE,report,save,validate_receipts)
+  Acceptance=acceptance_type(Profile,DiskLazy,TraceMac,i,IMAGE,report,save,validate_receipts,preflight=a.phase=='backend-preflight')
   j=Acceptance()
  else:j=Profile()
  j.run();assert sources()==source['sha256'];code=0
@@ -212,6 +212,11 @@ except Exception as error:
     except Exception as error:report['failures'].append({'diagnostic_error':str(error),'trace_source':c['path']})
 finally:
  # Missing diagnostics cannot bypass normal-unmount-first owned cleanup.
+ if report['failures']:
+  try:
+   from latency_acceptance import backend_diagnostics
+   backend_diagnostics(i,'failure')
+  except Exception as error:report['failures'].append({'diagnostic_error':str(error),'trace_source':'owned backend resources'})
  if j:
   if j.lazy:
    for name in j.lazy.mounts:
