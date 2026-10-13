@@ -195,15 +195,19 @@ except Exception as error:
   for ep in j.endpoints:
    for c in ep.clients:
     try:i.write_json('failure-native-log.json',{'path':c['path'],'log':ep.run("print(json.dumps(open(s+'/daemon.log').read()))",c['path'])})
-    except Exception:pass
+    except Exception as error:report['failures'].append({'diagnostic_error':str(error),'trace_source':c['path']})
 finally:
+ # Missing diagnostics cannot bypass normal-unmount-first owned cleanup.
+ if j:
+  if j.lazy:
+   for name in j.lazy.mounts:
+    try:i.write_json('trace-'+name+'.json',{'log':j.lazy.execute("import json,sys;print(json.dumps(open('/private/'+json.load(sys.stdin)+'/daemon.log').read()))",name)})
+    except Exception as error:report['failures'].append({'diagnostic_error':str(error),'trace_source':name});code=1
+  try:i.write_json('trace-service.json',{'log':i.docker('exec',i.service,'cat','/tmp/service.log',evidence=False).stdout})
+  except Exception as error:report['failures'].append({'diagnostic_error':str(error),'trace_source':'service'});code=1
  try:
-  if j:
-   if j.lazy:
-    for name in j.lazy.mounts:
-     i.write_json('trace-'+name+'.json',{'log':j.lazy.execute("import json,sys;print(json.dumps(open('/private/'+json.load(sys.stdin)+'/daemon.log').read()))",name)})
-   i.write_json('trace-service.json',{'log':i.docker('exec',i.service,'cat','/tmp/service.log',evidence=False).stdout})
-   j.cleanup()
+  if j:j.cleanup()
+  # Preserve helpers/resources if normal unmount itself failed above.
   i.cleanup()
  except Exception as error:report['failures'].append({'cleanup_error':str(error)});code=1
  report.update(exit=code,seconds=time.monotonic()-started,source_unchanged=sources()==source['sha256']);save()
