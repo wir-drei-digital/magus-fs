@@ -265,6 +265,12 @@ def acceptance_type(Profile, DiskLazy, TraceMac, infra, image, report, save, val
                 profiles[name]=profile
             assert policies['a']['expires']==parent_expiry and policies['b']['expires']==parent_expiry-3600
             infra.write_json('credential-preflight-audit.json',{'verified':True,'before_timers':True,'actual_profile_tokens_match_chosen_credentials':True,'policies':policies,'profiles':profiles})
+            if not preflight:
+                topology=infra.backend_http(9333,'/dir/status');volumes=infra.backend_http(8080,'/status')
+                assert topology['status']==200 and topology['body']['Topology']['Max']==8
+                command=infra.inspect('container',infra.s3)['Config']['Cmd']
+                assert '-volume.max=8' in command and '-master.volumeSizeLimitMB=1024' in command
+                infra.write_json('acceptance-s3-before-timers.json',{'before_timers':True,'command':command,'topology':topology,'volumes':volumes})
             mac = TraceMac(self, 'macos', image); self.endpoints.append(mac)
             if preflight:
                 report['kind']='focused warm64 nativeAtomic16K backend failure/recovery; not acceptance cohort'
