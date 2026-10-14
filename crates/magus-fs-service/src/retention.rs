@@ -1,6 +1,9 @@
 //! Conservative PoC retention: every committed revision closure is a root. Expired
 //! partial uploads and never-referenced generated generations are reclaimable. There
-//! is deliberately no pruning of acknowledged operations or published history.
+//! is deliberately no pruning of acknowledged operations, publication_results, or
+//! published history. Migration007 foreign keys retain the producing operation and
+//! actual published descriptor; revision_objects closures stay protected by ELIGIBLE.
+//! submitted_revision is the immutable receipt digest, not a historical read grant.
 use crate::{db, publication::barrier, Error, Result, ServiceState};
 use magus_fs_core::protocol::NamespaceId;
 use serde::{Deserialize, Serialize};

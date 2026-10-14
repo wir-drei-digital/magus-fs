@@ -138,6 +138,7 @@ pub(crate) async fn seed(
                     },
                 )
                 .await?;
+                crate::continuation::record_publication(&tx, &ns, &receipt, &req.revision).await?;
                 tx.execute(
                     "INSERT INTO changes(namespace,branch,head,paths) VALUES($1,$2,$3,$4)",
                     &[&ns, &req.branch.as_str(), &receipt.head.as_str(), &paths],
@@ -393,13 +394,14 @@ async fn integrate_request(
    let conflicted = matches!(decision, Decision::Conflicted(_));
    if conflicted { result = "{}".into(); }
    save_operation(&tx,&current,NewOperation{operation:&req.operation,kind:"integration",request:serialized,result:&result,status:if matches!(decision,Decision::Publish{..}){200}else{409},branch:req.branch.as_str(),view:Some(original.original_view.as_str()),receipt:&receipt.receipt,submitted:&original.revision,derived:derived_id}).await?;
+   if let Some((id,_,_,_))=published { crate::continuation::record_publication(&tx,&current.namespace,receipt,id).await?; }
    if let Decision::Conflicted(retain)=decision {
     let x=crate::conflicts::Retained{branch:req.branch.as_str(),receipt:&req.candidate_receipt,integration:&req.operation,root,base:base_id,candidate:derived_id,current:current_id,original_head:original.original_head.as_str(),current_head:s.head.as_deref().unwrap_or_default()};
     let ids=crate::conflicts::record(&tx,&current,&x,retain.clone()).await?;
     result=r::json(&ConflictedIntegration{code:CONFLICTED.into(),conflicts:ids})?;
     tx.execute("UPDATE operations SET result=$4 WHERE namespace=$1 AND replica=$2 AND operation=$3",&[&current.namespace,&current.replica,&req.operation.as_str(),&result]).await?;
    }
-   tx.commit().await?;if matches!(decision,Decision::Publish{..}) {state.shared_committed(receipt, derived_id);} Ok((axum::http::StatusCode::from_u16(if matches!(decision,Decision::Publish{..}){200}else{409}).map_err(|_|Error::backend())?,[("content-type","application/json")],result).into_response())
+   tx.commit().await?;if let Some((id,_,_,_))=published {state.shared_committed(receipt, id);} Ok((axum::http::StatusCode::from_u16(if matches!(decision,Decision::Publish{..}){200}else{409}).map_err(|_|Error::backend())?,[("content-type","application/json")],result).into_response())
   })}).await;
         match commit {
             Err(e) if e.code == "conflict" && attempt < 2 => {

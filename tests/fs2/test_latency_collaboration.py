@@ -39,3 +39,34 @@ class AttributionTests(unittest.TestCase):
   p={'window':0,'callback_count':0,'load_count':0,'ambiguous':False}
   self.assertEqual(validate_profile_attribution({'ok':True,'profile':p},False),{'mode':'control-off','ambiguous':None})
   with self.assertRaises(AssertionError):validate_profile_attribution({'ok':True,'profile':dict(p,window=1)},False)
+
+class ContinuationServiceRunnerTests(unittest.TestCase):
+ def test_service_failure_retained_and_owned_cleanup_always_runs(self):
+  from continuation_proof import execute
+  class Infra:
+   def __init__(self):self.records={};self.cleaned=False
+   def preflight(self):pass
+   def setup(self,image):pass
+   def isolate_service_control(self):pass
+   def cleanup(self):self.cleaned=True
+   def write_json(self,name,value):self.records[name]=value
+  class BadJourney:
+   def __init__(self,i):pass
+   def run(self):raise AssertionError('retained failed journey')
+  i=Infra()
+  self.assertEqual(execute(i,'sha256:'+'1'*64,BadJourney,lambda _: {},lambda *_: None),1)
+  self.assertTrue(i.cleaned);self.assertIn('retained failed journey',i.records['failure.json']['reason'])
+ def test_source_mismatch_prevents_service_journey_and_cleanup_failure_is_failure(self):
+  from continuation_proof import execute
+  class Infra:
+   def preflight(self):pass
+   def setup(self,image):pass
+   def isolate_service_control(self):pass
+   def cleanup(self):raise RuntimeError('owned cleanup incomplete')
+   def write_json(self,name,value):pass
+  def bad_source(*_):raise AssertionError('source mismatch')
+  def forbidden(_):self.fail('journey reached before provenance')
+  self.assertEqual(execute(Infra(),'sha256:'+'1'*64,forbidden,lambda _: {},bad_source),1)
+ def test_mutable_image_refused(self):
+  from continuation_proof import validate_image
+  with self.assertRaises(ValueError):validate_image('latest')

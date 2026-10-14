@@ -36,8 +36,11 @@ def main():
  from provenance import capture,verify_linux_image
  from service_protocol import identity,file_entry,GROUP,REPLICA,WORKER
  from service_storage import NS,ALICE
- args=argparse.ArgumentParser();args.add_argument('--mode',choices=['profile'],required=True);args.add_argument('--image',required=True);args.add_argument('--output',required=True);a=args.parse_args()
+ args=argparse.ArgumentParser();args.add_argument('--mode',choices=['profile','service'],required=True);args.add_argument('--image',required=True);args.add_argument('--output',required=True);a=args.parse_args()
  assert a.image.startswith('sha256:') and len(a.image)==71,'immutable image required'
+ if a.mode=='service':
+  from continuation_proof import main as service_main
+  return service_main(['--image',a.image,'--output',a.output])
  class TraceInfra(OwnedInfra):
   def create(self,kind,suffix,args):return super().create(kind,suffix,acceptance_s3_capacity('acceptance',kind,suffix,args))
   def docker(self,*args,**kw):

@@ -21,6 +21,7 @@ const LIMIT: Duration = Duration::from_secs(3);
 enum Step {
     Reply(&'static str),
     Stall(&'static str),
+    StallExtended(&'static str),
 }
 struct Peer {
     config: String,
@@ -48,13 +49,18 @@ async fn peer_connection(mut socket: TcpStream, steps: Vec<Step>, stalled: &Noti
         .unwrap();
     socket.write_all(&frame(b'Z', b"I")).await.unwrap();
     for step in steps {
-        assert_eq!(socket.read_u8().await.unwrap(), b'Q');
+        let expected_kind = if matches!(step, Step::StallExtended(_)) {
+            b'P'
+        } else {
+            b'Q'
+        };
+        assert_eq!(socket.read_u8().await.unwrap(), expected_kind);
         let length = socket.read_u32().await.unwrap();
         let mut query = vec![0; length as usize - 4];
         socket.read_exact(&mut query).await.unwrap();
         let (expected, stall) = match step {
             Step::Reply(s) => (s, false),
-            Step::Stall(s) => (s, true),
+            Step::Stall(s) | Step::StallExtended(s) => (s, true),
         };
         assert!(String::from_utf8_lossy(&query).contains(expected));
         if stall {
@@ -195,6 +201,55 @@ async fn cancelled_provisioning_discards_connection_before_recovery() {
         .run(|client| {
             Box::pin(async move {
                 client.batch_execute("SELECT 1").await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    peer.finished().await;
+}
+
+#[tokio::test]
+async fn continuation_traversal_timeout_discards_connection() {
+    let mut peer = Peer::new(vec![
+        vec![
+            Step::Reply(INIT),
+            Step::Reply(MIGRATION),
+            Step::Reply("START TRANSACTION"),
+            Step::StallExtended("SELECT descriptor FROM revisions"),
+        ],
+        vec![Step::Reply(INIT), Step::Reply("SELECT 1")],
+    ])
+    .await;
+    let database = Database::open(peer.config.clone()).await.unwrap();
+    let current = magus_fs_core::RevisionId::parse(format!("sha256:{}", "1".repeat(64))).unwrap();
+    let published = magus_fs_core::RevisionId::parse(format!("sha256:{}", "2".repeat(64))).unwrap();
+    backend_error(async {
+        database
+            .acquire()
+            .await?
+            .run(|db| {
+                Box::pin(async move {
+                    let tx = db.transaction().await?;
+                    magus_fs_service::continuation::verify_ancestry(
+                        &tx,
+                        "synthetic",
+                        &current,
+                        &published,
+                    )
+                    .await
+                })
+            })
+            .await
+    })
+    .await;
+    database
+        .acquire()
+        .await
+        .unwrap()
+        .run(|db| {
+            Box::pin(async move {
+                db.batch_execute("SELECT 1").await?;
                 Ok(())
             })
         })

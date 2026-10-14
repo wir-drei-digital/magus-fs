@@ -54,3 +54,6 @@ mod metadata_profile;
 pub use metadata_profile::{metadata_thread_cpu_ns, MetadataProfile, MetadataProfileGuard};
 
 mod metadata;
+
+pub mod continuation_protocol;
+pub use continuation_protocol::*;

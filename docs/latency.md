@@ -87,3 +87,49 @@ Metadata lookup, identity lookup, directory enumeration and native attribute pro
 Schema2 inventory is computed only for an active collection window. `current` counts unique identities in the adopted descriptor, including root; it is not the old+new notification list or the number of allocated kernel inode numbers. `remembered` is the pre-notification inode-slot snapshot length, including root and retained file epochs. `removed` counts those remembered slots whose identity is absent from the adopted tree; a rename preserves identity, while same-name replacement removes old identity slots. `stale_epoch` counts remembered slots for surviving files from a different adoption epoch; directories/root remain epoch-independent. Removed and stale-epoch counts are disjoint. Metadata callbacks may allocate more inode slots after the snapshot. Disabled collection emits null inventory in an opted-in daemon and performs no diagnostic tree inventory traversal. Existing complete name/attribute/absence checks remain required for Applied.
 
 Enabled profile rows require a real nonzero window, callback and authority-load counts; their per-endpoint attribution verdict retains the ambiguity flag. Counter-off controls are explicitly marked `control-off` with unavailable ambiguity, never interpreted as zero metadata work. The original P1/P2 envelopes predate schema2: their `current` and `removed` values are invalid as inode inventories and are retained unchanged, without retroactive relabeling or reconstructed counts. The correction has focused source/test verification only; its live CPU/latency impact is unmeasured.
+
+
+## Continuation producer (source verified; live execution pending P3)
+
+The additive `POST /v1/n/{namespace}/continuations/proof` endpoint accepts
+`ContinuationRequestV1 { receipt: SharedReceipt }` within the existing 64-KiB
+control limit. It returns `ContinuationResponseV1` with the current issued
+projection inline, bounded by `MAX_DESCRIPTOR + 16384`. The proof format is
+`magus-fs/continuation-proof/v1`; unknown fields/formats and mismatched descriptor
+hashes are rejected. Clients must use the bounded bytes response path, not the
+64-KiB control JSON helper. Requests/receipts retain their existing wire formats.
+
+Migration007 records each successful seed, integration, resolution and restore
+in its publication transaction. The mapping retains the actual published result,
+including merge results distinct from the stored candidate. Its operation and
+published-revision foreign keys preserve evidence under existing conservative
+retention. `submitted_revision` is the exact receipt digest: older candidates and
+restore projections do not necessarily have a separately stored full revision,
+so imposing a submitted-revision foreign key would break existing publication.
+No old successful receipts are backfilled or inferred from candidate identity.
+
+Issuance checks current credential/principal/replica ownership of the exact
+successful receipt, current read/write/integrate actions, full projection, and
+verified ancestry within 256 unique nodes and the existing two-second DB phase.
+It reuses normal view issuance under the namespace/head/authority recheck fence.
+This is metadata inclusion evidence, never a historical read grant. Missing
+mapping, exhaustion, unrelated ancestry and scoped projection return explicit
+409 codes; current denial keeps ordinary opaque errors. An older server's404
+means capability unavailable. A later query after response loss reauthorizes.
+
+Run the owned actual-service journey only against the combined frozen P3 image:
+
+```sh
+python3 tests/fs2/latency_collaboration.py --mode service --image sha256:P3_SHA --output /private/tmp/NEW_CONTINUATION_PROOF
+```
+
+The runner builds nothing, verifies current image/source/binaries, and owns all
+TLS/PG/S3 resources and cleanup. It exercises all four publication sources,
+actual merge result, response loss, current-grant/head races, rollback, retention,
+legacy evidence and 256/257-node graph limits. Its old-server case reuses retained
+P2 image `sha256:9c7b55e2e231b8f06e6b7f6f2110fa056bd9e21d2b4e5c8b473ac4f286e18569`
+and verifies that binary's recorded hash; missing P2 is a prerequisite failure,
+not a skipped success. It also publishes a candidate admitted by that old server
+through the new producer. Synthetic graph installation tests bounded traversal,
+not publication throughput. Unit checks of this runner do not qualify the live
+producer, and no latency result follows from the source/protocol checks.

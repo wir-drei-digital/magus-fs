@@ -700,6 +700,7 @@ pub(crate) async fn resolve(
                 derived: if stale { derived_id } else { resolved_id },
             }).await?;
             if !stale {
+                crate::continuation::record_publication(&tx,&current.namespace,receipt,resolved_id).await?;
                 for (id, hidden) in ids.iter().map(|i| (i, false)).chain(superseded.iter().map(|i| (i, true))) {
                     tx.execute("INSERT INTO conflict_resolutions(conflict,namespace,replica,operation,revision,superseded) VALUES($1,$2,$3,$4,$5,$6)",&[id,&current.namespace,&current.replica,&req.operation.as_str(),&resolved_id.as_str(),&hidden]).await?;
                 }

@@ -204,36 +204,26 @@ pub(crate) async fn create(
     let id = r::rid(&projected)?;
     let full_id = r::rid(full)?;
     let head = HeadToken::parse(s.head.clone().ok_or(Error::not_found())?).map_err(core_error)?;
-    state.db.acquire().await?.run(|db| Box::pin(async move {
-        let tx = db.transaction().await?;
-        // Current authority and projection must always be computed and rechecked.
-        // This namespace lock serializes selection/insertion across service owners.
-        let c = r::recheck(&tx, &s, "read").await?;
-        let fields: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
-            &ns, &req.branch.as_str(), &c.credential, &c.principal, &c.replica,
-            &full_id.as_str(), &head.as_str(), &id.as_str(), &bytes,
-            &c.generation, &c.actions, &c.branches, &c.prefixes,
-        ];
-        let existing = tx.query_opt(
-            "SELECT id FROM views WHERE namespace=$1 AND branch=$2 AND credential=$3 AND principal=$4 AND replica=$5 AND full_revision=$6 AND head=$7 AND projected_revision=$8 AND descriptor=$9 AND credential_generation=$10 AND grant_actions=$11 AND grant_branches=$12 AND grant_prefixes=$13 AND alternative IS NULL AND history IS NULL ORDER BY id LIMIT 1",
-            fields,
-        ).await?;
-        let view = if let Some(row) = existing {
-            ViewId::parse(row.get::<_, String>(0)).map_err(core_error)?
-        } else {
-            let view = ViewId::random().map_err(core_error)?;
-            let mut values = fields.to_vec();
-            let view_id = view.as_str();
-            values.push(&view_id);
-            tx.execute(
-                "INSERT INTO views(namespace,branch,credential,principal,replica,full_revision,head,projected_revision,descriptor,credential_generation,grant_actions,grant_branches,grant_prefixes,id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
-                &values,
-            ).await?;
-            view
-        };
-        tx.commit().await?;
-        Ok(Json(ViewBinding { view, head, revision: id }))
-    })).await
+    state
+        .db
+        .acquire()
+        .await?
+        .run(|db| {
+            Box::pin(async move {
+                let tx = db.transaction().await?;
+                // Current authority and projection must always be computed and rechecked.
+                // This namespace lock serializes selection/insertion across service owners.
+                let c = r::recheck(&tx, &s, "read").await?;
+                let view = issue_current(&tx, &s, &c, &full_id, &head, &id, &bytes).await?;
+                tx.commit().await?;
+                Ok(Json(ViewBinding {
+                    view,
+                    head,
+                    revision: id,
+                }))
+            })
+        })
+        .await
 }
 pub(crate) async fn descriptor(
     State(state): State<ServiceState>,
@@ -279,4 +269,50 @@ pub(crate) async fn object_record(
   let row=tx.query_opt("SELECT storage_key,generation FROM objects WHERE namespace=$1 AND object_id=$2 AND size=$3 AND state='ready'",&[&c.namespace,&id.as_str(),&size]).await?.ok_or(Error::not_found())?;let out=(row.get(0),row.get(1));tx.commit().await?;Ok(out)
  })).await?;
     Ok((s, key, generation, size as usize))
+}
+
+/// Shared current-view issuance, always called after snapshot recheck under namespace lock.
+pub(crate) async fn issue_current(
+    tx: &tokio_postgres::Transaction<'_>,
+    s: &r::Snapshot,
+    c: &auth::AuthContext,
+    full_id: &RevisionId,
+    head: &HeadToken,
+    id: &RevisionId,
+    bytes: &[u8],
+) -> Result<ViewId> {
+    let fields: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+        &s.context.namespace,
+        &s.branch,
+        &c.credential,
+        &c.principal,
+        &c.replica,
+        &full_id.as_str(),
+        &head.as_str(),
+        &id.as_str(),
+        &bytes,
+        &c.generation,
+        &c.actions,
+        &c.branches,
+        &c.prefixes,
+    ];
+    let existing = tx.query_opt(
+            "SELECT id FROM views WHERE namespace=$1 AND branch=$2 AND credential=$3 AND principal=$4 AND replica=$5 AND full_revision=$6 AND head=$7 AND projected_revision=$8 AND descriptor=$9 AND credential_generation=$10 AND grant_actions=$11 AND grant_branches=$12 AND grant_prefixes=$13 AND alternative IS NULL AND history IS NULL ORDER BY id LIMIT 1",
+            fields,
+        ).await?;
+    let view = if let Some(row) = existing {
+        ViewId::parse(row.get::<_, String>(0)).map_err(core_error)?
+    } else {
+        let view = ViewId::random().map_err(core_error)?;
+        let mut values = fields.to_vec();
+        let view_id = view.as_str();
+        values.push(&view_id);
+        tx.execute(
+                "INSERT INTO views(namespace,branch,credential,principal,replica,full_revision,head,projected_revision,descriptor,credential_generation,grant_actions,grant_branches,grant_prefixes,id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+                &values,
+            ).await?;
+        view
+    };
+
+    Ok(view)
 }

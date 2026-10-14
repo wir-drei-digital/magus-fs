@@ -3,6 +3,7 @@ pub mod auth;
 mod changes;
 pub mod config;
 mod conflicts;
+pub mod continuation;
 pub mod db;
 pub mod dependencies;
 mod history;
@@ -184,6 +185,7 @@ async fn bounded(State(state): State<ServiceState>, req: Request, next: Next) ->
         || path.contains("/operations/")
         || path.contains("/conflicts")
         || path.contains("/history")
+        || path.ends_with("/continuations/proof")
         || path.ends_with("/restores")
         || [
             "/seed",
@@ -252,6 +254,10 @@ pub fn router(state: ServiceState) -> Router {
         )
         .route("/v1/n/{namespace}/seed", post(publication::seed))
         .route("/v1/n/{namespace}/views", post(views::create))
+        .route(
+            "/v1/n/{namespace}/continuations/proof",
+            post(continuation::create),
+        )
         .route(
             "/v1/n/{namespace}/views/{view}/descriptor",
             get(views::descriptor),
