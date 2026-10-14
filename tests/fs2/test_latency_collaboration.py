@@ -124,3 +124,55 @@ class ExactReadBindingTests(unittest.TestCase):
   for section,key in [('private_receipt','operation'),('shared_receipt','submitted_revision'),('request','original_view'),('integration','candidate_receipt')]:
    bad=copy.deepcopy(progress);bad[section][key]='wrong'
    with self.assertRaises(AssertionError):validate_receipts(bad,binding,'replica')
+
+class PostReadSettlementTests(unittest.TestCase):
+ def scenario(self, mode):
+  import json
+  from latency_collaboration import immediate_post_applied_read, collect_post_read_evidence
+  order=[];now=[0.0];snapshots=[0];row={}
+  captured={'head':'new','applied':{'a':[],'b':[{'revision':'peer-new','monotonic_ns':30}]}}
+  def read():
+   order.append('read')
+   return {'read_started_ns':31,'fresh_after_applied_ns':35,'uid':1001,'bytes':24,'sha256':'hash'}
+  def status():order.append('status');return {}
+  post,_=immediate_post_applied_read(read,status,30,24,'hash')
+  row['post_applied_read']=post
+  def profile(revision,ok=True):return 'metadata_profile '+json.dumps({'revision':revision,'ok':ok,'profile':{}})
+  def logs():
+   order.append('logs');snapshots[0]+=1
+   # Wrong-head Applied and unrelated successful profiles cannot qualify.
+   sender='latency stage=applied head=old revision=old monotonic_ns=29\n'+profile('old')
+   if mode!='missing' and snapshots[0]>=2:
+    sender+='\nlatency stage=applied head=new revision=sender-new monotonic_ns=40'
+    if snapshots[0]>=3:sender+='\n'+profile('sender-new',mode!='failed')
+   return {'a':{'log':sender},'b':{'log':profile('peer-new')}}
+  def events(log,owner):
+   return [dict(dict(x.split('=',1) for x in line.split()[1:]),owner=owner) for line in log.splitlines() if line.startswith('latency ')]
+  def sleep(seconds):
+   self.assertGreater(seconds,0);self.assertLessEqual(seconds,.1);now[0]+=seconds
+  try:
+   result=collect_post_read_evidence(logs,events,captured,row,clock=lambda:now[0],sleep=sleep)
+  except AssertionError as error:result=error
+  self.assertEqual(order[:3],['read','status','logs'])
+  self.assertEqual(order.count('read'),1)
+  self.assertEqual(row['post_applied_read'],{'read_started_ns':31,'fresh_after_applied_ns':35,'uid':1001,'bytes':24,'sha256':'hash'})
+  self.assertEqual((max(20,30,post['fresh_after_applied_ns'])-10)/1e9,25e-9)
+  return result,row,now[0],snapshots[0]
+ def test_later_sender_applied_and_profile_succeed_after_peer_read(self):
+  result,row,elapsed,count=self.scenario('delayed')
+  self.assertNotIsInstance(result,Exception)
+  logs,events,profiles=result
+  self.assertEqual(profiles['a']['revision'],'sender-new')
+  self.assertEqual(profiles['b']['revision'],'peer-new')
+  self.assertEqual(count,3);self.assertAlmostEqual(elapsed,.2)
+ def test_missing_exact_sender_fails_at_existing_settle_bound(self):
+  result,row,elapsed,count=self.scenario('missing')
+  self.assertIsInstance(result,AssertionError)
+  self.assertIn('sender Applied',str(result));self.assertAlmostEqual(elapsed,60)
+  self.assertGreater(count,1)
+  self.assertIn('head=old',row['post_read_diagnostics']['logs']['a']['log'])
+ def test_failed_exact_sender_profile_is_retained(self):
+  result,row,elapsed,count=self.scenario('failed')
+  self.assertIsInstance(result,AssertionError)
+  self.assertIn('failed',str(result))
+  self.assertIn('"ok": false',row['post_read_diagnostics']['logs']['a']['log'])

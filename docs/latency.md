@@ -189,3 +189,21 @@ bytes are separate and never qualify completion. Existing 25-second observation
 and 60-second settling limits remain. Every completion must be at most 500 ms,
 with median at most 200 ms. This mode is implemented but unrun; three saves
 would not establish p95. Continuation producer P3 remains independently pending.
+
+
+The subsequent I1 harness correction preserves that immediate peer read and
+collects exact-head sender Applied plus each endpoint's exact-revision profile
+within a bounded 60-second post-read phase. It retains the last diagnostic
+snapshot on missing or failed evidence; waiting cannot change the recorded read
+start/completion or the latency calculation. No manual drain or additional timed
+read is used. The 25-second observation deadline is unchanged.
+
+Source bridge: the retained October 14 comparison belongs to
+`fb9be4f155a4c1c20f6e0cfef801c422534ddf7f`, with its recorded binary/input hashes
+and documented post-campaign documentation-only exception. This later correction
+changes only the Python collaboration harness, its regression tests and this
+explanation; the measured Rust/cache/comparison source is unchanged. The earlier
+runtime/test hash identity does not describe the corrected Python files. No
+benchmark rerun, new Linux build or mounted measurement accompanies this fix.
+All 15 original blocks remain included; slow C block index 3 is the fourth block,
+not the last. The failed 100-ms gate and independent P3 live requirement remain.

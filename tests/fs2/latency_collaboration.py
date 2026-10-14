@@ -27,6 +27,34 @@ def profile_docker_args(args):
  return args
 
 
+def collect_post_read_evidence(read_logs,events,captured,row,clock=None,sleep=None):
+ """Collect exact endpoint evidence only after the preserved immediate peer read."""
+ import json,time
+ clock=clock or time.monotonic;sleep=sleep or time.sleep
+ deadline=clock()+60
+ diagnostic={'missing':['endpoint evidence']}
+ while clock()<deadline:
+  logs=read_logs();es=events(logs['a']['log'],'a')+events(logs['b']['log'],'b')
+  # Keep the actual last snapshot even if evidence is missing or failed.
+  diagnostic={'logs':logs,'events':es,'missing':[]};row['post_read_diagnostics']=diagnostic
+  captured['applied']['a']=[x for x in es if x['owner']=='a' and x['stage']=='applied' and x['head']==captured['head']]
+  profiles={}
+  for n in ['a','b']:
+   if not captured['applied'][n]:
+    diagnostic['missing'].append('sender Applied' if n=='a' else 'peer Applied');continue
+   aggregate=[json.loads(line[len('metadata_profile '):]) for line in logs[n]['log'].splitlines() if line.startswith('metadata_profile ')]
+   exact=[x for x in aggregate if x['revision']==captured['applied'][n][-1]['revision']]
+   assert len(exact)<=1,'ambiguous exact '+n+' metadata profile after peer read'
+   if not exact:diagnostic['missing'].append(n+' metadata profile');continue
+   assert exact[0]['ok'],'failed exact '+n+' metadata profile after peer read'
+   profiles[n]=exact[0]
+  remaining=deadline-clock()
+  if remaining<=0:break
+  if not diagnostic['missing']:return logs,es,profiles
+  sleep(min(.1,remaining))
+ raise AssertionError('existing60s post-read settle deadline: missing or late '+', '.join(diagnostic['missing']))
+
+
 def main():
  import argparse,hashlib,json,secrets,time,traceback
  from pathlib import Path
@@ -120,8 +148,7 @@ def main():
      time.sleep(.1)
     assert captured,'existing25s exact appended Applied/read deadline';row['captured_appended_applied']=captured
     post,after=immediate_post_applied_read(lambda:receiver.execute("import json,hashlib,time,os;started=time.monotonic_ns();v=open('/shared/b/reports/bench','rb').read();print(json.dumps({'read_started_ns':started,'fresh_after_applied_ns':time.monotonic_ns(),'bytes':len(v),'sha256':hashlib.sha256(v).hexdigest(),'uid':os.geteuid()}))",user='1001:1001'),lambda:{n:e.status(n) for n,e in endpoints},captured['applied']['b'][-1]['monotonic_ns'],size,digest);row['post_applied_read']=post;row['sha256']=post['sha256']
-    logs={n:logread(e,n,offsets[n],marker if n=='b' else None) for n,e in endpoints};es=events(logs['a']['log'],'a')+events(logs['b']['log'],'b');captured['applied']['a']=[x for x in es if x['owner']=='a' and x['stage']=='applied' and x['head']==captured['head']]
-    assert captured['applied']['a'],'sender profile attribution unavailable after immediate peer read'
+    logs,es,profiles=collect_post_read_evidence(lambda:{n:logread(e,n,offsets[n],marker if n=='b' else None) for n,e in endpoints},events,captured,row)
     subs=[s for s in after['a']['status']['submissions'] if s['operation'] not in prior];assert len(subs)==1 and subs[0]['shared_receipt'];progress=subs[0];validate_receipts(progress,before['a']['status']['binding'],REPLICA)
     revision=validate_exact_peer_binding(captured,after['b'],progress['shared_receipt'])
     serviceevents=[x for x in events(i.docker('exec',i.service,'cat','/tmp/service.log',evidence=False).stdout,'service') if x.get('head')==captured['head'] and x.get('operation')==progress['shared_receipt']['operation'] and x['stage']=='shared_committed'];assert len(serviceevents)==1
@@ -130,7 +157,7 @@ def main():
     row['seconds']=(max(stamp,peer,post['fresh_after_applied_ns'])-row['save_started_ns'])/1e9;row['firstbytes_seconds']=(row['fresh_read_ns']-row['save_started_ns'])/1e9 if row.get('fresh_read_ns') else None;row['target_pass']=row['seconds']<=.5
     row['metadata_profiles']={};row['profile_attribution']={}
     for n in ['a','b']:
-     aggregate=[json.loads(line[len('metadata_profile '):]) for line in logs[n]['log'].splitlines() if line.startswith('metadata_profile ')];exact=[x for x in aggregate if x['revision']==captured['applied'][n][-1]['revision'] and x['ok']];assert len(exact)==1;row['metadata_profiles'][n]=exact[0];row['profile_attribution'][n]=validate_profile_attribution(exact[0],row['enabled'])
+     row['metadata_profiles'][n]=profiles[n];row['profile_attribution'][n]=validate_profile_attribution(profiles[n],row['enabled'])
     row['qualified']=True;print(json.dumps({k:row[k] for k in ['number','size','background','enabled','seconds','firstbytes_seconds','target_pass']}),flush=True)
    except Exception as error:row.update(error=str(error),qualified=False);raise
    finally:save();snap('sample-'+str(number)+'-every-outcome')
