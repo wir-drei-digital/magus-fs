@@ -202,3 +202,14 @@ class MountedGateBoundaryTests(unittest.TestCase):
   self.assertFalse(currently_blocked({'recovery':[{'operation':'old'}],'readiness':'Ready'}))
   self.assertFalse(currently_blocked({'recovery':[{'operation':'old'}],'readiness':{'Waiting':{'reason':'visibility'}}}))
   self.assertTrue(currently_blocked({'recovery':[{'operation':'new'}],'readiness':{'Blocked':{'reason':'overlap'}}}))
+
+class ActualAgentsOnlyTests(unittest.TestCase):
+ def test_agents_only_runs_setup_and_actual_rendezvous_only(self):
+  from mounted_continuation import Journey
+  class OnlyAgents:
+   def __init__(self):self.calls=[]
+   def setup_mounts(self):self.calls.append('setup')
+   def two_agents(self):self.calls.append('actual-agents')
+  journey=OnlyAgents()
+  Journey.run(journey,agents_only=True)
+  self.assertEqual(journey.calls,['setup','actual-agents'])

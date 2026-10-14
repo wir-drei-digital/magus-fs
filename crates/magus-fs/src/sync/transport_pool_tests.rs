@@ -665,3 +665,196 @@ fn queued_request_revalidates_private_credentials_at_dispatch() {
         assert_eq!(f.requests.lock().unwrap().len(), 4);
     });
 }
+
+#[test]
+fn mounted_same_view_recovery_clears_resolved_discovery_error() {
+    let fixture = Fixture::new();
+    let principal = PrincipalId::random().unwrap();
+    let group = GroupId::random().unwrap();
+    let actor = Actor::new(principal.clone());
+    let mut config = fixture.config.clone();
+    config.cache_bytes = 32 * 1024 * 1024;
+    config.authorities.push(Authority {
+        principal: principal.clone(),
+        uid: unsafe { libc::geteuid() },
+        gid: 1001,
+        primary_group: group.clone(),
+        groups: vec![group.clone()],
+        dac_override: false,
+        ownership_transfer: false,
+    });
+    let rep = Replica::open(fixture.dir.join("state"), config.clone()).unwrap();
+    let revision = Revision {
+        format: FORMAT.into(),
+        hash: HASH.into(),
+        layout: LAYOUT.into(),
+        parents: vec![],
+        operation: OperationId::random().unwrap(),
+        replica: config.replica,
+        principal: principal.clone(),
+        captured_at_ns: 0,
+        coverage: vec!["".into()],
+        provenance: "explicit".into(),
+        restoration: None,
+        tree: Tree {
+            root: Root {
+                id: EntryId::random().unwrap(),
+                owner: principal,
+                group,
+                mode: 0o755,
+            },
+            entries: vec![],
+        },
+    };
+    let bytes = encode_revision(&revision).unwrap();
+    let id = revision_id(&revision).unwrap();
+    rep.import_revision(
+        ImportDescriptor {
+            expected: id.clone(),
+            bytes: bytes.clone(),
+        },
+        ChunkSource::Unavailable,
+    )
+    .unwrap();
+    let owner = rep.begin_live(&id, actor.clone(), false).unwrap();
+    let mut binding = fixture.transport.binding.clone();
+    binding.publication = PublicationMode::SharedLive;
+    binding.view.revision = id;
+    rep.configure_sync(binding.clone()).unwrap();
+    rep.enable_mounted_collaboration(&owner, &binding, actor.clone())
+        .unwrap();
+    drop(owner.create("local-draft", 0o600).unwrap());
+    let mut incoming = crate::sync::Incoming::new(&rep).unwrap();
+    fixture.response(404, br#"{"code":"denied"}"#);
+    assert!(incoming
+        .poll_mounted(|_| panic!("denied discovery must not apply"))
+        .is_err());
+    assert!(rep.incoming_recovery().unwrap().discovery_error.is_some());
+    let retained = rep.local_work_recovery().unwrap().remove(0).operation;
+    fixture.response(200, &serde_json::to_vec(&binding.view).unwrap());
+    fixture.response(200, &bytes);
+    let denied_generation = rep.live_status().unwrap().authority_generation;
+    let result = incoming
+        .select_current_remote(|mut prepared| {
+            assert_eq!(
+                rep.live_status()?.authority_generation,
+                denied_generation,
+                "fresh authority must wait for the serialized apply owner"
+            );
+            assert!(prepared.observe_authority(&rep)?);
+            let state = rep.scheduling_snapshot()?;
+            let fence = ContinuationFence {
+                generation: state.generation,
+                head: state.head.unwrap(),
+                binding: binding.clone(),
+                authority_generation: prepared.authority_generation,
+                credential_stamp: prepared.credential_stamp,
+                capability_generation: 0,
+            };
+            rep.use_current_remote(&retained, &prepared.binding, &fence, actor.clone())
+                .map(crate::sync::MountedIncoming::Clean)
+        })
+        .unwrap();
+    assert!(
+        result.is_some(),
+        "explicit selection must reach Core for the same authenticated view"
+    );
+    assert!(rep.incoming_recovery().unwrap().discovery_error.is_none());
+    assert!(rep.pending_visibility().unwrap().is_some());
+    // Same-bound authenticated no-op still refreshes under the apply owner.
+    fixture.response(200, &serde_json::to_vec(&binding.view).unwrap());
+    fixture.response(200, &bytes);
+    assert!(matches!(
+        incoming
+            .poll_mounted(|mut prepared| {
+                assert!(!prepared.observe_authority(&rep)?);
+                Ok(crate::sync::MountedIncoming::Unchanged)
+            })
+            .unwrap(),
+        Some(crate::sync::MountedIncoming::Unchanged)
+    ));
+
+    // The actual private socket route performs HTTP before acquiring callback ownership.
+    drop(owner.create("second-draft", 0o600).unwrap());
+    rep.observe_remote_authority(None, rep.live_status().unwrap().authority_generation)
+        .unwrap();
+    let recovery = rep
+        .local_work_recovery()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.operation != retained)
+        .unwrap();
+    let denied_generation = rep.live_status().unwrap().authority_generation;
+    let options = std::collections::BTreeMap::from([
+        ("operation-id".into(), recovery.operation.as_str().into()),
+        (
+            "expected-generation".into(),
+            owner.generation().unwrap().to_string(),
+        ),
+    ]);
+    let epoch = Arc::new(Mutex::new(rep.live_status().unwrap().epoch));
+    let selected = Arc::new(AtomicUsize::new(0));
+    let (callback_epoch, count, expected_actor) = (epoch.clone(), selected.clone(), actor.clone());
+    let hook: crate::adapters::control::LocalWorkSelection =
+        Arc::new(move |rep, actor, options| {
+            assert_eq!(actor.principal(), expected_actor.principal());
+            count.fetch_add(1, Ordering::SeqCst);
+            crate::cli::local_work_selection(rep, actor, options, |apply| {
+                let mut owned_epoch = callback_epoch.lock().unwrap();
+                let adoption = apply()?;
+                *owned_epoch = adoption.epoch;
+                Ok(adoption)
+            })
+        });
+    let path = fixture.dir.join("state");
+    let server = crate::adapters::control::Server::start_with_local_work_owner(
+        rep.clone(),
+        &path,
+        false,
+        hook.clone(),
+    )
+    .unwrap();
+    fixture.response(200, &serde_json::to_vec(&binding.view).unwrap());
+    fixture.response(200, &bytes);
+    let held = epoch.lock().unwrap();
+    let requests = fixture.requests.lock().unwrap().len();
+    std::thread::scope(|scope| {
+        let request = scope.spawn(|| {
+            crate::adapters::control::request(&path, "sync-local-work-use-remote", &options)
+                .unwrap()
+                .unwrap()
+        });
+        fixture.wait_requests(requests + 2);
+        assert_eq!(
+            rep.live_status().unwrap().authority_generation,
+            denied_generation
+        );
+        drop(held);
+        let response = request.join().unwrap();
+        assert_eq!(response.exit, 0, "{}", response.value);
+        assert_eq!(*epoch.lock().unwrap(), rep.live_status().unwrap().epoch);
+        assert_eq!(
+            response.value["adoption"]["epoch"].as_u64().unwrap(),
+            *epoch.lock().unwrap()
+        );
+    });
+    assert_eq!(selected.load(Ordering::SeqCst), 1);
+    drop(server);
+    let readonly = crate::adapters::control::Server::start_with_local_work_owner(
+        rep.clone(),
+        &path,
+        true,
+        hook,
+    )
+    .unwrap();
+    let response = crate::adapters::control::request(&path, "sync-local-work-use-remote", &options)
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.value["error"], "read_only");
+    assert_eq!(
+        selected.load(Ordering::SeqCst),
+        1,
+        "readonly must not enter the owner callback"
+    );
+    drop(readonly);
+}

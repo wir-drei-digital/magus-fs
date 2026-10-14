@@ -158,8 +158,11 @@ except BaseException:
         log=self.endpoints['a'].execute("import json;print(json.dumps(open('/private/a/daemon.log').read()))")
         if not overlap:assert ('DirtyReconciled' if foreign else 'OwnBaseAdvanced') in log
         self.record(case,before=before,after=after,original=original,new=[p for p in current if p['operation'] not in prior],ordinary_uid=1001,logs=log)
-    def run(self):
+    def run(self, agents_only=False):
         self.setup_mounts()
+        if agents_only:
+            self.two_agents()
+            return
         self.write('a','target',b'normal-atomic',True);after=self.settle();assert self.read('b','target')==b'normal-atomic'.hex();self.record('normal-atomic',after=after)
         self.held('held-own-atomic')
         self.held('foreign-never-issued',foreign=True)
@@ -283,7 +286,8 @@ print(json.dumps({'pid':p.pid,'schema':schema}))""",{'name':name,'fault':fault,'
         if errors:raise AssertionError('owned mounted cleanup incomplete')
 
 def main(argv=None):
-    parser=argparse.ArgumentParser();parser.add_argument('--image',required=True);parser.add_argument('--output',required=True);args=parser.parse_args(argv)
+    parser=argparse.ArgumentParser();parser.add_argument('--image',required=True);parser.add_argument('--output',required=True);parser.add_argument('--agents-only',action='store_true');args=parser.parse_args(argv)
+    cases=['two-ordinary-agents'] if args.agents_only else CASES
     from continuation_proof import validate_image
     validate_image(args.image)
     class Infra(OwnedInfra):
@@ -292,10 +296,10 @@ def main(argv=None):
             if args[:1]==('exec',) and args[1:2] in [('-d',),('-i',)]:args=('exec',args[1],'-e','MAGUS_LATENCY_TRACE=1',*args[2:])
             return super().docker(*args,**kwargs)
     infra=Infra(args.output);infra.runtime_profile='release';journey=None;status=1
-    infra.write_json('mounted-plan.json',{'cases':CASES,'ordinary_uid':1001,'manual_drains':False})
+    infra.write_json('mounted-plan.json',{'cases':cases,'ordinary_uid':1001,'manual_drains':False})
     try:
         infra.preflight();source=capture(infra);infra.setup(args.image);infra.isolate_service_control();verify_linux_image(infra,source)
-        journey=Journey(infra,args.image);journey.run();verify_linux_image(infra,source);status=0
+        journey=Journey(infra,args.image);journey.run(agents_only=args.agents_only);verify_linux_image(infra,source);status=0
     except InfrastructureUnavailable as error:infra.write_json('failure.json',{'classification':'blocked','reason':str(error)});status=2
     except Exception as error:infra.write_json('failure.json',{'classification':'failed','reason':str(error),'trace':traceback.format_exc()});print(traceback.format_exc(),flush=True)
     finally:
@@ -303,7 +307,7 @@ def main(argv=None):
             if journey:journey.cleanup()
             infra.cleanup()
         except Exception as error:infra.write_json('cleanup-failure.json',{'reason':str(error)});status=1
-        infra.write_json('result.json',{'status':status,'scope':'mounted continuation correctness','completed':journey.observations if journey else [],'not_run':[c for c in CASES if not journey or not any(r['case']==c for r in journey.observations)]})
+        infra.write_json('result.json',{'status':status,'scope':'actual two-agent practicality' if args.agents_only else 'mounted continuation correctness','completed':journey.observations if journey else [],'not_run':[c for c in cases if not journey or not any(r['case']==c for r in journey.observations)]})
     return status
 
 if __name__=='__main__':raise SystemExit(main())

@@ -267,21 +267,53 @@ pub(crate) fn subscribe(
 
 #[derive(Clone)]
 pub(crate) struct MountedPrepared {
+    apply_ready: bool,
     pub binding: SyncBinding,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub proof: Option<ContinuationProofV1>,
     pub credential_stamp: ObjectId,
     pub authority_generation: u64,
 }
+impl MountedPrepared {
+    /// The mounted adapter invokes this while holding its ordinary callback owner.
+    /// HTTP completed before that lock; current credentials and authority still CAS.
+    pub(crate) fn observe_authority(&mut self, rep: &Replica) -> Result<bool, FsError> {
+        let transport = Transport::new(self.binding.clone(), &rep.configuration()?)?;
+        if transport.credential_stamp()? != self.credential_stamp {
+            return Err(FsError::GenerationMismatch);
+        }
+        rep.observe_remote_authority(Some(&self.binding.view.revision), self.authority_generation)?;
+        self.authority_generation = rep.live_status()?.authority_generation;
+        #[cfg(feature = "test-faults")]
+        authority_adoption_barrier(rep)?;
+        Ok(self.apply_ready)
+    }
+}
 pub(crate) enum MountedIncoming {
+    #[cfg(any(target_os = "linux", test))]
+    Unchanged,
     Clean(Adoption),
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Continued(ContinuationOutcome),
 }
 impl Incoming {
     /// Snapshot ownership, release it for HTTP, then compare every local fence again.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn poll_mounted(
         &mut self,
+        apply: impl FnOnce(MountedPrepared) -> Result<MountedIncoming, FsError>,
+    ) -> Result<Option<MountedIncoming>, FsError> {
+        self.poll_mounted_inner(false, apply)
+    }
+    pub(crate) fn select_current_remote(
+        &mut self,
+        apply: impl FnOnce(MountedPrepared) -> Result<MountedIncoming, FsError>,
+    ) -> Result<Option<MountedIncoming>, FsError> {
+        self.poll_mounted_inner(true, apply)
+    }
+    fn poll_mounted_inner(
+        &mut self,
+        explicit_selection: bool,
         apply: impl FnOnce(MountedPrepared) -> Result<MountedIncoming, FsError>,
     ) -> Result<Option<MountedIncoming>, FsError> {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -417,22 +449,53 @@ impl Incoming {
                 source: next.source.clone(),
             },
         )?;
-        self.rep
-            .observe_remote_authority(Some(&next.view.revision), authority)?;
         install_sources(&self.rep, Some(next.clone()))?;
         self.credential = Some(credential.clone());
-        if !ready || next == binding {
-            return Ok(None);
-        }
+        let mut recovery = self.rep.incoming_recovery()?;
+        recovery.discovery_error = None;
+        self.rep.record_incoming_recovery(recovery)?;
         if transport.credential_stamp()? != credential {
             return Err(FsError::GenerationMismatch);
         }
         apply(MountedPrepared {
+            apply_ready: explicit_selection || (ready && next != binding),
             binding: next,
             proof,
             credential_stamp: credential,
-            authority_generation: self.rep.live_status()?.authority_generation,
+            authority_generation: authority,
         })
         .map(Some)
     }
+}
+
+#[cfg(feature = "test-faults")]
+fn authority_adoption_barrier(rep: &Replica) -> Result<(), FsError> {
+    use std::io::Write;
+    let Some(prefix) = std::env::var_os("MAGUS_TEST_AUTHORITY_BARRIER") else {
+        return Ok(());
+    };
+    let prefix = std::path::PathBuf::from(prefix);
+    if !prefix.with_extension("arm").exists() {
+        return Ok(());
+    }
+    let Ok(mut marker) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(prefix.with_extension("hit"))
+    else {
+        return Ok(());
+    };
+    let state = rep.scheduling_snapshot()?;
+    let live = rep.live_status()?;
+    writeln!(
+        marker,
+        "working_head={:?} working_generation={} epoch={} authority_generation={} applied={}",
+        state.head, state.generation, live.epoch, live.authority_generation, live.applied
+    )?;
+    marker.sync_all()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !prefix.with_extension("release").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
 }

@@ -165,6 +165,7 @@ pub struct PreparedContinuation {
     next: Working,
     foreign: bool,
     blocked: Option<String>,
+    blocked_entries: Vec<EntryId>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VisibilitySnapshot {
@@ -253,6 +254,7 @@ impl Core {
         capabilities: &CapabilitySnapshot,
         actor: &Actor,
         proof: Option<&ContinuationProofV1>,
+        blocker: &mut Option<(String, Vec<EntryId>)>,
     ) -> Result<(Working, bool), FsError> {
         self.continuation_fence(incoming, fence, capabilities)?;
         perm::authority(&self.config, actor)?;
@@ -310,6 +312,7 @@ impl Core {
                 &remote.tree,
                 capabilities,
                 actor,
+                blocker,
             )?
         };
         let mut next = working.clone();
@@ -337,8 +340,9 @@ impl Replica {
         let core = lock(&self.core)?;
         core.continuation_fence(binding, fence, capabilities)?;
         perm::authority(&core.config, &actor)?;
-        let (next, foreign, blocked) =
-            match core.prepare_own(binding, fence, capabilities, &actor, proof) {
+        let mut blocker = None;
+        let (next, foreign, mut blocked) =
+            match core.prepare_own(binding, fence, capabilities, &actor, proof, &mut blocker) {
                 Ok((next, foreign)) => (next, foreign, None),
                 Err(
                     error @ (FsError::CheckpointBlocked
@@ -347,7 +351,14 @@ impl Replica {
                 ) => (core.working()?.clone(), false, Some(error.code().into())),
                 Err(error) => return Err(error),
             };
+        let blocked_entries = if let Some((reason, entries)) = blocker {
+            blocked = Some(reason);
+            entries
+        } else {
+            Vec::new()
+        };
         Ok(PreparedContinuation {
+            blocked_entries,
             binding: binding.clone(),
             fence: fence.clone(),
             capabilities: capabilities.clone(),
@@ -384,13 +395,7 @@ impl Replica {
             let status = LocalWorkRecovery {
                 operation: operation.clone(),
                 reason: reason.clone(),
-                entries: core
-                    .working()?
-                    .tree
-                    .entries
-                    .iter()
-                    .map(|e| e.id.clone())
-                    .collect(),
+                entries: prepared.blocked_entries.clone(),
                 actions: vec![
                     "inspect/export currently readable local work".into(),
                     "close blocking capabilities".into(),
@@ -422,6 +427,7 @@ impl Replica {
             capabilities,
             &prepared.actor,
             prepared.proof.as_ref(),
+            &mut None,
         )?;
         if foreign != prepared.foreign {
             return Err(FsError::GenerationMismatch);
@@ -503,10 +509,19 @@ impl Core {
         remote: &Tree,
         capabilities: &CapabilitySnapshot,
         actor: &Actor,
+        blocker: &mut Option<(String, Vec<EntryId>)>,
     ) -> Result<Tree, FsError> {
         use std::collections::BTreeMap;
+        let mut blocked = |reason: &str, entries: Vec<EntryId>, error| {
+            *blocker = Some((reason.into(), entries));
+            error
+        };
         if base.root != local.root || base.root != remote.root {
-            return Err(FsError::CheckpointBlocked);
+            return Err(blocked(
+                "unsupported_root_change",
+                vec![base.root.id.clone()],
+                FsError::CheckpointBlocked,
+            ));
         }
         let index = |tree: &Tree| {
             tree.entries
@@ -528,12 +543,25 @@ impl Core {
             .filter(|id| before.get(*id) != current.get(*id))
             .cloned()
             .collect();
-        if !capabilities.complete
-            || foreign
-                .iter()
-                .any(|id| capabilities.pinned.contains(id) || self.pinned_entry_ids().contains(id))
-        {
-            return Err(FsError::MappingBlocked);
+        if !capabilities.complete {
+            return Err(blocked(
+                "capability_accounting_unavailable",
+                vec![],
+                FsError::MappingBlocked,
+            ));
+        }
+        let core_pins = self.pinned_entry_ids();
+        let pins: Vec<_> = foreign
+            .iter()
+            .filter(|id| capabilities.pinned.contains(*id) || core_pins.contains(*id))
+            .cloned()
+            .collect();
+        if !pins.is_empty() {
+            return Err(blocked(
+                "affected_capability_pinned",
+                pins,
+                FsError::MappingBlocked,
+            ));
         }
         for id in &foreign {
             if before
@@ -542,26 +570,46 @@ impl Core {
                 .chain(current.get(id))
                 .any(|e| !matches!(e.content, EntryContent::File { .. }))
             {
-                return Err(FsError::CheckpointBlocked);
+                return Err(blocked(
+                    "unsupported_structure",
+                    vec![id.clone()],
+                    FsError::CheckpointBlocked,
+                ));
             }
         }
         for id in &changed {
             let old = before.get(id);
             let new = after.get(id);
             if old != current.get(id) {
-                return Err(FsError::CheckpointBlocked);
+                return Err(blocked(
+                    "conflicting_identity",
+                    vec![id.clone()],
+                    FsError::CheckpointBlocked,
+                ));
             }
             if old.is_none() && self.remote_entries.contains(id) {
-                return Err(FsError::PermissionDenied);
+                return Err(blocked(
+                    "current_authority_denied",
+                    vec![id.clone()],
+                    FsError::PermissionDenied,
+                ));
             }
             if let (Some(old), Some(new)) = (old, new) {
                 if old.owner != new.owner || old.group != new.group || old.mode != new.mode {
-                    return Err(FsError::CheckpointBlocked);
+                    return Err(blocked(
+                        "unsupported_metadata_change",
+                        vec![id.clone()],
+                        FsError::CheckpointBlocked,
+                    ));
                 }
             }
             for entry in old.into_iter().chain(new) {
                 if !matches!(entry.content, EntryContent::File { .. }) {
-                    return Err(FsError::CheckpointBlocked);
+                    return Err(blocked(
+                        "unsupported_structure",
+                        vec![id.clone()],
+                        FsError::CheckpointBlocked,
+                    ));
                 }
                 let occupancy = |tree: &Tree| {
                     tree.entries
@@ -570,7 +618,16 @@ impl Core {
                         .map(|e| e.id.clone())
                 };
                 if occupancy(base) != occupancy(remote) {
-                    return Err(FsError::CheckpointBlocked);
+                    return Err(blocked(
+                        "conflicting_name_slot",
+                        std::iter::once(id.clone())
+                            .chain(occupancy(base))
+                            .chain(occupancy(remote))
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect(),
+                        FsError::CheckpointBlocked,
+                    ));
                 }
                 let mut parent = &entry.parent;
                 let mut seen = BTreeSet::new();
@@ -578,12 +635,22 @@ impl Core {
                     if !seen.insert(parent) {
                         return Err(FsError::InvalidTree);
                     }
-                    let ancestor = before.get(parent).ok_or(FsError::CheckpointBlocked)?;
+                    let ancestor = before.get(parent).ok_or_else(|| {
+                        blocked(
+                            "conflicting_ancestor",
+                            vec![parent.clone()],
+                            FsError::CheckpointBlocked,
+                        )
+                    })?;
                     if after.get(parent) != Some(ancestor)
                         || current.get(parent) != Some(ancestor)
                         || ancestor.content != EntryContent::Directory
                     {
-                        return Err(FsError::CheckpointBlocked);
+                        return Err(blocked(
+                            "conflicting_ancestor",
+                            vec![parent.clone()],
+                            FsError::CheckpointBlocked,
+                        ));
                     }
                     parent = &ancestor.parent;
                 }
@@ -811,9 +878,9 @@ impl Replica {
                 pinned: BTreeSet::new(),
             },
         )?;
-        let mut recovery = core
-            .recoveries()?
-            .into_iter()
+        let mut recoveries = core.recoveries()?;
+        let recovery = recoveries
+            .iter()
             .find(|r| r.status.operation == *operation)
             .ok_or(FsError::NotFound)?;
         if recovery.selected_remote {
@@ -849,8 +916,22 @@ impl Replica {
         let mut entries = old.tree.entries.clone();
         entries.extend(next.tree.entries.clone());
         entries.push(perm::root_entry(&next.tree));
-        recovery.selected_remote = true;
+        if let Some(previous) = core.current_visibility()? {
+            entries.extend(previous.entries);
+        }
         let snapshot = json(&(&old, fence, binding, &recovery.proof))?;
+        // Replacing active Working settles its retained alternatives, not their snapshots.
+        for recovery in &mut recoveries {
+            if recovery.binding.id == fence.binding.id
+                && recovery.binding.branch == fence.binding.branch
+                && recovery.binding.publication == fence.binding.publication
+                && recovery.binding.transport_identity == fence.binding.transport_identity
+                && recovery.binding.transport_profile == fence.binding.transport_profile
+                && recovery.working.generation <= old.generation
+            {
+                recovery.selected_remote = true;
+            }
+        }
         let snapshot_id = OperationId::random()?;
         core.journal.guard()?;
         crate::faults::hit("recovery-before-commit")?;
@@ -862,10 +943,12 @@ impl Replica {
             "INSERT INTO continuation_records VALUES(?,?)",
             params![snapshot_id.as_str(), snapshot],
         )?;
-        tx.execute(
-            "UPDATE local_work_recovery SET record=? WHERE operation=?",
-            params![json(&recovery)?, operation.as_str()],
-        )?;
+        for recovery in &recoveries {
+            tx.execute(
+                "UPDATE local_work_recovery SET record=? WHERE operation=?",
+                params![json(recovery)?, recovery.status.operation.as_str()],
+            )?;
+        }
         tx.execute(
             "UPDATE sync_binding SET value=? WHERE singleton=1",
             [json(binding)?],

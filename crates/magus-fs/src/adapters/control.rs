@@ -152,8 +152,28 @@ pub(crate) struct Server {
     path: PathBuf,
     identity: (u64, u64),
 }
+pub(crate) type LocalWorkSelection = Arc<
+    dyn Fn(&Replica, Actor, &BTreeMap<String, String>) -> crate::cli::Result<Value> + Send + Sync,
+>;
 impl Server {
     pub fn start(rep: Replica, state: &Path, read_only: bool) -> Result<Self, FsError> {
+        Self::start_inner(rep, state, read_only, None)
+    }
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn start_with_local_work_owner(
+        rep: Replica,
+        state: &Path,
+        read_only: bool,
+        selection: LocalWorkSelection,
+    ) -> Result<Self, FsError> {
+        Self::start_inner(rep, state, read_only, Some(selection))
+    }
+    fn start_inner(
+        rep: Replica,
+        state: &Path,
+        read_only: bool,
+        selection: Option<LocalWorkSelection>,
+    ) -> Result<Self, FsError> {
         directory(state)?;
         rep.configuration()?;
         let path = state.join("control.sock");
@@ -256,6 +276,11 @@ impl Server {
                             let actor = rep
                                 .actor_for_uid(unsafe { libc::geteuid() })
                                 .map_err(|e| (1, e))?;
+                            if request.command == "sync-local-work-use-remote" {
+                                if let Some(selection) = &selection {
+                                    return selection(&rep, actor, &request.options);
+                                }
+                            }
                             crate::cli::control(&rep, actor, &request.command, &request.options)
                         })();
                         let response = match result {

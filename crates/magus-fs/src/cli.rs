@@ -864,40 +864,52 @@ fn local_work_control(
             .map_err(|e| (1, e))?;
             Ok(json!({"ok":true}))
         }
-        "sync-local-work-use-remote" => {
-            let operation =
-                OperationId::parse(required(options, "operation-id")?).map_err(|e| (2, e))?;
-            let expected: u64 = required(options, "expected-generation")?
-                .parse()
-                .map_err(|_| (2, FsError::InvalidDescriptor))?;
-            let mut incoming = crate::sync::Incoming::new(rep).map_err(|e| (1, e))?;
-            let outcome = incoming
-                .poll_mounted(|prepared| {
-                    let snapshot = rep.scheduling_snapshot()?;
-                    if snapshot.generation != expected {
-                        return Err(FsError::GenerationMismatch);
-                    }
-                    let binding = rep.sync_status()?.binding.ok_or(FsError::ConfigMismatch)?;
-                    let fence = ContinuationFence {
-                        generation: expected,
-                        head: snapshot.head.ok_or(FsError::BaseMismatch)?,
-                        binding,
-                        authority_generation: prepared.authority_generation,
-                        credential_stamp: prepared.credential_stamp,
-                        capability_generation: 0,
-                    };
-                    rep.use_current_remote(&operation, &prepared.binding, &fence, actor)
-                        .map(crate::sync::MountedIncoming::Clean)
-                })
-                .map_err(|e| (1, e))?;
-            match outcome {
-                Some(crate::sync::MountedIncoming::Clean(adoption)) => {
-                    Ok(json!({"ok":true,"adoption":adoption}))
-                }
-                _ => Err((1, FsError::CheckpointBlocked)),
-            }
-        }
+        "sync-local-work-use-remote" => local_work_selection(rep, actor, options, |apply| apply()),
         _ => Err((2, FsError::InvalidPath)),
+    }
+}
+
+/// Discovery stays outside adapter ownership; only the fenced replacement is serialized.
+pub(crate) fn local_work_selection(
+    rep: &Replica,
+    actor: Actor,
+    options: &BTreeMap<String, String>,
+    serialize: impl FnOnce(
+        &mut dyn FnMut() -> std::result::Result<Adoption, FsError>,
+    ) -> std::result::Result<Adoption, FsError>,
+) -> Result<Value> {
+    let operation = OperationId::parse(required(options, "operation-id")?).map_err(|e| (2, e))?;
+    let expected: u64 = required(options, "expected-generation")?
+        .parse()
+        .map_err(|_| (2, FsError::InvalidDescriptor))?;
+    let mut incoming = crate::sync::Incoming::new(rep).map_err(|e| (1, e))?;
+    let outcome = incoming
+        .select_current_remote(|mut prepared| {
+            serialize(&mut || {
+                prepared.observe_authority(rep)?;
+                let snapshot = rep.scheduling_snapshot()?;
+                if snapshot.generation != expected {
+                    return Err(FsError::GenerationMismatch);
+                }
+                let binding = rep.sync_status()?.binding.ok_or(FsError::ConfigMismatch)?;
+                let fence = ContinuationFence {
+                    generation: expected,
+                    head: snapshot.head.ok_or(FsError::BaseMismatch)?,
+                    binding,
+                    authority_generation: prepared.authority_generation,
+                    credential_stamp: prepared.credential_stamp.clone(),
+                    capability_generation: 0,
+                };
+                rep.use_current_remote(&operation, &prepared.binding, &fence, actor.clone())
+            })
+            .map(crate::sync::MountedIncoming::Clean)
+        })
+        .map_err(|e| (1, e))?;
+    match outcome {
+        Some(crate::sync::MountedIncoming::Clean(adoption)) => {
+            Ok(json!({"ok":true,"adoption":adoption}))
+        }
+        _ => Err((1, FsError::CheckpointBlocked)),
     }
 }
 

@@ -262,3 +262,14 @@ client has its own mounted evidence. The earlier failed cache comparison remains
 unchanged. Full-walk/visibility follow-on work requires its separate reviewed
 plan; no affected-set acknowledgement, permission shortcut or early Applied was
 introduced here.
+
+
+Task 3 correction evidence subsequently reproduced the atomic-read EACCES in
+LOOKUP between current-authority observation and Working adoption. Mounted
+observation and adoption now share callback ownership; explicit recovery also
+updates the adapter epoch under that ownership. A one-shot actual read queued
+until adoption and returned correct bytes, and the focused overlap/recovery
+case passed. Two actual ordinary agents then completed atomic and in-place saves
+on separate mounts with matching Applied heads and fresh reads. The original
+fixed36 failure remains unchanged; these focused checks do not establish a new
+latency distribution or authorize the 800-save cohorts.

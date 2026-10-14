@@ -269,6 +269,38 @@ struct Adapter {
     read_only: bool,
 }
 impl Adapter {
+    fn with_read_diagnostic<T>(
+        &self,
+        callback: &str,
+        ino: INodeNo,
+        f: impl FnOnce(&mut State) -> Result<T>,
+    ) -> std::result::Result<T, Errno> {
+        #[cfg(feature = "test-faults")]
+        if std::env::var_os("MAGUS_TEST_AUTHORITY_BARRIER").is_some() {
+            eprintln!(
+                "test_read_callback_wait callback={} inode={}",
+                callback, ino.0
+            );
+        }
+        let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
+        #[cfg(feature = "test-faults")]
+        if std::env::var_os("MAGUS_TEST_AUTHORITY_BARRIER").is_some() {
+            eprintln!(
+                "test_read_callback_acquired callback={} inode={} adapter_epoch={}",
+                callback, ino.0, state.epoch
+            );
+        }
+        let result = f(&mut state);
+        #[cfg(feature = "test-faults")]
+        if std::env::var_os("MAGUS_TEST_AUTHORITY_BARRIER").is_some() {
+            if let Err(error) = &result {
+                eprintln!("test_read_callback callback={} inode={} identity={:?} adapter_epoch={} error={}", callback, ino.0, state.identity(ino), state.epoch, error.code());
+            }
+        }
+        #[cfg(not(feature = "test-faults"))]
+        let _ = (callback, ino);
+        result.map_err(errno)
+    }
     fn with<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> std::result::Result<T, Errno> {
         let mut state = self.state.lock().map_err(|_| Errno::EIO)?;
         f(&mut state).map_err(errno)
@@ -303,7 +335,7 @@ impl Filesystem for Adapter {
         Ok(())
     }
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        match self.with(|s| {
+        match self.with_read_diagnostic("lookup", parent, |s| {
             let path = s.child(req, parent, name)?;
             let e = s.ws(req)?.lookup(&path)?;
             s.attr(req, &e)
@@ -317,7 +349,7 @@ impl Filesystem for Adapter {
         }
     }
     fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.with(|s| {
+        match self.with_read_diagnostic("getattr", ino, |s| {
             let (e, _) = s.metadata_target(req, ino, fh)?;
             let mut attr = s.attr(req, &e)?;
             attr.ino = ino;
@@ -328,7 +360,7 @@ impl Filesystem for Adapter {
         }
     }
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        match self.with(|s| {
+        match self.with_read_diagnostic("open", ino, |s| {
             // LOOKUP and OPEN are separate kernel requests. An adopted file epoch
             // invalidates this inode, not the stable pathname. ESTALE lets VFS
             // repeat lookup; never bind a new handle to an old inode's epoch.
@@ -345,7 +377,7 @@ impl Filesystem for Adapter {
     fn read(
         &self,
         req: &Request,
-        _: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         size: u32,
@@ -353,7 +385,7 @@ impl Filesystem for Adapter {
         _: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        match self.with(|s| {
+        match self.with_read_diagnostic("read", ino, |s| {
             let f = s.held(req, fh)?;
             if f.access == libc::O_WRONLY {
                 return Err(FsError::PermissionDenied);
@@ -771,7 +803,20 @@ pub fn mount(
         read_only,
     };
     let replica_id = rep.configuration()?.replica;
-    let _control = super::control::Server::start(rep.clone(), state, read_only)?;
+    let control_state = adapter.state.clone();
+    let _control = super::control::Server::start_with_local_work_owner(
+        rep.clone(),
+        state,
+        read_only,
+        Arc::new(move |rep, actor, options| {
+            crate::cli::local_work_selection(rep, actor, options, |apply| {
+                let mut state = control_state.lock().map_err(|_| FsError::ReplicaBusy)?;
+                let adoption = apply()?;
+                state.epoch = adoption.epoch;
+                Ok(adoption)
+            })
+        }),
+    )?;
     std::fs::create_dir(mountpoint)?;
     rep.check_content_path(mountpoint)?;
     let mut cfg = Config::default();
@@ -889,8 +934,11 @@ pub fn mount(
             while !stop.load(Ordering::Relaxed) {
                 let observed = incoming_wakeup.epoch();
                 let result = if mounted_policy {
-                    incoming.poll_mounted(|prepared| {
+                    incoming.poll_mounted(|mut prepared| {
                         let mut state = live_state.lock().map_err(|_| FsError::ReplicaBusy)?;
+                        if !prepared.observe_authority(&rep)? {
+                            return Ok(crate::sync::MountedIncoming::Unchanged);
+                        }
                         let actor = crate::sync::publication_actor(
                             &rep,
                             Actor::new(state.config.authorities[0].principal.clone()),
@@ -953,7 +1001,7 @@ pub fn mount(
                         pending = None;
                         eprintln!("mounted_continuation outcome={outcome:?}");
                     }
-                    Ok(None) => {}
+                    Ok(None | Some(crate::sync::MountedIncoming::Unchanged)) => {}
                     Err(error) => eprintln!("live_discovery_error code={}", error.code()),
                 }
                 if mounted_policy {

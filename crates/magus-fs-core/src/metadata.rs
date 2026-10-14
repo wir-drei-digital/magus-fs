@@ -101,6 +101,11 @@ impl<'a> MetadataContext<'a> {
                 if self.core.remote_entries.contains(&entry.id)
                     || self.base()?.tree.entries.iter().any(|e| e.id == entry.id)
                 {
+                    #[cfg(feature = "test-faults")]
+                    if std::env::var_os("MAGUS_TEST_AUTHORITY_BARRIER").is_some() {
+                        let working = self.core.working()?;
+                        eprintln!("test_authority_absent entry={} authority={:?} authority_generation={} working_head={} working_generation={} working_epoch={} bits={}", entry.id.as_str(), self.authority_revision, self._authority_generation, working.head.as_str(), working.generation, working.epoch, bits);
+                    }
                     return Err(FsError::PermissionDenied);
                 }
                 // Every local ancestor still reaches the nearest freshly verified remote parent.

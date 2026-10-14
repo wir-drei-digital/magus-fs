@@ -426,15 +426,97 @@ fn same_identity_or_slot_overlap_retains_conflict() {
     assert_eq!(w.lookup("target").unwrap().id, replacement_id);
     assert_eq!(w.read(&temporary, 0, 20).unwrap(), b"replacement");
     assert_eq!(rep.local_work_recovery().unwrap()[0].operation, recovery);
+    assert_eq!(
+        rep.local_work_recovery().unwrap()[0].reason,
+        "conflicting_identity"
+    );
+    assert_eq!(
+        rep.local_work_recovery().unwrap()[0].entries,
+        vec![remote.tree.entries[0].id.clone()]
+    );
     let export = d.path().join("export");
     rep.export_local_work(&recovery, &export, actor()).unwrap();
     assert_eq!(
         std::fs::read(export.join("target")).unwrap(),
         b"replacement"
     );
-    let adoption = rep
-        .use_current_remote(&recovery, &next, &fence, actor())
+    // A second generation of the same conflict retains another alternative.
+    let frozen = rep.sync_status().unwrap().submissions;
+    w.write(&temporary, 0, b"replacement-two").unwrap();
+    let fence = ContinuationFence {
+        generation: w.generation().unwrap(),
+        ..fence
+    };
+    let prepared = rep
+        .prepare_continuation(&next, Some(&proof), &fence, &capabilities, actor())
         .unwrap();
+    let ContinuationOutcome::Blocked { recovery: newest } = rep
+        .commit_continuation(prepared, &fence, &capabilities)
+        .unwrap()
+    else {
+        panic!("second conflict")
+    };
+    assert_ne!(newest, recovery);
+    let adoption = rep
+        .use_current_remote(&newest, &next, &fence, actor())
+        .unwrap();
+    assert_eq!(rep.sync_status().unwrap().submissions, frozen);
+    assert!(matches!(
+        rep.checkpoint_readiness().unwrap(),
+        CheckpointReadiness::Waiting { .. }
+    ));
+    assert_eq!(rep.local_work_recovery().unwrap().len(), 2);
+    rep.export_local_work(&recovery, &d.path().join("old-export"), actor())
+        .unwrap();
+    rep.export_local_work(&newest, &d.path().join("new-export"), actor())
+        .unwrap();
+    assert_eq!(
+        std::fs::read(d.path().join("old-export/target")).unwrap(),
+        b"replacement"
+    );
+    assert_eq!(
+        std::fs::read(d.path().join("new-export/target")).unwrap(),
+        b"replacement-two"
+    );
+    // An intermediate name must survive another explicit selection and reopen.
+    let local = w.create("intermediate-name", 0o600).unwrap();
+    drop(local);
+    w.rename("intermediate-name", "later-name").unwrap();
+    let stale_visibility = rep.pending_visibility().unwrap().unwrap();
+    rep.observe_remote_authority(None, rep.live_status().unwrap().authority_generation)
+        .unwrap();
+    rep.observe_remote_authority(
+        Some(&next.view.revision),
+        rep.live_status().unwrap().authority_generation,
+    )
+    .unwrap();
+    let denied = rep
+        .local_work_recovery()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.reason == "current authority denied")
+        .unwrap();
+    let fresh = ContinuationFence {
+        generation: w.generation().unwrap(),
+        head: next.view.revision.clone(),
+        binding: next.clone(),
+        authority_generation: rep.live_status().unwrap().authority_generation,
+        ..fence
+    };
+    rep.use_current_remote(&denied.operation, &next, &fresh, actor())
+        .unwrap();
+    err(
+        rep.complete_visibility(&stale_visibility, &capabilities),
+        "generation_mismatch",
+    );
+    assert!(rep
+        .pending_visibility()
+        .unwrap()
+        .unwrap()
+        .entries
+        .iter()
+        .any(|e| e.path == "intermediate-name"));
+
     assert!(!rep.live_status().unwrap().applied);
     assert_ne!(adoption.epoch, old_epoch);
     assert_ne!(w.lookup("target").unwrap().id, replacement_id);
@@ -447,6 +529,25 @@ fn same_identity_or_slot_overlap_retains_conflict() {
         rep.checkpoint_readiness().unwrap(),
         CheckpointReadiness::Waiting { .. }
     ));
+    let visibility = rep.pending_visibility().unwrap().unwrap();
+    assert!(visibility
+        .entries
+        .iter()
+        .any(|e| e.path == "intermediate-name"));
+    rep.complete_visibility(&visibility, &capabilities).unwrap();
+    assert_eq!(
+        rep.checkpoint_readiness().unwrap(),
+        CheckpointReadiness::Ready
+    );
+    let resumed = rep.begin_live(&next.view.revision, actor(), false).unwrap();
+    drop(resumed.create("new-edit", 0o600).unwrap());
+    resumed
+        .checkpoint(
+            &OperationId::random().unwrap(),
+            resumed.generation().unwrap(),
+            attr(),
+        )
+        .unwrap();
     let gc = rep.prune(true).unwrap();
     assert!(!gc
         .evictable
@@ -810,7 +911,11 @@ fn core_handles_and_unknown_accounting_block_foreign_affected_entries() {
     ));
     assert_eq!(
         rep.local_work_recovery().unwrap()[0].reason,
-        "mapping_blocked"
+        "affected_capability_pinned"
+    );
+    assert_eq!(
+        rep.local_work_recovery().unwrap()[0].entries,
+        vec![remote.tree.entries[0].id.clone()]
     );
     drop(foreign);
     caps.complete = false;
@@ -821,6 +926,16 @@ fn core_handles_and_unknown_accounting_block_foreign_affected_entries() {
         rep.commit_continuation(p, &fence, &caps).unwrap(),
         ContinuationOutcome::Blocked { .. }
     ));
+    let accounting = rep
+        .local_work_recovery()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.reason == "capability_accounting_unavailable")
+        .expect("unknown accounting must be explicit");
+    assert!(
+        accounting.entries.is_empty(),
+        "unknown pins must not invent blocking identities"
+    );
     caps.complete = true;
     let p = rep
         .prepare_continuation(&next, Some(&proof), &fence, &caps, actor())
