@@ -186,19 +186,6 @@ impl Replica {
         binding: Option<SyncBinding>,
     ) -> Result<Adoption, FsError> {
         let mut core = lock(&self.core)?;
-        core.clean_certificate = None;
-        core.adopt_clean(revision, expected_generation, actor, binding)
-    }
-}
-impl crate::engine::Core {
-    pub(crate) fn adopt_clean(
-        &mut self,
-        revision: &RevisionId,
-        expected_generation: u64,
-        actor: Actor,
-        binding: Option<SyncBinding>,
-    ) -> Result<Adoption, FsError> {
-        let core = self;
         perm::authority(&core.config, &actor)?;
         let old = core.working()?.clone();
         if old.generation != expected_generation {
@@ -319,22 +306,9 @@ impl crate::engine::Core {
             entries,
         })
     }
-}
-impl Replica {
     /// Only the native adapter calls this after notifier success and lookup verification.
     pub fn acknowledge_adoption(&self, revision: &RevisionId, epoch: u64) -> Result<(), FsError> {
         let mut core = lock(&self.core)?;
-        core.clean_certificate = None;
-        core.acknowledge_clean(revision, epoch)
-    }
-}
-impl crate::engine::Core {
-    pub(crate) fn acknowledge_clean(
-        &mut self,
-        revision: &RevisionId,
-        epoch: u64,
-    ) -> Result<(), FsError> {
-        let core = self;
         let mut next = core.working()?.clone();
         if next.head != *revision || next.epoch != epoch || next.dirty {
             return Err(FsError::GenerationMismatch);

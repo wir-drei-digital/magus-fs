@@ -79,7 +79,6 @@ pub(crate) struct Working {
     pub(crate) orphans: Vec<Entry>,
 }
 pub(crate) struct Core {
-    pub(crate) clean_certificate: Option<CleanCertificate>,
     pub(crate) metadata_descriptors:
         std::cell::RefCell<crate::metadata_descriptor::DescriptorCache>,
     pub(crate) metadata_profiler:
@@ -670,7 +669,6 @@ impl Replica {
             }
         }
         let mut core = Core {
-            clean_certificate: None,
             metadata_descriptors: std::cell::RefCell::new(
                 crate::metadata_descriptor::DescriptorCache::new(),
             ),

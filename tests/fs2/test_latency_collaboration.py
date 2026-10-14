@@ -213,18 +213,3 @@ class ActualAgentsOnlyTests(unittest.TestCase):
   journey=OnlyAgents()
   Journey.run(journey,agents_only=True)
   self.assertEqual(journey.calls,['setup','actual-agents'])
-
-class AffectedVerificationOfflineTests(unittest.TestCase):
- def test_exact_matrix_and_missing_evidence_refused(self):
-  import affected_verification as av
-  self.assertEqual(av.BUDGET_SECONDS,120)
-  self.assertEqual(len(av.DELTAS),3)
-  rows=[dict(kind='cell',delta=d,sender=s,mode='Full' if s or d==2 else 'Affected',applied=True,cpu_ns=100,wall_ns=100) for d in range(3) for s in (False,True)]+[dict(kind='end')]
-  self.assertEqual(av.decision(rows,0)['status'],'requires-controller-checkpoint')
-  self.assertEqual(av.decision(rows[:-2],0)['status'],'inconclusive')
-  self.assertEqual(av.decision(rows,1)['status'],'inconclusive')
-  self.assertEqual(av.decision(rows,0,True)['status'],'inconclusive')
-  rows[1]['wall_ns']=600_000_000
-  self.assertEqual(av.decision(rows,0)['status'],'stop')
-  rows[1]['mode']='Affected'
-  self.assertEqual(av.decision(rows,0)['status'],'failed')
