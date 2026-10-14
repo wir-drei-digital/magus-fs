@@ -16,6 +16,9 @@ pub struct MetadataProfile {
     pub revision_load_count: u64,
     pub copy_count: u64,
     pub decoded_bytes: u64,
+    pub descriptor_hits: u64,
+    pub descriptor_misses: u64,
+    pub raw_bytes: u64,
     pub cpu_inclusive_ns: BTreeMap<String, Option<u64>>,
     pub cpu_exclusive_ns: BTreeMap<String, Option<u64>>,
     pub ambiguous: bool,
@@ -203,6 +206,9 @@ pub(crate) fn count(kind: &str, n: u64) {
                 "revision_load" => w.revision_load_count += n,
                 "copy" => w.copy_count += n,
                 "bytes" => w.decoded_bytes += n,
+                "descriptor_hit" => w.descriptor_hits += n,
+                "descriptor_miss" => w.descriptor_misses += n,
+                "raw_bytes" => w.raw_bytes += n,
                 _ => {}
             }
         }

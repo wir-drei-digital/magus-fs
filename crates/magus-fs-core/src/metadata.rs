@@ -1,15 +1,15 @@
 //! Metadata authority lives for one continuously locked public operation only.
 use crate::{engine::Core, permissions as perm, *};
 use rusqlite::OptionalExtension;
-use std::{borrow::Cow, cell::OnceCell};
+use std::{borrow::Cow, cell::OnceCell, sync::Arc};
 pub(crate) struct MetadataContext<'a> {
     core: &'a Core,
     actor: &'a Authority,
     view: Option<&'a Revision>,
     pub(crate) tree: &'a Tree,
-    authority: Option<Revision>,
+    authority: Option<Arc<Revision>>,
     authority_revision: Option<RevisionId>,
-    base: OnceCell<Revision>,
+    base: OnceCell<Arc<Revision>>,
     // The Core borrow keeps this observed generation and descriptor indivisible.
     _authority_generation: u64,
 }
@@ -45,7 +45,7 @@ impl<'a> MetadataContext<'a> {
                 .map(|id| {
                     crate::metadata_profile::count("authority_load", 1);
                     let id = RevisionId::parse(id)?;
-                    let revision = core.revision(&id)?;
+                    let revision = crate::metadata_descriptor::load(core, &id)?;
                     Ok::<_, FsError>((id, revision))
                 })
                 .transpose()?
@@ -84,7 +84,7 @@ impl<'a> MetadataContext<'a> {
                 .expect("verified authority revision is present"));
         }
         if self.base.get().is_none() {
-            let r = self.core.revision(&self.core.working()?.base)?;
+            let r = crate::metadata_descriptor::load(self.core, &self.core.working()?.base)?;
             let _ = self.base.set(r);
         }
         Ok(self

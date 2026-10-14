@@ -57,3 +57,5 @@ mod metadata;
 
 pub mod continuation_protocol;
 pub use continuation_protocol::*;
+
+mod metadata_descriptor;

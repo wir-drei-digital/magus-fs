@@ -79,6 +79,8 @@ pub(crate) struct Working {
     pub(crate) orphans: Vec<Entry>,
 }
 pub(crate) struct Core {
+    pub(crate) metadata_descriptors:
+        std::cell::RefCell<crate::metadata_descriptor::DescriptorCache>,
     pub(crate) metadata_profiler:
         std::sync::OnceLock<Arc<Mutex<crate::metadata_profile::Profiler>>>,
     pub(crate) journal: Journal,
@@ -166,16 +168,19 @@ impl Core {
     pub(crate) fn revision(&self, id: &RevisionId) -> Result<Revision, FsError> {
         let _span = crate::metadata_profile::Span::begin("revision_load");
         crate::metadata_profile::count("revision_load", 1);
-        let bytes = self
-            .journal
-            .db
-            .query_row(
-                "SELECT descriptor FROM revisions WHERE id=?",
-                [id.as_str()],
-                |r| r.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-            .ok_or(FsError::NotFound)?;
+        let bytes = {
+            let _select = crate::metadata_profile::Span::begin("descriptor_select");
+            self.journal
+                .db
+                .query_row(
+                    "SELECT descriptor FROM revisions WHERE id=?",
+                    [id.as_str()],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .optional()?
+                .ok_or(FsError::NotFound)?
+        };
+        crate::metadata_profile::count("raw_bytes", bytes.len() as u64);
         let r = decode_revision(&bytes)?;
         if revision_id(&r)? != *id {
             return Err(FsError::CorruptObject);
@@ -640,6 +645,9 @@ impl Replica {
             }
         }
         let mut core = Core {
+            metadata_descriptors: std::cell::RefCell::new(
+                crate::metadata_descriptor::DescriptorCache::new(),
+            ),
             metadata_profiler: std::sync::OnceLock::new(),
             journal,
             objects,

@@ -4,7 +4,8 @@ def profile_matrix():
 def validate_passive_capture(row):
  assert not row["status_polls"]
  assert row["exact_shared_ns"]>=row["save_started_ns"] and row["exact_applied_ns"]>=row["save_started_ns"]
- post=row["post_applied_read"];assert post and post["fresh_after_applied_ns"]>=max(row["exact_shared_ns"],row["exact_applied_ns"])
+ post=row["post_applied_read"];assert post and post["read_started_ns"]>=max(row["exact_shared_ns"],row["exact_applied_ns"])
+ assert post["fresh_after_applied_ns"]>=post["read_started_ns"]
  assert post["uid"]==1001 and post["bytes"]==row["size"] and post["sha256"]==row["sha256"]
  return True
 
@@ -36,18 +37,20 @@ def main():
  from provenance import capture,verify_linux_image
  from service_protocol import identity,file_entry,GROUP,REPLICA,WORKER
  from service_storage import NS,ALICE
- args=argparse.ArgumentParser();args.add_argument('--mode',choices=['profile','service'],required=True);args.add_argument('--image',required=True);args.add_argument('--output',required=True);a=args.parse_args()
+ args=argparse.ArgumentParser();args.add_argument('--mode',choices=['profile','service','metadata-reuse'],required=True);args.add_argument('--image',required=True);args.add_argument('--output',required=True);a=args.parse_args()
  assert a.image.startswith('sha256:') and len(a.image)==71,'immutable image required'
  if a.mode=='service':
   from continuation_proof import main as service_main
   return service_main(['--image',a.image,'--output',a.output])
+ from metadata_reuse import mounted_matrix
+ matrix=mounted_matrix() if a.mode=='metadata-reuse' else profile_matrix()
  class TraceInfra(OwnedInfra):
   def create(self,kind,suffix,args):return super().create(kind,suffix,acceptance_s3_capacity('acceptance',kind,suffix,args))
   def docker(self,*args,**kw):
    return super().docker(*profile_docker_args(args),**kw)
  i=TraceInfra(a.output);i.runtime_profile='release';j=None;endpoints=[];rows=[];phase='preflight';code=1
  (i.output/'driver.py').write_bytes(Path(__file__).read_bytes())
- i.write_json('diagnostic-plan.json',{'matrix':profile_matrix(),'bounds':{'observation_seconds':25,'settle_seconds':60},'qualification':False,'controls':'same daemon, counters switched outside timed saves'})
+ i.write_json('diagnostic-plan.json',{'matrix':matrix,'bounds':{'observation_seconds':25,'settle_seconds':60},'qualification':False,'controls':'same daemon, counters switched outside timed saves'})
  def logread(e,n,offset=0,marker=None):
   return e.execute("import json,sys,time,os;s=json.load(sys.stdin)\nwith open('/private/'+s['name']+'/daemon.log','rb') as f:f.seek(s['offset']);text=f.read().decode(errors='replace')\nr={'guest_ns':time.monotonic_ns(),'log':text}\nif s.get('marker') and os.path.exists(s['marker']+'-result'):r['ordinary_observer']=json.load(open(s['marker']+'-result'))\nprint(json.dumps(r))",{'name':n,'offset':offset,'marker':marker})
  def events(log,owner):
@@ -86,7 +89,7 @@ def main():
    e=DiskLazy(j,'profile-'+n);endpoints.append((n,e));e.start(n,actor=actor)
    assert any(line.startswith('metadata_profile ') for line in logread(e,n)['log'].splitlines()),'startup metadata profile opt-in absent'
   background=0
-  for number,spec in enumerate(profile_matrix()):
+  for number,spec in enumerate(matrix):
    phase='sample-'+str(number);size=spec['size']
    if spec['background']!=background:
     phase='grow-'+str(spec['background']);view,revision=j.view();bodies=[]
@@ -112,22 +115,28 @@ def main():
      logs={n:logread(e,n,offsets[n],marker if n=='b' else None) for n,e in endpoints}
      row.update(logs['b'].get('ordinary_observer',{}));es=events(logs['a']['log'],'a')+events(logs['b']['log'],'b');shared=[x for x in es if x['owner']=='a' and x['stage']=='shared_receipt'];head=shared[-1]['head'] if shared else None
      applied={n:[x for x in es if x['owner']==n and x['stage']=='applied' and x['head']==head] for n,e in endpoints}
-     if head and all(applied.values()) and row.get('fresh_read_ns'):captured={'head':head,'applied':applied,'logs':logs};break
+     if head and applied['b']:captured={'head':head,'applied':applied,'logs':logs};break
      if row.get('timeout') or row.get('error'):raise AssertionError('ordinary observer failed')
      time.sleep(.1)
-    assert captured,'existing25s exact appended Applied/read deadline';row['captured_appended_applied']=captured;assert row['sha256']==digest
-    after={n:e.status(n) for n,e in endpoints};subs=[s for s in after['a']['status']['submissions'] if s['operation'] not in prior];assert len(subs)==1 and subs[0]['shared_receipt'];progress=subs[0];validate_receipts(progress,before['a']['status']['binding'],REPLICA)
-    assert progress['shared_receipt']['head']==captured['head'] and after['b']['live']['applied'] and after['b']['live']['authorized'];revision=after['b']['status']['binding']['view']['revision'];assert after['b']['status']['binding']['view']['head']==captured['head'] and captured['applied']['b'][-1]['revision']==revision
+    assert captured,'existing25s exact appended Applied/read deadline';row['captured_appended_applied']=captured
+    post,after=immediate_post_applied_read(lambda:receiver.execute("import json,hashlib,time,os;started=time.monotonic_ns();v=open('/shared/b/reports/bench','rb').read();print(json.dumps({'read_started_ns':started,'fresh_after_applied_ns':time.monotonic_ns(),'bytes':len(v),'sha256':hashlib.sha256(v).hexdigest(),'uid':os.geteuid()}))",user='1001:1001'),lambda:{n:e.status(n) for n,e in endpoints},captured['applied']['b'][-1]['monotonic_ns'],size,digest);row['post_applied_read']=post;row['sha256']=post['sha256']
+    logs={n:logread(e,n,offsets[n],marker if n=='b' else None) for n,e in endpoints};es=events(logs['a']['log'],'a')+events(logs['b']['log'],'b');captured['applied']['a']=[x for x in es if x['owner']=='a' and x['stage']=='applied' and x['head']==captured['head']]
+    assert captured['applied']['a'],'sender profile attribution unavailable after immediate peer read'
+    subs=[s for s in after['a']['status']['submissions'] if s['operation'] not in prior];assert len(subs)==1 and subs[0]['shared_receipt'];progress=subs[0];validate_receipts(progress,before['a']['status']['binding'],REPLICA)
+    revision=validate_exact_peer_binding(captured,after['b'],progress['shared_receipt'])
     serviceevents=[x for x in events(i.docker('exec',i.service,'cat','/tmp/service.log',evidence=False).stdout,'service') if x.get('head')==captured['head'] and x.get('operation')==progress['shared_receipt']['operation'] and x['stage']=='shared_committed'];assert len(serviceevents)==1
     stamp=serviceevents[0]['monotonic_ns'];peer=captured['applied']['b'][-1]['monotonic_ns'];row.update(progress=progress,after=after,peer_projected_revision=revision,events=es+serviceevents,exact_shared_ns=stamp,exact_applied_ns=peer)
-    post=receiver.execute("import json,hashlib,time,os;v=open('/shared/b/reports/bench','rb').read();print(json.dumps({'fresh_after_applied_ns':time.monotonic_ns(),'bytes':len(v),'sha256':hashlib.sha256(v).hexdigest(),'uid':os.geteuid()}))",user='1001:1001');row['post_applied_read']=post;validate_passive_capture(row)
-    row['seconds']=(max(stamp,peer,post['fresh_after_applied_ns'])-row['save_started_ns'])/1e9;row['firstbytes_seconds']=(row['fresh_read_ns']-row['save_started_ns'])/1e9;row['target_pass']=row['seconds']<=.5
+    validate_passive_capture(row)
+    row['seconds']=(max(stamp,peer,post['fresh_after_applied_ns'])-row['save_started_ns'])/1e9;row['firstbytes_seconds']=(row['fresh_read_ns']-row['save_started_ns'])/1e9 if row.get('fresh_read_ns') else None;row['target_pass']=row['seconds']<=.5
     row['metadata_profiles']={};row['profile_attribution']={}
     for n in ['a','b']:
      aggregate=[json.loads(line[len('metadata_profile '):]) for line in logs[n]['log'].splitlines() if line.startswith('metadata_profile ')];exact=[x for x in aggregate if x['revision']==captured['applied'][n][-1]['revision'] and x['ok']];assert len(exact)==1;row['metadata_profiles'][n]=exact[0];row['profile_attribution'][n]=validate_profile_attribution(exact[0],row['enabled'])
     row['qualified']=True;print(json.dumps({k:row[k] for k in ['number','size','background','enabled','seconds','firstbytes_seconds','target_pass']}),flush=True)
    except Exception as error:row.update(error=str(error),qualified=False);raise
    finally:save();snap('sample-'+str(number)+'-every-outcome')
+  if a.mode=='metadata-reuse':
+   import statistics
+   assert len(rows)==3 and all(r['target_pass'] for r in rows) and statistics.median(r['seconds'] for r in rows)<=.2,'three-save metadata reuse latency gate failed'
   verify_linux_image(i,source);code=0
  except InfrastructureUnavailable as error:
   code=2;i.write_json('unavailable.json',{'phase':phase,'error':str(error)})
@@ -147,5 +156,17 @@ def main():
   else:code=1;i.write_json('endpoint-cleanup-errors.json',cleanup_errors)
   i.write_json('result.json',{'exit':code,'diagnostic_only':True,'saves':len(rows),'qualified':sum(bool(r.get('qualified')) for r in rows),'cleanup_errors':cleanup_errors})
  return code
+
+def validate_exact_peer_binding(captured,peer,receipt):
+ assert receipt['head']==captured['head'] and peer['live']['applied'] and peer['live']['authorized']
+ view=peer['status']['binding']['view']
+ assert view['head']==captured['head'] and captured['applied']['b'][-1]['revision']==view['revision']
+ return view['revision']
+
+def immediate_post_applied_read(read,diagnostics,applied_ns,size,digest):
+ post=read()
+ assert post['read_started_ns']>=applied_ns and post['fresh_after_applied_ns']>=post['read_started_ns']
+ assert post['uid']==1001 and post['bytes']==size and post['sha256']==digest
+ return post,diagnostics()
 
 if __name__=='__main__':raise SystemExit(main())

@@ -82,7 +82,7 @@ Current status is NEEDS_REQUIREMENTS. Naive admission deferral can deadlock beca
 
 `MAGUS_METADATA_PROFILE=1` opts mounted clients into bounded aggregate diagnostics; collection defaults off. Owner-authenticated `sync metadata-profile --state PATH --enabled true|false` switches collection outside saves only for an opted-in daemon. Each adoption aggregate reports schema2 `inventory`, notifier counts, notifier/walk/ack wall and thread CPU, and replica-scoped metadata callback/load/copy/decoded-byte counters. Decode/validation/hash and enclosing callback CPU are inclusive; exclusive totals exclude measured children. Unknown CPU clocks are null. Overlapping windows are explicitly ambiguous. Collection carries no authority or cache. Linux source/image/all-five-binary verification records host verification as unexecuted when no host binary was used.
 
-Metadata lookup, identity lookup, directory enumeration and native attribute projection now create one operation-local context while holding Core continuously. It borrows the selected tree and shares one freshly decoded, validated and hash-verified current authority descriptor across recursive metadata helpers. Locally created descendants still check their remote ancestor and verify the local base descriptor once when needed. A new operation verifies again; actor/generation/view state is never cached across calls. Body reads and mutation authorization keep their existing paths. Default-disabled replicas allocate no profiler state; opted-in callbacks outside a unique active window are reported separately, since the previous summary, and overlaps remain ambiguous.
+Metadata lookup, identity lookup, directory enumeration and native attribute projection now create one operation-local context while holding Core continuously. It borrows the selected tree and shares one freshly verified current authority descriptor across recursive metadata helpers. Locally created descendants still check their remote ancestor and verify the local base descriptor once when needed. A new operation verifies again; actor/generation/view state is never cached across calls. Body reads and mutation authorization keep their existing paths. Default-disabled replicas allocate no profiler state; opted-in callbacks outside a unique active window are reported separately, since the previous summary, and overlaps remain ambiguous.
 
 Schema2 inventory is computed only for an active collection window. `current` counts unique identities in the adopted descriptor, including root; it is not the old+new notification list or the number of allocated kernel inode numbers. `remembered` is the pre-notification inode-slot snapshot length, including root and retained file epochs. `removed` counts those remembered slots whose identity is absent from the adopted tree; a rename preserves identity, while same-name replacement removes old identity slots. `stale_epoch` counts remembered slots for surviving files from a different adoption epoch; directories/root remain epoch-independent. Removed and stale-epoch counts are disjoint. Metadata callbacks may allocate more inode slots after the snapshot. Disabled collection emits null inventory in an opted-in daemon and performs no diagnostic tree inventory traversal. Existing complete name/attribute/absence checks remain required for Applied.
 
@@ -133,3 +133,59 @@ not a skipped success. It also publishes a candidate admitted by that old server
 through the new producer. Synthetic graph installation tests bounded traversal,
 not publication throughput. Unit checks of this runner do not qualify the live
 producer, and no latency result follows from the source/protocol checks.
+
+
+## Fresh-byte-verified metadata reuse
+
+Each Core instance privately retains at most two immutable parsed descriptors,
+with a combined 16-MiB charge covering raw capacities, ID/string capacities,
+nested vectors, fixed slots and Arc storage. Every metadata authority/base load
+still checks the journal guard, SELECTs the complete current row, hashes its raw
+bytes and compares the expected canonical RevisionId, raw digest, length and
+exact bytes. A miss performs the existing full decoding, validation and canonical
+ID check. Errors evict the matching slot and never return stale metadata.
+Restoration descriptors and values exceeding the retained allocation budget are
+fully verified without retention. Cache state is empty on reopen and never crosses
+replica roots. Actor, authority generation, working state and access decisions
+are not cached. General revision, body, mutation and continuation-proof loading
+continue to use full verification; their added profiling spans do not change
+behavior. Applied still requires the complete existing metadata/absence walk.
+
+Opt-in profiles distinguish actual fresh revision loads and raw bytes from cache
+hits/misses and decoded bytes. SELECT, raw SHA, exact comparison, JSON parse,
+validation and canonical encoding have separate nested CPU spans. Exclusive
+spans exclude their measured children. Disabled profiling adds no inventory walk,
+profile allocation, CPU-clock sampling or per-operation logging.
+
+`tests/fs2/metadata_reuse.py` extracts only the selected synthetic descriptor
+from retained JSON evidence, verifies its canonical identity through Core and
+runs one Core-only release comparison. Its fixed workload is 100 warmups and
+five blocks of 1,000 requests per mechanism, in ABC/BCA/CAB/ABC/BCA order, with a
+single 120-second campaign cap after fixture preparation. A performs three full
+verifications, B one hypothetical composite-request verification, and C three
+fresh-byte-verified cache loads. Cold fill is separate. All output, including
+partial blocks and failures, is retained; the driver does not retry. Raw input
+values are reconstructed into canonical bytes, not represented as original
+SQLite bytes. These are verification proxies, not a measurement of FUSE mix.
+
+The October 14 host comparison completed all 15 blocks in 53.306 seconds.
+Conservative C projections onto retained 500-file endpoint operation counts
+were 1.886/1.897 seconds CPU and 8.128/8.172 seconds wall, including cold fill.
+The latter retains a scheduling outlier. Both exceed the 100-ms descriptor
+allocation; no mounted run or Linux release image followed this failed gate.
+The separately retained exclusive callback/context residuals were at most
+215.8/209.6 ms CPU. They are neither additional inclusive wall time nor a
+prediction of end-to-end completion. Further latency work requires the separate
+full-walk/traversal design decision; this result is not a 500-ms qualification.
+
+When a future approved gate permits it,
+`python3 tests/fs2/latency_collaboration.py --mode metadata-reuse --image sha256:IMMUTABLE_SHA --output NEW_ABSOLUTE_PATH`
+uses one warmed 500-note fixture and exactly three in-place UID1001 writes of
+24, 1024 and 16384 bytes. After passive matching Shared and peer Applied events,
+it immediately starts a fresh ordinary read, recording guest-clock start,
+completion, hash, byte count and UID before status, receipt or service-log
+retrieval. Exact operation/receipt/view bindings are checked afterward; first
+bytes are separate and never qualify completion. Existing 25-second observation
+and 60-second settling limits remain. Every completion must be at most 500 ms,
+with median at most 200 ms. This mode is implemented but unrun; three saves
+would not establish p95. Continuation producer P3 remains independently pending.

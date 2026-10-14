@@ -141,6 +141,9 @@ macro_rules! id {
             fn prefix() -> &'static str {
                 $prefix
             }
+            pub(crate) fn heap_capacity(&self) -> usize {
+                self.0.capacity()
+            }
             pub fn as_str(&self) -> &str {
                 &self.0
             }

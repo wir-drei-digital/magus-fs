@@ -94,6 +94,7 @@ impl Write for BoundedOutput {
 }
 pub fn encode_revision(r: &Revision) -> Result<Vec<u8>, FsError> {
     validate_revision(r)?;
+    let _span = crate::metadata_profile::Span::begin("canonical_encode");
     let mut entries: Vec<_> = r.tree.entries.iter().collect();
     entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
     let mut coverage: Vec<_> = r.coverage.iter().map(String::as_str).collect();
@@ -164,6 +165,7 @@ pub fn decode_revision(bytes: &[u8]) -> Result<Revision, FsError> {
         hash: Option<&'a str>,
         layout: Option<&'a str>,
     }
+    let parse_span = crate::metadata_profile::Span::begin("parse");
     let header: Header<'_> =
         serde_json::from_slice(bytes).map_err(|_| FsError::InvalidDescriptor)?;
     if !matches!(header.format, Some(FORMAT | RESTORE_FORMAT))
@@ -173,6 +175,7 @@ pub fn decode_revision(bytes: &[u8]) -> Result<Revision, FsError> {
         return Err(FsError::UnsupportedFormat);
     }
     let mut r: Revision = serde_json::from_slice(bytes).map_err(|_| FsError::InvalidDescriptor)?;
+    drop(parse_span);
     validate_revision(&r)?;
     r.tree.entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
     r.coverage.sort_unstable();

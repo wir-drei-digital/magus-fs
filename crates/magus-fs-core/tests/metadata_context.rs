@@ -161,3 +161,62 @@ fn historical_attributes_keep_current_denial() {
     err(historical.native_attributes(&entry), "permission_denied");
     err(historical.lookup("remote/file"), "permission_denied");
 }
+#[test]
+fn cached_authority_still_observes_serialized_denial_and_actor() {
+    let (_d, rep, w, mut r, base) = remote_fixture();
+    r.tree.root.mode = 0o700;
+    let restricted = import(&rep, &r, ChunkSource::Unavailable);
+    observe(&rep, &restricted);
+    let other = rep
+        .begin_live(&base, Actor::new(principal(3)), false)
+        .unwrap();
+    let mut result = w.lookup("remote/file").unwrap();
+    result.mode = 0;
+    assert_eq!(w.lookup("remote/file").unwrap().mode, 0o640);
+    err(other.lookup("remote/file"), "permission_denied");
+    // Returning to an earlier cached identity does not restore another actor's grant.
+    r.operation = OperationId::random().unwrap();
+    let next = import(&rep, &r, ChunkSource::Unavailable);
+    observe(&rep, &next);
+    observe(&rep, &restricted);
+    err(other.lookup("remote/file"), "permission_denied");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let b = barrier.clone();
+    let reader = std::thread::spawn(move || {
+        b.wait();
+        err(w.lookup("remote/file"), "permission_denied");
+    });
+    rep.observe_remote_authority(None, rep.live_status().unwrap().authority_generation)
+        .unwrap();
+    barrier.wait();
+    reader.join().unwrap();
+}
+#[test]
+fn base_and_authority_are_independently_verified() {
+    let (d, rep, w, mut r, base) = remote_fixture();
+    w.mkdir("remote/local", 0o755).unwrap();
+    r.operation = OperationId::random().unwrap();
+    let authority = import(&rep, &r, ChunkSource::Unavailable);
+    observe(&rep, &authority);
+    w.lookup("remote/local").unwrap();
+    let db = rusqlite::Connection::open(database(d.path())).unwrap();
+    db.execute(
+        "UPDATE revisions SET descriptor=? WHERE id=?",
+        rusqlite::params![b"{".to_vec(), base.as_str()],
+    )
+    .unwrap();
+    err(w.lookup("remote/local"), "invalid_descriptor");
+}
+#[test]
+fn disabled_profile_stays_empty_on_cache_hits() {
+    let (_d, rep, w, _r, base) = remote_fixture();
+    rep.set_metadata_profile_enabled(false).unwrap();
+    let window = rep.begin_metadata_profile(&base).unwrap();
+    assert!(!window.is_enabled());
+    w.lookup("").unwrap();
+    w.lookup("").unwrap();
+    let p = window.finish();
+    assert_eq!(p.raw_bytes, 0);
+    assert_eq!(p.descriptor_hits, 0);
+    assert!(p.cpu_exclusive_ns.is_empty());
+}

@@ -8,7 +8,7 @@ class CollaborationTests(unittest.TestCase):
   self.assertEqual([r["size"] for r in rows[6:12]],[1024]*6)
   self.assertEqual([r["enabled"] for r in rows],[True]*12+[False]*2)
  def test_passive_capture_requires_exact_post_applied_read(self):
-  row={"save_started_ns":10,"exact_shared_ns":20,"exact_applied_ns":30,"first_read_ns":25,"post_applied_read":{"fresh_after_applied_ns":31,"uid":1001,"bytes":24,"sha256":"hash"},"size":24,"sha256":"hash","status_polls":[]}
+  row={"save_started_ns":10,"exact_shared_ns":20,"exact_applied_ns":30,"first_read_ns":25,"post_applied_read":{"read_started_ns":30,"fresh_after_applied_ns":31,"uid":1001,"bytes":24,"sha256":"hash"},"size":24,"sha256":"hash","status_polls":[]}
   self.assertTrue(validate_passive_capture(row))
   for key,value in [("post_applied_read",None),("exact_applied_ns",9),("status_polls",[1])]:
    with self.assertRaises((AssertionError,ValueError)):validate_passive_capture(dict(row,**{key:value}))
@@ -70,3 +70,57 @@ class ContinuationServiceRunnerTests(unittest.TestCase):
  def test_mutable_image_refused(self):
   from continuation_proof import validate_image
   with self.assertRaises(ValueError):validate_image('latest')
+
+class MetadataReuseTests(unittest.TestCase):
+ def test_immediate_post_applied_read_precedes_diagnostics(self):
+  from latency_collaboration import immediate_post_applied_read
+  events=[]
+  def read():
+   events.append('read');return {'read_started_ns':31,'fresh_after_applied_ns':35,'uid':1001,'bytes':24,'sha256':'hash'}
+  def diagnostics():events.append('diagnostics');return {'receipt':'later'}
+  post,after=immediate_post_applied_read(read,diagnostics,30,24,'hash')
+  self.assertEqual(events,['read','diagnostics']);self.assertEqual(after,{'receipt':'later'})
+  for change in [{'read_started_ns':29},{'fresh_after_applied_ns':28},{'uid':0},{'sha256':'stale'},{'bytes':1}]:
+   events.clear()
+   with self.assertRaises(AssertionError):immediate_post_applied_read(lambda:dict(post,**change),diagnostics,30,24,'hash')
+   self.assertEqual(events,[])
+ def test_comparison_gate_rejects_incomplete_or_slow(self):
+  from metadata_reuse import comparison_gate
+  blocks=[{'kind':'block','mechanism':m,'block':b,'requests':1000,'cpu_ns':1000000 if m=='C' else 9000000,'wall_ns':1000000 if m=='C' else 9000000} for b in range(5) for m in 'ABC']
+  cold={'cpu_ns':1000,'wall_ns':1000}
+  endpoints={'a':{'operations':3000,'residual_cpu_ns':100000000,'scheduling_plausible':True},'b':{'operations':3000,'residual_cpu_ns':100000000,'scheduling_plausible':True}}
+  self.assertEqual(comparison_gate(blocks,cold,endpoints,True)['status'],'passed')
+  self.assertEqual(comparison_gate(blocks[:-1],cold,endpoints,True)['status'],'inconclusive')
+  self.assertEqual(comparison_gate(blocks,cold,endpoints,False)['status'],'failed')
+  for changed in [dict(blocks[2],cpu_ns=None),dict(blocks[2],cpu_ns=1000000000),dict(blocks[2],cpu_ns=10000000)]:
+   self.assertNotEqual(comparison_gate(blocks[:2]+[changed]+blocks[3:],cold,endpoints,True)['status'],'passed')
+  endpoints['b']['residual_cpu_ns']=600000000
+  self.assertEqual(comparison_gate(blocks,cold,endpoints,True)['status'],'failed')
+ def test_fixed_comparison_and_mounted_workload(self):
+  from metadata_reuse import comparison_schedule,mounted_matrix
+  schedule=comparison_schedule()
+  self.assertEqual(schedule,{'warmups':100,'requests':1000,'orders':['ABC','BCA','CAB','ABC','BCA'],'budget_seconds':120})
+  self.assertEqual([(r['background'],r['size']) for r in mounted_matrix()],[(500,24),(500,1024),(500,16384)])
+
+class ExactReadBindingTests(unittest.TestCase):
+ def test_wrong_revision_receipt_or_denial_cannot_qualify_read(self):
+  import copy
+  from latency_collaboration import validate_exact_peer_binding
+  captured={'head':'new','applied':{'b':[{'revision':'revision-new'}]}}
+  peer={'live':{'applied':True,'authorized':True},'status':{'binding':{'view':{'head':'new','revision':'revision-new'}}}}
+  self.assertEqual(validate_exact_peer_binding(captured,peer,{'head':'new'}),'revision-new')
+  for field in ('head','revision'):
+   bad=copy.deepcopy(peer);bad['status']['binding']['view'][field]='old'
+   with self.assertRaises(AssertionError):validate_exact_peer_binding(captured,bad,{'head':'new'})
+  with self.assertRaises(AssertionError):validate_exact_peer_binding(captured,peer,{'head':'old'})
+  bad=copy.deepcopy(peer);bad['live']['authorized']=False
+  with self.assertRaises(AssertionError):validate_exact_peer_binding(captured,bad,{'head':'new'})
+ def test_receipts_bind_operation_revision_and_original_view(self):
+  import copy
+  from latency_support import validate_receipts
+  progress={'operation':'private-op','local_revision':'local','private_receipt':{'operation':'private-op','replica':'replica','submitted_revision':'local','original_view':'view','original_head':'head','receipt':'private-receipt'},'shared_receipt':{'operation':'shared-op','replica':'replica','submitted_revision':'local','branch':'main'},'request':{'operation':'private-op','replica':'replica','revision':'local','original_view':'view','original_head':'head'},'integration':{'operation':'shared-op','replica':'replica','candidate_receipt':'private-receipt','branch':'main'}}
+  binding={'branch':'main','view':{'view':'view','head':'head'}}
+  validate_receipts(progress,binding,'replica')
+  for section,key in [('private_receipt','operation'),('shared_receipt','submitted_revision'),('request','original_view'),('integration','candidate_receipt')]:
+   bad=copy.deepcopy(progress);bad[section][key]='wrong'
+   with self.assertRaises(AssertionError):validate_receipts(bad,binding,'replica')
