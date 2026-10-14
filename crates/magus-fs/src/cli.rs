@@ -34,6 +34,7 @@ fn args(mut argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
         "sync-attach" => vec!["state", "profile", "branch", "publication"],
         "sync-run" => vec!["state", "revision", "operation-id", "enqueue-only", "serve"],
         "sync-status" => vec!["state", "revision"],
+        "sync-metadata-profile" => vec!["state", "enabled"],
         "sync-declare" => vec!["state", "request"],
         "sync-drain" => vec!["state", "revision", "level", "deadline-ms"],
         "sync-integrate" => vec!["state", "revision", "expected-head"],
@@ -508,6 +509,19 @@ pub(crate) fn control(
 fn sync_control(rep: &Replica, command: &str, options: &BTreeMap<String, String>) -> Result<Value> {
     use magus_fs_core::protocol::*;
     use std::time::{Duration, Instant};
+    if command == "sync-metadata-profile" {
+        if std::env::var("MAGUS_METADATA_PROFILE").ok().as_deref() != Some("1") {
+            return Err((1, FsError::PermissionDenied));
+        }
+        let enabled = match required(options, "enabled")? {
+            "true" => true,
+            "false" => false,
+            _ => return Err((2, FsError::InvalidDescriptor)),
+        };
+        rep.set_metadata_profile_enabled(enabled)
+            .map_err(|e| (1, e))?;
+        return Ok(json!({"ok":true,"enabled":enabled}));
+    }
     let revision = || RevisionId::parse(required(options, "revision")?).map_err(|e| (2, e));
     if command == "sync-attach" {
         let mode = match options.get("publication").map(String::as_str) {

@@ -94,4 +94,26 @@ class ImageReuseTests(unittest.TestCase):
                     self.assertNotIn('image-ownership.json', files)
                     self.assertFalse(files['result.json']['complete_gate'])
 
+class LinuxImageVerificationTests(unittest.TestCase):
+    def test_linux_verification_rejects_source_mismatch(self):
+        infra=SimpleNamespace(service='service',docker=lambda *a,**k:SimpleNamespace(stdout=json.dumps({'source':'stale'})))
+        with patch.object(provenance,'sources',lambda:{'source':'current'}):
+            with self.assertRaisesRegex(AssertionError,'differs from built image'):
+                provenance.verify_linux_image(infra,{'sha256':{'source':'current'}})
+
+    def test_linux_verification_omits_unexecuted_host_verification(self):
+        from infra import PG,S3
+        expected={PG:'sha256:67ba68a22dc7d5af3627b7e0f33d10bbefad07562ff9703b3a6c2de247649129',S3:'sha256:f1f303474940e9e088edbd2c1658f7ac38cb0dd90f91a2b0a51916d74b8575a1'}
+        def docker(*args,**kwargs):
+            if args[:2]==('exec','-i'):out=json.dumps({'source':'current'})
+            elif args[:3]==('buildx','imagetools','inspect'):out=json.dumps({'manifests':[{'digest':expected[args[-1]],'platform':{'architecture':'arm64','os':'linux'}}]})
+            elif args[:2]==('image','inspect'):out=json.dumps([{'Architecture':'arm64'}])
+            else:out='binary-hash tool'
+            return SimpleNamespace(stdout=out)
+        infra=SimpleNamespace(service='service',pg='pg',s3='s3',docker=docker,inspect=lambda *a:{'Image':IMAGE,'Platform':'linux'},write_json=lambda *a:None)
+        with patch.object(provenance,'sources',lambda:{'source':'current'}):
+            result=provenance.verify_linux_image(infra,{'sha256':{'source':'current'}})
+        self.assertIsNone(result['host_verification']);self.assertNotIn('host-magus-fs-service',result['binaries'])
+        self.assertEqual(len(result['binaries']),5)
+
 if __name__ == '__main__':unittest.main()

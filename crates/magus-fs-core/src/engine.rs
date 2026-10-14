@@ -79,6 +79,7 @@ pub(crate) struct Working {
     pub(crate) orphans: Vec<Entry>,
 }
 pub(crate) struct Core {
+    pub(crate) metadata_profiler: Arc<Mutex<crate::metadata_profile::Profiler>>,
     pub(crate) journal: Journal,
     pub(crate) objects: ObjectStore,
     pub(crate) config: ReplicaConfig,
@@ -162,6 +163,8 @@ impl Core {
         self.working.as_ref().ok_or(FsError::BaseMismatch)
     }
     pub(crate) fn revision(&self, id: &RevisionId) -> Result<Revision, FsError> {
+        let _span = crate::metadata_profile::Span::begin("revision_load");
+        crate::metadata_profile::count("revision_load", 1);
         let bytes = self
             .journal
             .db
@@ -636,6 +639,7 @@ impl Replica {
             }
         }
         let mut core = Core {
+            metadata_profiler: Arc::default(),
             journal,
             objects,
             config,
@@ -971,6 +975,8 @@ impl Replica {
 }
 impl Workspace {
     fn tree(&self, core: &Core) -> Result<Tree, FsError> {
+        let _span = crate::metadata_profile::Span::begin("working_copy");
+        crate::metadata_profile::count("copy", 1);
         Ok(match &self.view {
             Some(r) => r.tree.clone(),
             None => core.working()?.tree.clone(),
@@ -1006,6 +1012,7 @@ impl Workspace {
                 )
                 .optional()?
             {
+                crate::metadata_profile::count("authority_load", 1);
                 let authority = core.revision(&RevisionId::parse(id)?)?;
                 let current = if e.id == authority.tree.root.id {
                     Some(perm::root_entry(&authority.tree))
@@ -1075,6 +1082,7 @@ impl Workspace {
                 )
                 .optional()?
             {
+                crate::metadata_profile::count("authority_load", 1);
                 let authority = core.revision(&RevisionId::parse(id)?)?;
                 if entry.id == authority.tree.root.id {
                     return Ok(authority.tree.root.owner);
@@ -1175,6 +1183,7 @@ impl Workspace {
     /// Live entries (including already-guarded orphan handles) need no projection.
     pub fn native_attributes(&self, entry: &Entry) -> Result<Entry, FsError> {
         let core = lock(&self.core)?;
+        let _callback = crate::metadata_profile::Callback::begin(&core.metadata_profiler);
         let mut projected = entry.clone();
         if self.view.is_none() {
             self.access(&core, entry, 0)?;
@@ -1188,6 +1197,9 @@ impl Workspace {
                 )
                 .optional()?
                 .flatten();
+            if remote.is_some() {
+                crate::metadata_profile::count("authority_load", 1);
+            }
             let authority = remote
                 .map(|id| core.revision(&RevisionId::parse(id)?))
                 .transpose()?;
@@ -1232,11 +1244,13 @@ impl Workspace {
     }
     pub fn lookup(&self, path: &str) -> Result<Entry, FsError> {
         let core = lock(&self.core)?;
+        let _callback = crate::metadata_profile::Callback::begin(&core.metadata_profiler);
         let tree = self.tree(&core)?;
         self.resolve_entry(&core, &tree, path)
     }
     pub fn list(&self, path: &str) -> Result<Vec<String>, FsError> {
         let core = lock(&self.core)?;
+        let _callback = crate::metadata_profile::Callback::begin(&core.metadata_profiler);
         let tree = self.tree(&core)?;
         let e = self.resolve_entry(&core, &tree, path)?;
         if e.content != EntryContent::Directory {
@@ -1255,6 +1269,7 @@ impl Workspace {
     /// Readdir names, stable identities and kinds only; child attributes still require search.
     pub fn directory_entries(&self, path: &str) -> Result<Vec<(String, EntryId, bool)>, FsError> {
         let core = lock(&self.core)?;
+        let _callback = crate::metadata_profile::Callback::begin(&core.metadata_profiler);
         let tree = self.tree(&core)?;
         let entry = self.resolve_entry(&core, &tree, path)?;
         if entry.content != EntryContent::Directory {
@@ -1277,6 +1292,7 @@ impl Workspace {
     /// Resolve an inode identity through its current path and current traversal authority.
     pub fn lookup_identity(&self, id: &EntryId) -> Result<Entry, FsError> {
         let core = lock(&self.core)?;
+        let _callback = crate::metadata_profile::Callback::begin(&core.metadata_profiler);
         let tree = self.tree(&core)?;
         let path = if &tree.root.id == id {
             ""

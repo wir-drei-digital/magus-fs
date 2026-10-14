@@ -49,3 +49,6 @@ mod reconcile;
 pub use reconcile::*;
 pub mod collaboration_protocol;
 pub use collaboration_protocol::*;
+
+mod metadata_profile;
+pub use metadata_profile::{metadata_thread_cpu_ns, MetadataProfile, MetadataProfileGuard};

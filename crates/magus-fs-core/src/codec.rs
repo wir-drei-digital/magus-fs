@@ -6,6 +6,7 @@ use std::{
 };
 
 fn validate_revision(r: &Revision) -> Result<(), FsError> {
+    let _span = crate::metadata_profile::Span::begin("validation");
     if ![FORMAT, RESTORE_FORMAT].contains(&r.format.as_str())
         || r.hash != HASH
         || r.layout != LAYOUT
@@ -154,6 +155,8 @@ fn input_bounds(bytes: &[u8]) -> Result<(), FsError> {
     Ok(())
 }
 pub fn decode_revision(bytes: &[u8]) -> Result<Revision, FsError> {
+    let _span = crate::metadata_profile::Span::begin("decode");
+    crate::metadata_profile::count("bytes", bytes.len() as u64);
     input_bounds(bytes)?;
     #[derive(Deserialize)]
     struct Header<'a> {
@@ -176,6 +179,7 @@ pub fn decode_revision(bytes: &[u8]) -> Result<Revision, FsError> {
     Ok(r)
 }
 pub fn revision_id(revision: &Revision) -> Result<RevisionId, FsError> {
+    let _span = crate::metadata_profile::Span::begin("hash");
     RevisionId::digest(&encode_revision(revision)?)
 }
 

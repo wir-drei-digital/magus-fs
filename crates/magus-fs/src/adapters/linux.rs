@@ -726,6 +726,9 @@ pub fn mount(
     mountpoint: &Path,
     read_only: bool,
 ) -> Result<()> {
+    let metadata_opt_in = std::env::var("MAGUS_METADATA_PROFILE").ok().as_deref() == Some("1");
+    rep.set_metadata_profile_enabled(metadata_opt_in)?;
+
     let config = rep.configuration()?;
     if !mountpoint.is_absolute() || !config.content_roots.contains(&mountpoint.to_path_buf()) {
         return Err(FsError::ConfigMismatch);
@@ -872,14 +875,28 @@ pub fn mount(
                 }
                 if let Some(adoption) = &pending {
                     let started = std::time::Instant::now();
+                    let profile = rep.begin_metadata_profile(&adoption.revision).ok();
+                    let mut stages = Vec::new();
+                    let mut remembered = 0usize;
+                    let mut notifications = 0usize;
+                    let mut removed = 0usize;
+
                     let result = (|| -> Result<()> {
                         // Do not hold state while notifying: the kernel may issue callbacks.
+                        let stage_start = std::time::Instant::now();
+                        let stage_cpu = if metadata_opt_in {
+                            metadata_thread_cpu_ns()
+                        } else {
+                            None
+                        };
                         let inodes = live_state
                             .lock()
                             .map_err(|_| FsError::ReplicaBusy)?
                             .inodes
                             .clone();
+                        remembered = inodes.len();
                         for (i, _) in inodes.iter().enumerate() {
+                            notifications += 1;
                             notifier.inval_inode(INodeNo(i as u64 + 1), 0, 0)?;
                         }
                         for entry in &adoption.entries {
@@ -892,12 +909,22 @@ pub fn mount(
                                 .filter(|(_, v)| v.0 == entry.parent)
                             {
                                 let _ = id;
+                                notifications += 1;
                                 notifier.inval_entry(
                                     INodeNo(i as u64 + 1),
                                     OsStr::new(entry.path.rsplit('/').next().unwrap()),
                                 )?;
                             }
                         }
+                        if metadata_opt_in {
+                            stages.push(serde_json::json!({"stage":"notifier","wall_ns":stage_start.elapsed().as_nanos(),"thread_cpu_ns":stage_cpu.zip(metadata_thread_cpu_ns()).map(|(a,b)|b.saturating_sub(a))}));
+                        }
+                        let stage_start = std::time::Instant::now();
+                        let stage_cpu = if metadata_opt_in {
+                            metadata_thread_cpu_ns()
+                        } else {
+                            None
+                        };
                         let current = rep.revision(&adoption.revision)?;
                         // An ordinary kernel path walk verifies post-invalidation names and attrs.
                         for e in &current.tree.entries {
@@ -910,6 +937,9 @@ pub fn mount(
                             }
                         }
                         for e in &adoption.entries {
+                            if !current.tree.entries.iter().any(|v| v.path == e.path) {
+                                removed += 1;
+                            }
                             if !e.path.is_empty()
                                 && !current.tree.entries.iter().any(|v| v.path == e.path)
                                 && mountpoint.join(&e.path).try_exists()?
@@ -917,8 +947,28 @@ pub fn mount(
                                 return Err(FsError::StaleHandle);
                             }
                         }
-                        rep.acknowledge_adoption(&adoption.revision, adoption.epoch)
+                        if metadata_opt_in {
+                            stages.push(serde_json::json!({"stage":"metadata_walk","wall_ns":stage_start.elapsed().as_nanos(),"thread_cpu_ns":stage_cpu.zip(metadata_thread_cpu_ns()).map(|(a,b)|b.saturating_sub(a))}));
+                        }
+                        let stage_start = std::time::Instant::now();
+                        let stage_cpu = if metadata_opt_in {
+                            metadata_thread_cpu_ns()
+                        } else {
+                            None
+                        };
+                        let result = rep.acknowledge_adoption(&adoption.revision, adoption.epoch);
+                        if metadata_opt_in {
+                            stages.push(serde_json::json!({"stage":"acknowledgement","wall_ns":stage_start.elapsed().as_nanos(),"thread_cpu_ns":stage_cpu.zip(metadata_thread_cpu_ns()).map(|(a,b)|b.saturating_sub(a))}));
+                        }
+                        result
                     })();
+                    let aggregate = profile.map(|p| p.finish());
+                    if metadata_opt_in {
+                        eprintln!(
+                            "metadata_profile {}",
+                            serde_json::json!({"replica":replica_id.as_str(),"revision":adoption.revision.as_str(),"current":adoption.entries.len(),"remembered":remembered,"removed":removed,"notifications":notifications,"stages":stages,"profile":aggregate,"ok":result.is_ok()})
+                        );
+                    }
                     if let Err(error) = &result {
                         let _ = rep.record_incoming_acknowledgement(Some(error));
                         eprintln!("live_acknowledgement_error code={}", error.code());

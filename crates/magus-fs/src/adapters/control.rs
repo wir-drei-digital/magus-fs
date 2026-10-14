@@ -208,6 +208,7 @@ impl Server {
                                     | "sync-attach"
                                     | "sync-run"
                                     | "sync-status"
+                                    | "sync-metadata-profile"
                                     | "sync-drain"
                                     | "sync-integrate"
                                     | "sync-declare"

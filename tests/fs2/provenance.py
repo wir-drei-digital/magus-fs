@@ -22,7 +22,7 @@ def capture(infra):
     infra.write_json('source.json',data)
     return data
 
-def verify_image(infra,before,host_profile="debug"):
+def verify_linux_image(infra,before):
     script="import hashlib,json; from pathlib import Path; expected=json.load(__import__('sys').stdin); print(json.dumps({p:hashlib.sha256((Path('/src')/p).read_bytes()).hexdigest() for p in expected}))"
     actual=json.loads(infra.docker('exec','-i',infra.service,'python3','-c',script,input=json.dumps(before['sha256']),evidence=False).stdout)
     if sources()!=before['sha256'] or actual!=before['sha256']:
@@ -31,9 +31,8 @@ def verify_image(infra,before,host_profile="debug"):
     infra.docker('exec',infra.service,'python3','--version')
     infra.docker('exec',infra.s3,'weed','version')
     binaries={}
-    for name in ['magus-fs-service','magus-fs-service-faults']:
+    for name in ['magus-fs-service','magus-fs-service-faults','magus-fs','magus-fs-client-faults','client_probe']:
         binaries[name]=infra.docker('exec',infra.service,'sha256sum','/usr/local/bin/'+name).stdout.strip().split()[0]
-    binaries['host-magus-fs-service']=hashlib.sha256((ROOT/('target/'+host_profile+'/magus-fs-service')).read_bytes()).hexdigest()
     selected={}
     arch=infra.inspect('container',infra.service)['Platform']
     for ref in [PG,S3]:
@@ -48,7 +47,15 @@ def verify_image(infra,before,host_profile="debug"):
         x=infra.inspect('container',name)
         image=json.loads(infra.docker('image','inspect',x['Image']).stdout)[0]
         assert image['Architecture']=='arm64'
-    infra.write_json('image-source.json',{'matched':True,'files':len(actual),'binaries':binaries,'service_image':infra.inspect('container',infra.service)['Image'],'platform':arch,'selected_backend_manifests':selected})
+    data={'matched':True,'files':len(actual),'binaries':binaries,'service_image':infra.inspect('container',infra.service)['Image'],'platform':arch,'selected_backend_manifests':selected,'host_verification':None}
+    infra.write_json('image-source.json',data)
+    return data
+
+def verify_image(infra,before,host_profile='debug'):
+    data=verify_linux_image(infra,before)
+    data['binaries']['host-magus-fs-service']=hashlib.sha256((ROOT/('target/'+host_profile+'/magus-fs-service')).read_bytes()).hexdigest()
+    data['host_verification']={'profile':host_profile,'executed':True}
+    infra.write_json('image-source.json',data)
 
 def resolve_reused_image(infra, reference):
     """Pin a borrowed debug runtime image; source verification remains mandatory."""
