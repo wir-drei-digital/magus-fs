@@ -877,9 +877,9 @@ pub fn mount(
                     let started = std::time::Instant::now();
                     let profile = rep.begin_metadata_profile(&adoption.revision).ok();
                     let mut stages = Vec::new();
-                    let mut remembered = 0usize;
+                    let collect_inventory = profile.as_ref().is_some_and(|p| p.is_enabled());
+                    let mut inventory = None;
                     let mut notifications = 0usize;
-                    let mut removed = 0usize;
 
                     let result = (|| -> Result<()> {
                         // Do not hold state while notifying: the kernel may issue callbacks.
@@ -894,7 +894,6 @@ pub fn mount(
                             .map_err(|_| FsError::ReplicaBusy)?
                             .inodes
                             .clone();
-                        remembered = inodes.len();
                         for (i, _) in inodes.iter().enumerate() {
                             notifications += 1;
                             notifier.inval_inode(INodeNo(i as u64 + 1), 0, 0)?;
@@ -926,6 +925,12 @@ pub fn mount(
                             None
                         };
                         let current = rep.revision(&adoption.revision)?;
+                        inventory = super::inventory::inventory(
+                            collect_inventory,
+                            || &current.tree,
+                            &inodes,
+                            adoption.epoch,
+                        );
                         // An ordinary kernel path walk verifies post-invalidation names and attrs.
                         for e in &current.tree.entries {
                             let observed = std::fs::metadata(mountpoint.join(&e.path))?;
@@ -937,9 +942,6 @@ pub fn mount(
                             }
                         }
                         for e in &adoption.entries {
-                            if !current.tree.entries.iter().any(|v| v.path == e.path) {
-                                removed += 1;
-                            }
                             if !e.path.is_empty()
                                 && !current.tree.entries.iter().any(|v| v.path == e.path)
                                 && mountpoint.join(&e.path).try_exists()?
@@ -966,7 +968,7 @@ pub fn mount(
                     if metadata_opt_in {
                         eprintln!(
                             "metadata_profile {}",
-                            serde_json::json!({"replica":replica_id.as_str(),"revision":adoption.revision.as_str(),"current":adoption.entries.len(),"remembered":remembered,"removed":removed,"notifications":notifications,"stages":stages,"profile":aggregate,"ok":result.is_ok()})
+                            serde_json::json!({"replica":replica_id.as_str(),"revision":adoption.revision.as_str(),"inventory":inventory,"inventory_schema":2,"notifications":notifications,"stages":stages,"profile":aggregate,"ok":result.is_ok()})
                         );
                     }
                     if let Err(error) = &result {

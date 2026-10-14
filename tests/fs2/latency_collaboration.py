@@ -9,6 +9,18 @@ def validate_passive_capture(row):
  return True
 
 
+def validate_profile_attribution(aggregate, enabled):
+ assert aggregate['ok']
+ profile=aggregate.get('profile')
+ assert isinstance(profile,dict)
+ if enabled:
+  assert all(type(profile.get(k)) is int and profile[k]>0 for k in ['window','callback_count','load_count'])
+  assert type(profile.get('ambiguous')) is bool
+  return {'mode':'enabled','ambiguous':profile['ambiguous']}
+ assert all(profile.get(k)==0 for k in ['window','callback_count','load_count'])
+ return {'mode':'control-off','ambiguous':None}
+
+
 def profile_docker_args(args):
  if args[0:1]==('exec',) and args[1:2] in [('-d',),('-i',)]:return ('exec',args[1],'-e','MAGUS_LATENCY_TRACE=1','-e','MAGUS_METADATA_PROFILE=1',*args[2:])
  return args
@@ -107,9 +119,9 @@ def main():
     stamp=serviceevents[0]['monotonic_ns'];peer=captured['applied']['b'][-1]['monotonic_ns'];row.update(progress=progress,after=after,peer_projected_revision=revision,events=es+serviceevents,exact_shared_ns=stamp,exact_applied_ns=peer)
     post=receiver.execute("import json,hashlib,time,os;v=open('/shared/b/reports/bench','rb').read();print(json.dumps({'fresh_after_applied_ns':time.monotonic_ns(),'bytes':len(v),'sha256':hashlib.sha256(v).hexdigest(),'uid':os.geteuid()}))",user='1001:1001');row['post_applied_read']=post;validate_passive_capture(row)
     row['seconds']=(max(stamp,peer,post['fresh_after_applied_ns'])-row['save_started_ns'])/1e9;row['firstbytes_seconds']=(row['fresh_read_ns']-row['save_started_ns'])/1e9;row['target_pass']=row['seconds']<=.5
-    row['metadata_profiles']={}
+    row['metadata_profiles']={};row['profile_attribution']={}
     for n in ['a','b']:
-     aggregate=[json.loads(line[len('metadata_profile '):]) for line in logs[n]['log'].splitlines() if line.startswith('metadata_profile ')];exact=[x for x in aggregate if x['revision']==captured['applied'][n][-1]['revision'] and x['ok']];assert len(exact)==1;row['metadata_profiles'][n]=exact[0]
+     aggregate=[json.loads(line[len('metadata_profile '):]) for line in logs[n]['log'].splitlines() if line.startswith('metadata_profile ')];exact=[x for x in aggregate if x['revision']==captured['applied'][n][-1]['revision'] and x['ok']];assert len(exact)==1;row['metadata_profiles'][n]=exact[0];row['profile_attribution'][n]=validate_profile_attribution(exact[0],row['enabled'])
     row['qualified']=True;print(json.dumps({k:row[k] for k in ['number','size','background','enabled','seconds','firstbytes_seconds','target_pass']}),flush=True)
    except Exception as error:row.update(error=str(error),qualified=False);raise
    finally:save();snap('sample-'+str(number)+'-every-outcome')

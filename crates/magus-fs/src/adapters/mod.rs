@@ -18,3 +18,6 @@ pub fn mount(
 ) -> Result<(), magus_fs_core::FsError> {
     Err(magus_fs_core::FsError::UnsupportedMode)
 }
+
+#[cfg(any(target_os = "linux", test))]
+mod inventory;

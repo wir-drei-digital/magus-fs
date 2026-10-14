@@ -33,6 +33,11 @@ pub struct MetadataProfileGuard {
     window: Option<Arc<Mutex<MetadataProfile>>>,
 }
 impl MetadataProfileGuard {
+    /// Whether this guard owns an active collection window (not just startup opt-in).
+    pub fn is_enabled(&self) -> bool {
+        self.window.is_some()
+    }
+
     pub fn finish(mut self) -> MetadataProfile {
         let Some(w) = self.window.take() else {
             return MetadataProfile::default();

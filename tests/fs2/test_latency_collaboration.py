@@ -22,3 +22,20 @@ class ProfileStartupTests(unittest.TestCase):
  def test_profile_opt_in_preserves_service_and_non_exec_commands(self):
   self.assertIn('MAGUS_LATENCY_TRACE=1',profile_docker_args(('exec','-d','owned-service','service')))
   self.assertEqual(profile_docker_args(('image','inspect','sha256:abc')),('image','inspect','sha256:abc'))
+
+class AttributionTests(unittest.TestCase):
+ def test_enabled_requires_real_collection_and_retains_ambiguity(self):
+  from latency_collaboration import validate_profile_attribution
+  p={'window':1,'callback_count':10,'load_count':10,'ambiguous':True}
+  self.assertEqual(validate_profile_attribution({'ok':True,'profile':p},True),{'mode':'enabled','ambiguous':True})
+ def test_enabled_rejects_missing_or_zero_counters(self):
+  from latency_collaboration import validate_profile_attribution
+  p={'window':1,'callback_count':10,'load_count':10,'ambiguous':False}
+  for key in ['window','callback_count','load_count']:
+   with self.assertRaises(AssertionError):validate_profile_attribution({'ok':True,'profile':dict(p,**{key:0})},True)
+  with self.assertRaises(AssertionError):validate_profile_attribution({'ok':True,'profile':None},True)
+ def test_control_off_distinguished_and_rejects_active_window(self):
+  from latency_collaboration import validate_profile_attribution
+  p={'window':0,'callback_count':0,'load_count':0,'ambiguous':False}
+  self.assertEqual(validate_profile_attribution({'ok':True,'profile':p},False),{'mode':'control-off','ambiguous':None})
+  with self.assertRaises(AssertionError):validate_profile_attribution({'ok':True,'profile':dict(p,window=1)},False)
