@@ -176,3 +176,29 @@ class PostReadSettlementTests(unittest.TestCase):
   self.assertIsInstance(result,AssertionError)
   self.assertIn('failed',str(result))
   self.assertIn('"ok": false',row['post_read_diagnostics']['logs']['a']['log'])
+
+class MountedScreenTests(unittest.TestCase):
+ def test_fixed_screen_matrix_and_failed_cells(self):
+  from latency_collaboration import smoke_matrix,validate_smoke
+  matrix=smoke_matrix()
+  self.assertEqual(len(matrix),36)
+  self.assertEqual({(r['background'],r['pattern'],r['size']) for r in matrix},{(b,p,s) for b in [0,500] for p in ['in-place','atomic'] for s in [24,1024,16384]})
+  rows=[dict(r,seconds=.15,qualified=True,transient_errors=[]) for r in matrix]
+  self.assertTrue(validate_smoke(rows)['passed'])
+  rows[2]['seconds']=.501
+  self.assertFalse(validate_smoke(rows)['passed'])
+  self.assertEqual(validate_smoke(rows)['failed_cells'],[2])
+
+class MountedGateBoundaryTests(unittest.TestCase):
+ def test_cell_medians_do_not_replace_original_background_gate(self):
+  from latency_collaboration import smoke_matrix, validate_smoke
+  rows=[dict(r,seconds=.1,qualified=True,transient_errors=[]) for r in smoke_matrix()]
+  for row in rows[:3]:row['seconds']=.3
+  result=validate_smoke(rows)
+  self.assertTrue(result['passed'])
+  self.assertEqual(result['cell_medians_seconds']['0/in-place/24'],.3)
+ def test_retained_settled_snapshot_is_not_current_block(self):
+  from mounted_continuation import currently_blocked
+  self.assertFalse(currently_blocked({'recovery':[{'operation':'old'}],'readiness':'Ready'}))
+  self.assertFalse(currently_blocked({'recovery':[{'operation':'old'}],'readiness':{'Waiting':{'reason':'visibility'}}}))
+  self.assertTrue(currently_blocked({'recovery':[{'operation':'new'}],'readiness':{'Blocked':{'reason':'overlap'}}}))

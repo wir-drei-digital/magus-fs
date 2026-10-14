@@ -59,3 +59,6 @@ pub mod continuation_protocol;
 pub use continuation_protocol::*;
 
 mod metadata_descriptor;
+
+mod mounted_continuation;
+pub use mounted_continuation::*;

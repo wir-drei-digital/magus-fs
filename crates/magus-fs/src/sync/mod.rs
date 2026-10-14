@@ -4,7 +4,7 @@ mod transport;
 pub(crate) use controller::*;
 
 mod live;
-pub(crate) use live::{subscribe, Incoming};
+pub(crate) use live::{subscribe, Incoming, MountedIncoming};
 
 pub(crate) mod watch;
 
@@ -14,3 +14,5 @@ pub(crate) mod mounted;
 pub(crate) mod dependencies;
 
 pub(crate) mod wakeup;
+
+pub(crate) mod continuation;

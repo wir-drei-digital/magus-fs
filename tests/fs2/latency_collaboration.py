@@ -55,6 +55,18 @@ def collect_post_read_evidence(read_logs,events,captured,row,clock=None,sleep=No
  raise AssertionError('existing60s post-read settle deadline: missing or late '+', '.join(diagnostic['missing']))
 
 
+def smoke_matrix():
+ return [{'background':b,'pattern':p,'size':s,'repetition':r,'enabled':False} for b in [0,500] for p in ['in-place','atomic'] for s in [24,1024,16384] for r in range(3)]
+
+def validate_smoke(rows):
+ import statistics
+ failed=[n for n,r in enumerate(rows) if not r.get('qualified') or r.get('seconds',float('inf'))>.5 or r.get('transient_errors') or r.get('timeout') or r.get('error')]
+ medians={str(b):statistics.median([r.get('seconds',float('inf')) for r in rows if r['background']==b]) for b in [0,500] if any(r['background']==b for r in rows)}
+ cells={(r['background'],r['pattern'],r['size']) for r in smoke_matrix()}
+ cell_medians={'/'.join(map(str,cell)):statistics.median([r.get('seconds',float('inf')) for r in rows if (r['background'],r['pattern'],r['size'])==cell]) for cell in sorted(cells) if sum((r['background'],r['pattern'],r['size'])==cell for r in rows)==3}
+ overall=statistics.median([r.get('seconds',float('inf')) for r in rows]) if rows else None
+ return {'passed':len(rows)==36 and not failed and len(medians)==2 and all(v<=.2 for v in medians.values()) and overall<=.2,'attempts':len(rows),'required':36,'failed_cells':failed,'cell_medians_seconds':cell_medians,'background_medians_seconds':medians,'overall_median_seconds':overall}
+
 def main():
  import argparse,hashlib,json,secrets,time,traceback
  from pathlib import Path
@@ -65,13 +77,16 @@ def main():
  from provenance import capture,verify_linux_image
  from service_protocol import identity,file_entry,GROUP,REPLICA,WORKER
  from service_storage import NS,ALICE
- args=argparse.ArgumentParser();args.add_argument('--mode',choices=['profile','service','metadata-reuse'],required=True);args.add_argument('--image',required=True);args.add_argument('--output',required=True);a=args.parse_args()
+ args=argparse.ArgumentParser();args.add_argument('--mode',choices=['profile','service','metadata-reuse','mounted','smoke'],required=True);args.add_argument('--image',required=True);args.add_argument('--output',required=True);a=args.parse_args()
  assert a.image.startswith('sha256:') and len(a.image)==71,'immutable image required'
+ if a.mode=='mounted':
+  from mounted_continuation import main as mounted_main
+  return mounted_main(['--image',a.image,'--output',a.output])
  if a.mode=='service':
   from continuation_proof import main as service_main
   return service_main(['--image',a.image,'--output',a.output])
  from metadata_reuse import mounted_matrix
- matrix=mounted_matrix() if a.mode=='metadata-reuse' else profile_matrix()
+ matrix=smoke_matrix() if a.mode=='smoke' else mounted_matrix() if a.mode=='metadata-reuse' else profile_matrix()
  class TraceInfra(OwnedInfra):
   def create(self,kind,suffix,args):return super().create(kind,suffix,acceptance_s3_capacity('acceptance',kind,suffix,args))
   def docker(self,*args,**kw):
@@ -116,6 +131,9 @@ def main():
   for n,actor in [('a','alice'),('b','worker')]:
    e=DiskLazy(j,'profile-'+n);endpoints.append((n,e));e.start(n,actor=actor)
    assert any(line.startswith('metadata_profile ') for line in logread(e,n)['log'].splitlines()),'startup metadata profile opt-in absent'
+  if a.mode=='smoke':
+   for n,e in endpoints:
+    switch=e.cli('sync','metadata-profile','--state','/private/'+n+'/state','--enabled','false');assert switch['enabled'] is False
   background=0
   for number,spec in enumerate(matrix):
    phase='sample-'+str(number);size=spec['size']
@@ -127,7 +145,7 @@ def main():
     expected=[hashlib.sha256((f'# Synthetic note {k}\nOwned latency fixture.\n'.encode()*20)[:1024]).hexdigest() for k in range(background)]
     for n,e in endpoints:
      observed=e.execute("import json,hashlib;print(json.dumps([hashlib.sha256(open('/shared/"+n+"/note-%03d.md'%k,'rb').read()).hexdigest() for k in range("+str(background)+")]))",user='1001:1001');assert observed==expected
-   if number==12:
+   if number==12 and a.mode=='profile':
     for n,e in endpoints:
      switch=e.cli('sync','metadata-profile','--state','/private/'+n+'/state','--enabled','false');assert switch['enabled'] is False
    before=settle();prior={s['operation'] for s in before['a']['status']['submissions']}
@@ -138,7 +156,7 @@ def main():
    j.until(lambda:receiver.execute("import json,os,sys;print(json.dumps(os.path.exists(json.load(sys.stdin)+'-ready')))",marker),5)
    row=dict(spec,number=number,before=before,log_offsets=offsets,observer_pid=observer,marker=marker,expected_sha256=digest,status_polls=[]);rows.append(row);save()
    try:
-    row.update(sender.execute(WRITE,{'body':value.hex(),'atomic':False,'path':'/shared/a/reports/bench'},user='1001:1001'));deadline=time.monotonic()+25;captured=None
+    row.update(sender.execute(WRITE,{'body':value.hex(),'atomic':spec.get('pattern')=='atomic','path':'/shared/a/reports/bench'},user='1001:1001'));deadline=time.monotonic()+25;captured=None
     while time.monotonic()<deadline:
      logs={n:logread(e,n,offsets[n],marker if n=='b' else None) for n,e in endpoints}
      row.update(logs['b'].get('ordinary_observer',{}));es=events(logs['a']['log'],'a')+events(logs['b']['log'],'b');shared=[x for x in es if x['owner']=='a' and x['stage']=='shared_receipt'];head=shared[-1]['head'] if shared else None
@@ -161,6 +179,8 @@ def main():
     row['qualified']=True;print(json.dumps({k:row[k] for k in ['number','size','background','enabled','seconds','firstbytes_seconds','target_pass']}),flush=True)
    except Exception as error:row.update(error=str(error),qualified=False);raise
    finally:save();snap('sample-'+str(number)+'-every-outcome')
+  if a.mode=='smoke':
+   screen=validate_smoke(rows);i.write_json('smoke-screen.json',screen);assert screen['passed'],'fixed36 latency screen failed; no800 authorization'
   if a.mode=='metadata-reuse':
    import statistics
    assert len(rows)==3 and all(r['target_pass'] for r in rows) and statistics.median(r['seconds'] for r in rows)<=.2,'three-save metadata reuse latency gate failed'

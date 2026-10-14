@@ -21,3 +21,6 @@ pub fn mount(
 
 #[cfg(any(target_os = "linux", test))]
 mod inventory;
+
+#[cfg(any(target_os = "linux", test))]
+mod linux_capabilities;

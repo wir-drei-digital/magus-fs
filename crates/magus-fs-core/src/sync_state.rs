@@ -924,8 +924,22 @@ impl Replica {
                 }
             }
         }
+        let retained = if matches!(
+            update.state,
+            SubmissionState::Denied | SubmissionState::Failed
+        ) {
+            core.mounted_recovery_record("original publication requires recovery")?
+        } else {
+            None
+        };
         r.progress = update;
         let tx = core.journal.db.unchecked_transaction()?;
+        if let Some((operation, bytes)) = retained {
+            tx.execute(
+                "INSERT INTO local_work_recovery VALUES(?,?)",
+                params![operation.as_str(), bytes],
+            )?;
+        }
         for record in covered.iter().chain(std::iter::once(&r)) {
             tx.execute(
                 "UPDATE sync_queue SET record=? WHERE operation=?",

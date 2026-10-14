@@ -63,6 +63,11 @@ impl Replica {
             observed_entries.extend(r.tree.entries.into_iter().map(|e| e.id));
         }
         let next = generation.checked_add(1).ok_or(FsError::LimitExceeded)?;
+        let retained = if revision.is_none() {
+            core.mounted_recovery_record("current authority denied")?
+        } else {
+            None
+        };
         let tx = core.journal.db.transaction()?;
         tx.execute(
             "INSERT INTO live_authority_history VALUES(?,?)",
@@ -75,6 +80,12 @@ impl Replica {
             "INSERT OR REPLACE INTO live_authority VALUES(1,?)",
             [revision.map(RevisionId::as_str)],
         )?;
+        if let Some((operation, bytes)) = retained {
+            tx.execute(
+                "INSERT INTO local_work_recovery VALUES(?,?)",
+                params![operation.as_str(), bytes],
+            )?;
+        }
         tx.commit()?;
         core.remote_entries.extend(observed_entries);
         Ok(())
@@ -250,7 +261,23 @@ impl Replica {
         let mut entries = old.tree.entries.clone();
         entries.extend(next.tree.entries.clone());
         entries.push(perm::root_entry(&next.tree));
+        let visibility = core.current_visibility()?.map(|mut snapshot| {
+            for entry in &entries {
+                if !snapshot.entries.contains(entry) {
+                    snapshot.entries.push(entry.clone());
+                }
+            }
+            snapshot.tree = next.tree.clone();
+            snapshot.generation = next.generation;
+            snapshot
+        });
         let tx = core.journal.db.transaction()?;
+        if let Some(snapshot) = visibility {
+            tx.execute(
+                "UPDATE dirty_visibility SET record=? WHERE singleton=1",
+                [json(&snapshot)?],
+            )?;
+        }
         if let (Some(active), Some(new)) = (&active, &binding) {
             tx.execute(
                 "INSERT OR IGNORE INTO sync_sources VALUES(?,?)",
@@ -285,6 +312,9 @@ impl Replica {
         let mut next = core.working()?.clone();
         if next.head != *revision || next.epoch != epoch || next.dirty {
             return Err(FsError::GenerationMismatch);
+        }
+        if core.current_visibility()?.is_some() {
+            return Err(FsError::CheckpointWaiting);
         }
         next.applied = true;
         let binding: Option<SyncBinding> = core

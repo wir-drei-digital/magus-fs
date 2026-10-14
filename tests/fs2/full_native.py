@@ -28,9 +28,9 @@ class Endpoint:
     def cli(self,c,*args):
         return self.run("deadline=time.monotonic()+3\nwhile True:\n p=subprocess.run([s[0],*s[1]],capture_output=True,text=True,timeout=12)\n if p.returncode==0:break\n if json.loads(p.stdout).get('error')!='replica_busy' or time.monotonic()>=deadline:raise AssertionError((s[1],p.stdout,p.stderr))\n time.sleep(.03)\nprint(p.stdout)",[self.binary,[*args,'--state',c['state']]])
     def status(self,c):return self.cli(c,'sync','status')
-    def create(self,name,nest=False,prefixes=None):
+    def create(self,name,nest=False,prefixes=None,actions=None):
         replica=identity('replica')
-        code,grant=self.j.request('POST',self.j.root+'/grants',body={'delegate':{'replica':replica,'expires':int(time.time())+1800,'actions':['read','write','history','integrate'],'branches':['main'],'prefixes':prefixes or ['']}});assert code==200,grant
+        code,grant=self.j.request('POST',self.j.root+'/grants',body={'delegate':{'replica':replica,'expires':int(time.time())+1800,'actions':actions or ['read','write','history','integrate'],'branches':['main'],'prefixes':prefixes or ['']}});assert code==200,grant
         # A path-scoped owner hydrates exactly its own authorized projection.
         actor='scoped-'+replica if prefixes else 'alice'
         if prefixes:self.j.tokens[actor]=grant['token']

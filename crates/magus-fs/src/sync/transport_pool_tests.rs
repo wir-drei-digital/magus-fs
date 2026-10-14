@@ -21,10 +21,10 @@ impl Reply {
     }
 }
 
-pub(super) struct Fixture {
+pub(in crate::sync) struct Fixture {
     _network: std::sync::MutexGuard<'static, ()>,
     dir: PathBuf,
-    pub(super) transport: Transport,
+    pub(in crate::sync) transport: Transport,
     config: ReplicaConfig,
     accepted: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<String>>>,
@@ -35,7 +35,14 @@ pub(super) struct Fixture {
     port: u16,
 }
 impl Fixture {
-    pub(super) fn new() -> Self {
+    pub(in crate::sync) fn response(&self, status: u16, body: &[u8]) {
+        self.replies
+            .lock()
+            .unwrap()
+            .push_back(Reply::new(status, body));
+    }
+
+    pub(in crate::sync) fn new() -> Self {
         let network = NETWORK_TEST.lock().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();

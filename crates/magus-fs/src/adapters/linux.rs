@@ -82,6 +82,7 @@ struct State {
     directories: BTreeSet<EntryId>,
     handles: BTreeMap<u64, OpenFile>,
     next_handle: u64,
+    capabilities: super::linux_capabilities::CapabilityTracker,
 }
 impl State {
     fn ws(&self, req: &Request) -> Result<Workspace> {
@@ -233,7 +234,8 @@ impl State {
         workspace: Workspace,
         handle: Handle,
         flags: i32,
-    ) {
+    ) -> Result<()> {
+        self.capabilities.pin(fh.0, handle.entry_id().clone())?;
         self.handles.insert(
             fh.0,
             OpenFile {
@@ -243,6 +245,7 @@ impl State {
                 access: flags & libc::O_ACCMODE,
             },
         );
+        Ok(())
     }
     fn open(&mut self, req: &Request, path: &str, flags: i32) -> Result<FileHandle> {
         let workspace = self.ws(req)?;
@@ -257,7 +260,7 @@ impl State {
         if flags & libc::O_TRUNC != 0 {
             workspace.truncate(&handle, 0)?;
         }
-        self.register(fh, req, workspace, handle, flags);
+        self.register(fh, req, workspace, handle, flags)?;
         Ok(fh)
     }
 }
@@ -404,6 +407,7 @@ impl Filesystem for Adapter {
         empty(
             reply,
             self.with(|s| {
+                s.capabilities.release(fh.0)?;
                 s.handles.remove(&fh.0).ok_or(FsError::StaleHandle)?;
                 Ok(())
             }),
@@ -413,11 +417,16 @@ impl Filesystem for Adapter {
         match self.with(|s| {
             let e = s.entry(req, ino)?;
             s.ws(req)?.list(&e.path)?;
-            Ok(())
+            let fh = s.reserve_handle()?;
+            s.capabilities.pin(fh.0, e.id)?;
+            Ok(fh)
         }) {
-            Ok(()) => reply.opened(FileHandle(0), FopenFlags::empty()),
+            Ok(fh) => reply.opened(fh, FopenFlags::empty()),
             Err(e) => reply.error(e),
         }
+    }
+    fn releasedir(&self, _: &Request, _: INodeNo, fh: FileHandle, _: OpenFlags, reply: ReplyEmpty) {
+        empty(reply, self.with(|s| s.capabilities.release(fh.0)))
     }
     fn readdir(
         &self,
@@ -488,7 +497,7 @@ impl Filesystem for Adapter {
             let a = s.attr(req, &e)?;
             // Creation already established this capability under the engine lock.
             // Reopening its pathname would fail for restrictive initial modes.
-            s.register(fh, req, w, h, flags);
+            s.register(fh, req, w, h, flags)?;
             Ok((a, fh))
         }) {
             Ok((a, h)) => reply.created(
@@ -755,6 +764,9 @@ pub fn mount(
             epoch: rep.live_status().map(|v| v.epoch).unwrap_or(0),
             handles: BTreeMap::new(),
             next_handle: 1,
+            // fuser 0.18 RELEASE is after the last FD and mmap reference. The real
+            // FD-close/mmap journey remains a required qualification gate.
+            capabilities: super::linux_capabilities::CapabilityTracker::new(true),
         })),
         read_only,
     };
@@ -775,6 +787,21 @@ pub fn mount(
             MountOption::RW
         },
     ];
+    let binding = rep.sync_status()?.binding;
+    let mounted_policy = !read_only
+        && binding
+            .as_ref()
+            .is_some_and(|b| b.publication == PublicationMode::SharedLive);
+    if mounted_policy {
+        let actor =
+            crate::sync::publication_actor(&rep, rep.actor_for_uid(unsafe { libc::geteuid() })?)?;
+        let owner = rep.begin_live(revision, actor.clone(), false)?;
+        rep.enable_mounted_collaboration(
+            &owner,
+            binding.as_ref().ok_or(FsError::ConfigMismatch)?,
+            actor,
+        )?;
+    }
     let live_state = adapter.state.clone();
     let session = fuser::Session::new(adapter, mountpoint, &cfg)?;
     let notifier = session.notifier();
@@ -861,17 +888,151 @@ pub fn mount(
                 });
             while !stop.load(Ordering::Relaxed) {
                 let observed = incoming_wakeup.epoch();
-                let result = incoming.poll(|binding, generation| {
-                    let mut state = live_state.lock().map_err(|_| FsError::ReplicaBusy)?;
-                    let actor = Actor::new(state.config.authorities[0].principal.clone());
-                    let adoption = rep.adopt_remote_view(binding, generation, actor)?;
-                    state.epoch = adoption.epoch;
-                    Ok(adoption)
-                });
+                let result = if mounted_policy {
+                    incoming.poll_mounted(|prepared| {
+                        let mut state = live_state.lock().map_err(|_| FsError::ReplicaBusy)?;
+                        let actor = crate::sync::publication_actor(
+                            &rep,
+                            Actor::new(state.config.authorities[0].principal.clone()),
+                        )?;
+                        let snapshot = rep.scheduling_snapshot()?;
+                        if snapshot.dirty {
+                            let capabilities = state.capabilities.snapshot();
+                            let binding =
+                                rep.sync_status()?.binding.ok_or(FsError::ConfigMismatch)?;
+                            let fence = ContinuationFence {
+                                generation: snapshot.generation,
+                                head: snapshot.head.ok_or(FsError::BaseMismatch)?,
+                                binding: binding.clone(),
+                                authority_generation: prepared.authority_generation,
+                                credential_stamp: prepared.credential_stamp.clone(),
+                                capability_generation: capabilities.generation,
+                            };
+                            let candidate = rep.prepare_continuation(
+                                &prepared.binding,
+                                prepared.proof.as_ref(),
+                                &fence,
+                                &capabilities,
+                                actor,
+                            )?;
+                            if crate::sync::continuation::current_credential_stamp(&rep, &binding)?
+                                != prepared.credential_stamp
+                            {
+                                return Err(FsError::GenerationMismatch);
+                            }
+                            rep.commit_continuation(
+                                candidate,
+                                &fence,
+                                &state.capabilities.snapshot(),
+                            )
+                            .map(crate::sync::MountedIncoming::Continued)
+                        } else {
+                            let adoption = rep.adopt_remote_view(
+                                prepared.binding,
+                                snapshot.generation,
+                                actor,
+                            )?;
+                            state.epoch = adoption.epoch;
+                            Ok(crate::sync::MountedIncoming::Clean(adoption))
+                        }
+                    })
+                } else {
+                    incoming.poll(|binding, generation| {
+                        let mut state = live_state.lock().map_err(|_| FsError::ReplicaBusy)?;
+                        let actor = Actor::new(state.config.authorities[0].principal.clone());
+                        let adoption = rep.adopt_remote_view(binding, generation, actor)?;
+                        state.epoch = adoption.epoch;
+                        Ok(crate::sync::MountedIncoming::Clean(adoption))
+                    })
+                };
                 match result {
-                    Ok(Some(adoption)) => pending = Some(adoption),
+                    Ok(Some(crate::sync::MountedIncoming::Clean(adoption))) => {
+                        pending = Some(adoption)
+                    }
+                    Ok(Some(crate::sync::MountedIncoming::Continued(outcome))) => {
+                        pending = None;
+                        eprintln!("mounted_continuation outcome={outcome:?}");
+                    }
                     Ok(None) => {}
                     Err(error) => eprintln!("live_discovery_error code={}", error.code()),
+                }
+                if mounted_policy {
+                    if let Ok(Some(mut visibility)) = rep.pending_visibility() {
+                        let verified = (|| -> Result<()> {
+                            let (inodes, initial_capabilities) = {
+                                let state = live_state.lock().map_err(|_| FsError::ReplicaBusy)?;
+                                (state.inodes.clone(), state.capabilities.snapshot())
+                            };
+                            visibility.capability_generation = initial_capabilities.generation;
+                            for (i, _) in inodes.iter().enumerate() {
+                                notifier.inval_inode(INodeNo(i as u64 + 1), 0, 0)?;
+                            }
+                            for entry in &visibility.entries {
+                                if entry.path.is_empty() {
+                                    continue;
+                                }
+                                for (i, _) in inodes
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, v)| v.0 == entry.parent)
+                                {
+                                    notifier.inval_entry(
+                                        INodeNo(i as u64 + 1),
+                                        OsStr::new(
+                                            entry
+                                                .path
+                                                .rsplit('/')
+                                                .next()
+                                                .ok_or(FsError::InvalidPath)?,
+                                        ),
+                                    )?;
+                                }
+                            }
+                            for entry in &visibility.tree.entries {
+                                let observed = std::fs::metadata(mountpoint.join(&entry.path))?;
+                                match &entry.content {
+                                    EntryContent::File { version }
+                                        if observed.is_file() && observed.len() == version.size => {
+                                    }
+                                    EntryContent::Directory if observed.is_dir() => {}
+                                    _ => return Err(FsError::StaleHandle),
+                                }
+                            }
+                            for entry in &visibility.entries {
+                                if !entry.path.is_empty()
+                                    && !visibility.tree.entries.iter().any(|e| e.path == entry.path)
+                                    && mountpoint.join(&entry.path).try_exists()?
+                                {
+                                    return Err(FsError::StaleHandle);
+                                }
+                            }
+                            let state = live_state.lock().map_err(|_| FsError::ReplicaBusy)?;
+                            let capabilities = state.capabilities.snapshot();
+                            rep.complete_visibility(&visibility, &capabilities)
+                        })();
+                        match verified {
+                            Err(error) => {
+                                eprintln!("mounted_visibility_error code={}", error.code())
+                            }
+                            Ok(()) => {
+                                let status = rep.scheduling_snapshot();
+                                if let Ok(status) = status {
+                                    if !status.dirty {
+                                        if let Ok(live) = rep.live_status() {
+                                            if let Ok(mut state) = live_state.lock() {
+                                                state.epoch = live.epoch;
+                                            }
+                                            pending = Some(Adoption {
+                                                revision: live.revision,
+                                                epoch: live.epoch,
+                                                entries: visibility.entries,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 if let Some(adoption) = &pending {
                     let started = std::time::Instant::now();

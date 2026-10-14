@@ -106,7 +106,11 @@ pub(crate) fn admit_engine_checkpoint(rep: &Replica) -> Result<(), FsError> {
         return Ok(());
     };
     if head == binding.view.revision || sync.submissions.iter().any(|p| p.local_revision == head) {
-        return Ok(());
+        return match rep.checkpoint_readiness()? {
+            CheckpointReadiness::Ready => Ok(()),
+            CheckpointReadiness::Waiting { .. } => Err(FsError::CheckpointWaiting),
+            CheckpointReadiness::Blocked { .. } => Err(FsError::CheckpointBlocked),
+        };
     }
     let revision = rep.revision(&head)?;
     // Issued projections and foreign revisions are not local saves. In particular,

@@ -406,6 +406,13 @@ async fn run(job: Job, pool: Arc<Mutex<Pool>>) -> DispatchResult<Vec<u8>> {
             Some("invalid_cursor") => "invalid_cursor",
             Some("cursor_expired") => "cursor_expired",
             Some("base_unavailable") => "base_unavailable",
+            Some("continuation_evidence_unavailable") => "continuation_evidence_unavailable",
+            Some("continuation_evidence_limit") => "continuation_evidence_limit",
+            Some("continuation_not_descendant") => "continuation_not_descendant",
+            Some("continuation_scope_unsupported") => "continuation_scope_unsupported",
+            None if status.as_u16() == 404 && job.path == "/continuations/proof" => {
+                "continuation_capability_unavailable"
+            }
             _ => match status.as_u16() {
                 401 => "invalid_credential",
                 404 => "denied",

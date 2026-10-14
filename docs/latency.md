@@ -207,3 +207,58 @@ runtime/test hash identity does not describe the corrected Python files. No
 benchmark rerun, new Linux build or mounted measurement accompanies this fix.
 All 15 original blocks remain included; slow C block index 3 is the fourth block,
 not the last. The failed 100-ms gate and independent P3 live requirement remain.
+
+## Mounted continuation and recovery, October 14
+
+Core journal version8 now retains mounted checkpoint policy, own/disjoint
+continuation snapshots, dirty visibility and local recovery. Ordinary writes stay
+available while new checkpoints wait for the original immutable publication.
+Foreign continuation requires current authenticated inclusion, disjoint stable
+identities/name slots and complete live-capability accounting. Overlap, denial,
+unsupported structure and affected pinned handles retain local work instead.
+Dirty continuation and visibility completion never acknowledge Applied.
+
+`magus-fs sync local-work list --state STATE` reports retained work and readiness.
+`export --id OPERATION --destination PATH --state STATE` exports currently
+readable ordinary files. `use-remote --operation-id OPERATION
+--expected-generation GENERATION --state STATE` explicitly retains the current
+local snapshot and selects freshly authenticated remote state. Unresolved frozen
+publication requests remain unchanged and block this selection.
+
+The combined P3 actual TLS/PostgreSQL/S3 producer journey passed, including
+merge-result identity, authorization races, rollback, retention, legacy candidate
+compatibility and256/257-node bounds. Eleven real Linux mounted correctness
+cases passed on the final client: own/disjoint atomic continuation, never-issued
+own view, actual merge result, overlap/export/current selection, response-loss
+and restart, denial retention, old-client schema refusal and unchanged Native
+routing. A real private mmap retained its kernel capability after its sole file
+descriptor closed; foreign affected work remained blocked until munmap. Shared
+mmap is unsupported by the existing direct-I/O mount and was not enabled.
+The separate actual two-agent rendezvous was not completed; scripts do not
+substitute for that practicality gate.
+
+The original fixed36 screen completed every sample, with first bytes kept
+separate from exact Shared/Applied/fresh post-Applied read completion:
+
+| Background | Median | Maximum |
+|---|---:|---:|
+| Tiny |538.033ms|1.131777s|
+|500 files|4.174349s|6.456239s|
+
+Overall median was2.112089s. Thirty samples exceeded500ms. Eight atomic samples
+recorded transient ordinary-read EACCES, even though all36 eventually completed
+with exact receipt/view binding and a correct fresh read. The screen therefore
+**failed**, including its no-read-error requirement. No host release build or
+800-save cohorts followed; no samples were selectively rerun or discarded.
+Correctness case coverage does not resolve this ordinary-read quality concern.
+
+Raw service evidence is `/private/tmp/magus-collaboration-task3-p3-service-20261014-b`;
+mounted evidence is `/private/tmp/magus-collaboration-task3-p3-mounted-20261014-f`;
+all36 samples are in `/private/tmp/magus-collaboration-task3-p3-smoke-20261014-f`.
+Owned cleanup completed. Original failures and correction images are retained.
+Final image `sha256:ab971c7b2a9f33b5d12d9643d7d59f8e2615a9e5dbec81ab801edcd37b0aeac6`
+has the same service binaries as the qualified producer image; the corrected
+client has its own mounted evidence. The earlier failed cache comparison remains
+unchanged. Full-walk/visibility follow-on work requires its separate reviewed
+plan; no affected-set acknowledgement, permission shortcut or early Applied was
+introduced here.

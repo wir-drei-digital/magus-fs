@@ -264,3 +264,175 @@ pub(crate) fn subscribe(
         }
     })
 }
+
+#[derive(Clone)]
+pub(crate) struct MountedPrepared {
+    pub binding: SyncBinding,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub proof: Option<ContinuationProofV1>,
+    pub credential_stamp: ObjectId,
+    pub authority_generation: u64,
+}
+pub(crate) enum MountedIncoming {
+    Clean(Adoption),
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Continued(ContinuationOutcome),
+}
+impl Incoming {
+    /// Snapshot ownership, release it for HTTP, then compare every local fence again.
+    pub(crate) fn poll_mounted(
+        &mut self,
+        apply: impl FnOnce(MountedPrepared) -> Result<MountedIncoming, FsError>,
+    ) -> Result<Option<MountedIncoming>, FsError> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (binding, transport, credential, generation, head, authority, receipt, dirty, ready) = {
+            let Some(_gate) = self
+                .execution
+                .acquire(Instant::now() + Duration::from_millis(50))?
+            else {
+                return Ok(None);
+            };
+            let sync = self.rep.sync_status()?;
+            let binding = sync.binding.ok_or(FsError::ConfigMismatch)?;
+            let transport = Transport::new(binding.clone(), &self.rep.configuration()?)?;
+            let credential = transport.credential_stamp()?;
+            let snapshot = self.rep.scheduling_snapshot()?;
+            let head = snapshot.head.ok_or(FsError::BaseMismatch)?;
+            let matching: Vec<_> = sync
+                .submissions
+                .iter()
+                .filter(|p| p.local_revision == head)
+                .collect();
+            let receipt = if matching.len() == 1 {
+                matching[0].shared_receipt.clone()
+            } else {
+                None
+            };
+            let ready = receipt.is_some() || head == binding.view.revision;
+            (
+                binding,
+                transport,
+                credential,
+                snapshot.generation,
+                head,
+                self.rep.live_status()?.authority_generation,
+                receipt,
+                snapshot.dirty,
+                ready,
+            )
+        };
+        let discovered = (|| -> Result<_, Failure> {
+            if dirty {
+                if let Some(receipt) = receipt {
+                    match super::continuation::fetch_proof(
+                        &transport,
+                        &ContinuationRequestV1 { receipt },
+                        deadline,
+                    ) {
+                        Ok(response) => {
+                            return Ok((
+                                response.proof.view.clone(),
+                                encode_revision(&response.descriptor)?,
+                                Some(response.proof),
+                            ))
+                        }
+                        Err(error)
+                            if matches!(
+                                error.code,
+                                "continuation_evidence_unavailable"
+                                    | "continuation_evidence_limit"
+                                    | "continuation_not_descendant"
+                                    | "continuation_scope_unsupported"
+                                    | "continuation_capability_unavailable"
+                            ) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            let view: ViewBinding =
+                transport.json("POST", "/views", json!({"branch":binding.branch}), deadline)?;
+            let bytes = transport.bytes(
+                "GET",
+                &format!("/views/{}/descriptor", view.view.as_str()),
+                vec![],
+                MAX_DESCRIPTOR,
+                deadline,
+                false,
+            )?;
+            let descriptor = decode_revision(&bytes)?;
+            if !descriptor.parents.is_empty() || revision_id(&descriptor)? != view.revision {
+                return Err(FsError::InvalidDescriptor.into());
+            }
+            Ok((view, bytes, None))
+        })();
+        let Some(_gate) = self
+            .execution
+            .acquire(Instant::now() + Duration::from_millis(50))?
+        else {
+            return Ok(None);
+        };
+        let snapshot = self.rep.scheduling_snapshot()?;
+        if self.rep.sync_status()?.binding.as_ref() != Some(&binding)
+            || snapshot.generation != generation
+            || snapshot.head.as_ref() != Some(&head)
+            || self.rep.live_status()?.authority_generation != authority
+            || transport.credential_stamp()? != credential
+        {
+            return Err(FsError::GenerationMismatch);
+        }
+        let (view, bytes, proof) = match discovered {
+            Ok(result) => result,
+            Err(error) => {
+                if matches!(error.code, "denied" | "invalid_credential") {
+                    self.rep.observe_remote_authority(None, authority)?;
+                }
+                let mut recovery = self.rep.incoming_recovery()?;
+                recovery.discovery_error = Some(error.code.into());
+                self.rep.record_incoming_recovery(recovery)?;
+                return Err(if error.retryable {
+                    FsError::InvalidSource
+                } else {
+                    FsError::PermissionDenied
+                });
+            }
+        };
+        let mut next = binding.clone();
+        next.source = RemoteSourceId::random()?;
+        next.view = view;
+        if let Some(existing) = self
+            .rep
+            .sync_sources()?
+            .into_iter()
+            .find(|b| b.view == next.view)
+        {
+            next = existing;
+        }
+        self.rep.register_sync_source(next.clone())?;
+        self.rep.import_revision(
+            ImportDescriptor {
+                expected: next.view.revision.clone(),
+                bytes,
+            },
+            ChunkSource::Remote {
+                source: next.source.clone(),
+            },
+        )?;
+        self.rep
+            .observe_remote_authority(Some(&next.view.revision), authority)?;
+        install_sources(&self.rep, Some(next.clone()))?;
+        self.credential = Some(credential.clone());
+        if !ready || next == binding {
+            return Ok(None);
+        }
+        if transport.credential_stamp()? != credential {
+            return Err(FsError::GenerationMismatch);
+        }
+        apply(MountedPrepared {
+            binding: next,
+            proof,
+            credential_stamp: credential,
+            authority_generation: self.rep.live_status()?.authority_generation,
+        })
+        .map(Some)
+    }
+}

@@ -17,7 +17,7 @@ mod tests {
 use magus_fs_core::{protocol::*, *};
 #[cfg(test)]
 #[path = "transport_pool_tests.rs"]
-mod pool_tests;
+pub(super) mod pool_tests;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,

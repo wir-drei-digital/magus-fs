@@ -112,7 +112,7 @@ class Journey(ProtocolJourney):
         self.expect('oversize-request', 'POST', self.root+'/continuations/proof', 413, raw=b' '*65537, headers={'Content-Type':'application/json'}, actor='worker')
         other_token=secrets.token_hex(32)
         other_authority=dict(authority,principal=BOB,uid=1002,dac_override=True)
-        self.i.provision([{'namespace':NS,'principal':BOB,'replica':WORKER,'token':other_token,'expires':int(time.time())+1800,'actions':['read','write','integrate'],'branches':['main'],'prefixes':[''],'authority':other_authority}])
+        self.i.provision([{'namespace':NS,'principal':BOB,'replica':identity('replica'),'token':other_token,'expires':int(time.time())+1800,'actions':['read','write','integrate'],'branches':['main'],'prefixes':[''],'authority':other_authority}])
         self.tokens['other-principal']=other_token
         self.proof(first,actor='other-principal',status=404,code='not_found',name='same-namespace-other-principal')
         for actor in ['alice','readonly','bob']:

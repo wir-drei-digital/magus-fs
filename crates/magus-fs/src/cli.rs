@@ -21,7 +21,7 @@ fn args(mut argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
         }
         let sub = argv.remove(1);
         argv[0] = format!("sync-{sub}");
-        if sub == "recovery" || sub == "conflicts" {
+        if sub == "recovery" || sub == "conflicts" || sub == "local-work" {
             if argv.len() < 2 || argv[1].starts_with("--") {
                 return Err((2, FsError::InvalidPath));
             }
@@ -34,6 +34,9 @@ fn args(mut argv: Vec<String>) -> Result<(String, BTreeMap<String, String>)> {
         "sync-attach" => vec!["state", "profile", "branch", "publication"],
         "sync-run" => vec!["state", "revision", "operation-id", "enqueue-only", "serve"],
         "sync-status" => vec!["state", "revision"],
+        "sync-local-work-list" => vec!["state"],
+        "sync-local-work-export" => vec!["state", "id", "destination"],
+        "sync-local-work-use-remote" => vec!["state", "operation-id", "expected-generation"],
         "sync-metadata-profile" => vec!["state", "enabled"],
         "sync-declare" => vec!["state", "request"],
         "sync-drain" => vec!["state", "revision", "level", "deadline-ms"],
@@ -431,6 +434,9 @@ pub(crate) fn control(
     command: &str,
     options: &BTreeMap<String, String>,
 ) -> Result<Value> {
+    if command.starts_with("sync-local-work-") {
+        return local_work_control(rep, actor, command, options);
+    }
     if command.starts_with("sync-") {
         return sync_control(rep, command, options);
     }
@@ -838,6 +844,63 @@ fn recovery_control(
     }
 }
 
+fn local_work_control(
+    rep: &Replica,
+    actor: Actor,
+    command: &str,
+    options: &BTreeMap<String, String>,
+) -> Result<Value> {
+    match command {
+        "sync-local-work-list" => Ok(
+            json!({"ok":true,"recovery":rep.local_work_recovery().map_err(|e|(1,e))?,"readiness":rep.checkpoint_readiness().map_err(|e|(1,e))?}),
+        ),
+        "sync-local-work-export" => {
+            let operation = OperationId::parse(required(options, "id")?).map_err(|e| (2, e))?;
+            rep.export_local_work(
+                &operation,
+                absolute(required(options, "destination")?)?,
+                actor,
+            )
+            .map_err(|e| (1, e))?;
+            Ok(json!({"ok":true}))
+        }
+        "sync-local-work-use-remote" => {
+            let operation =
+                OperationId::parse(required(options, "operation-id")?).map_err(|e| (2, e))?;
+            let expected: u64 = required(options, "expected-generation")?
+                .parse()
+                .map_err(|_| (2, FsError::InvalidDescriptor))?;
+            let mut incoming = crate::sync::Incoming::new(rep).map_err(|e| (1, e))?;
+            let outcome = incoming
+                .poll_mounted(|prepared| {
+                    let snapshot = rep.scheduling_snapshot()?;
+                    if snapshot.generation != expected {
+                        return Err(FsError::GenerationMismatch);
+                    }
+                    let binding = rep.sync_status()?.binding.ok_or(FsError::ConfigMismatch)?;
+                    let fence = ContinuationFence {
+                        generation: expected,
+                        head: snapshot.head.ok_or(FsError::BaseMismatch)?,
+                        binding,
+                        authority_generation: prepared.authority_generation,
+                        credential_stamp: prepared.credential_stamp,
+                        capability_generation: 0,
+                    };
+                    rep.use_current_remote(&operation, &prepared.binding, &fence, actor)
+                        .map(crate::sync::MountedIncoming::Clean)
+                })
+                .map_err(|e| (1, e))?;
+            match outcome {
+                Some(crate::sync::MountedIncoming::Clean(adoption)) => {
+                    Ok(json!({"ok":true,"adoption":adoption}))
+                }
+                _ => Err((1, FsError::CheckpointBlocked)),
+            }
+        }
+        _ => Err((2, FsError::InvalidPath)),
+    }
+}
+
 #[cfg(test)]
 mod sync_tests {
     use super::*;
@@ -1153,6 +1216,46 @@ mod sync_tests {
             "checkpoint",
             &BTreeMap::from([("operation-id".into(), operation.as_str().into())]),
         )
+    }
+    #[test]
+    fn cli_checkpoint_and_remote_recovery_share_owner() {
+        let (root, rep, ws, actor, binding) = admission_fixture(true);
+        rep.enable_mounted_collaboration(&ws, &binding.unwrap(), actor.clone())
+            .unwrap();
+        explicit_checkpoint(&rep, actor.clone(), OperationId::random().unwrap()).unwrap();
+        let result = explicit_checkpoint(&rep, actor.clone(), OperationId::random().unwrap());
+        assert!(matches!(result, Err((1, FsError::CheckpointWaiting))));
+        let original = rep.pending_submissions().unwrap();
+        drop(ws);
+        drop(rep);
+        let rep = Replica::reopen(root.join("state")).unwrap();
+        assert!(matches!(
+            explicit_checkpoint(&rep, actor.clone(), OperationId::random().unwrap()),
+            Err((1, FsError::CheckpointWaiting))
+        ));
+        assert_eq!(rep.pending_submissions().unwrap(), original);
+        let list = control(&rep, actor, "sync-local-work-list", &BTreeMap::new()).unwrap();
+        assert_eq!(list["ok"], true);
+        let (command, _) = args(
+            [
+                "sync",
+                "local-work",
+                "use-remote",
+                "--state",
+                "/s",
+                "--operation-id",
+                "x",
+                "--expected-generation",
+                "1",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        )
+        .unwrap();
+        assert_eq!(command, "sync-local-work-use-remote");
+        drop(rep);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn checkpoint_admission_orders_two_controls_and_control_first_after_restart() {

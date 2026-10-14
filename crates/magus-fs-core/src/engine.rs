@@ -204,12 +204,28 @@ impl Core {
             .collect();
         next.orphans.retain(|e| live.contains(&e.id));
         let bytes = json(&next)?;
+        let visibility = self.current_visibility()?.map(|mut snapshot| {
+            snapshot.generation = next.generation;
+            snapshot.tree = next.tree.clone();
+            for entry in &next.tree.entries {
+                if !snapshot.entries.contains(entry) {
+                    snapshot.entries.push(entry.clone());
+                }
+            }
+            snapshot
+        });
         self.journal.guard()?;
         let tx = self
             .journal
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute("INSERT OR REPLACE INTO working VALUES(1,?)", [bytes])?;
+        if let Some(visibility) = visibility {
+            tx.execute(
+                "UPDATE dirty_visibility SET record=? WHERE singleton=1",
+                [json(&visibility)?],
+            )?;
+        }
         crate::faults::hit("db-commit")?;
         tx.commit()?;
         self.working = Some(next);
@@ -247,9 +263,17 @@ impl Core {
         tx.commit()?;
         Ok(inventory)
     }
+    pub(crate) fn pinned_entry_ids(&self) -> BTreeSet<EntryId> {
+        self.handles
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|h| h.entry.id.clone())
+            .collect()
+    }
     fn protected(&self) -> Result<BTreeSet<ObjectId>, FsError> {
         let mut protected = self.sync_roots()?;
         protected.extend(self.native_roots()?);
+        protected.extend(self.continuation_roots()?);
         if let Some(w) = &self.working {
             if w.dirty {
                 protected.extend(cache::object_set(&w.tree));
@@ -983,6 +1007,26 @@ impl Replica {
     }
 }
 impl Workspace {
+    pub(crate) fn validate_mounted_owner(
+        &self,
+        replica: &Replica,
+        actor: &Actor,
+    ) -> Result<(), FsError> {
+        if !Arc::ptr_eq(&self.core, &replica.core) {
+            return Err(FsError::ConfigMismatch);
+        }
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
+        if self.view.is_some() {
+            return Err(FsError::UnsupportedMode);
+        }
+        if self.actor != *actor {
+            return Err(FsError::PermissionDenied);
+        }
+        Ok(())
+    }
+
     fn metadata_context<'a>(
         &'a self,
         core: &'a Core,
@@ -1806,6 +1850,11 @@ impl Workspace {
         }
         if expected_generation != working.generation {
             return Err(FsError::GenerationMismatch);
+        }
+        match core.mounted_checkpoint_readiness()? {
+            CheckpointReadiness::Ready => {}
+            CheckpointReadiness::Waiting { .. } => return Err(FsError::CheckpointWaiting),
+            CheckpointReadiness::Blocked { .. } => return Err(FsError::CheckpointBlocked),
         }
         let revision = Revision {
             format: FORMAT.into(),

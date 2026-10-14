@@ -209,6 +209,9 @@ impl Server {
                                     | "sync-run"
                                     | "sync-status"
                                     | "sync-metadata-profile"
+                                    | "sync-local-work-list"
+                                    | "sync-local-work-export"
+                                    | "sync-local-work-use-remote"
                                     | "sync-drain"
                                     | "sync-integrate"
                                     | "sync-declare"
@@ -245,6 +248,7 @@ impl Server {
                                             | "sync-recovery-inspect"
                                             | "sync-recovery-settle"
                                             | "sync-resolve"
+                                            | "sync-local-work-use-remote"
                                     ))
                             {
                                 return Err((1, FsError::ReadOnly));
@@ -331,6 +335,24 @@ mod tests {
         )
         .unwrap();
         let server = Server::start(rep.clone(), &path, false).unwrap();
+        let listed = request(&path, "sync-local-work-list", &BTreeMap::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(listed.exit, 0, "{}", listed.value);
+        let exported = request(
+            &path,
+            "sync-local-work-export",
+            &BTreeMap::from([
+                ("id".into(), OperationId::random().unwrap().as_str().into()),
+                (
+                    "destination".into(),
+                    path.with_extension("export").to_str().unwrap().into(),
+                ),
+            ]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(exported.value["error"], "not_found");
         for command in ["sync-recovery-import", "sync-recovery-compare"] {
             let response = request(
                 &path,
@@ -372,6 +394,7 @@ mod tests {
         let readonly = Server::start(rep.clone(), &path, true).unwrap();
         for (command, expected) in [
             ("sync-recovery-import", "read_only"),
+            ("sync-local-work-use-remote", "read_only"),
             ("sync-recovery-compare", "io_error"),
         ] {
             let response = request(
