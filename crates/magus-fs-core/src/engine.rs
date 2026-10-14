@@ -79,7 +79,8 @@ pub(crate) struct Working {
     pub(crate) orphans: Vec<Entry>,
 }
 pub(crate) struct Core {
-    pub(crate) metadata_profiler: Arc<Mutex<crate::metadata_profile::Profiler>>,
+    pub(crate) metadata_profiler:
+        std::sync::OnceLock<Arc<Mutex<crate::metadata_profile::Profiler>>>,
     pub(crate) journal: Journal,
     pub(crate) objects: ObjectStore,
     pub(crate) config: ReplicaConfig,
@@ -639,7 +640,7 @@ impl Replica {
             }
         }
         let mut core = Core {
-            metadata_profiler: Arc::default(),
+            metadata_profiler: std::sync::OnceLock::new(),
             journal,
             objects,
             config,
@@ -974,6 +975,12 @@ impl Replica {
     }
 }
 impl Workspace {
+    fn metadata_context<'a>(
+        &'a self,
+        core: &'a Core,
+    ) -> Result<crate::metadata::MetadataContext<'a>, FsError> {
+        crate::metadata::MetadataContext::new(core, self.actor(core)?, self.view.as_ref())
+    }
     fn tree(&self, core: &Core) -> Result<Tree, FsError> {
         let _span = crate::metadata_profile::Span::begin("working_copy");
         crate::metadata_profile::count("copy", 1);
@@ -1183,81 +1190,25 @@ impl Workspace {
     /// Live entries (including already-guarded orphan handles) need no projection.
     pub fn native_attributes(&self, entry: &Entry) -> Result<Entry, FsError> {
         let core = lock(&self.core)?;
-        let _callback = crate::metadata_profile::Callback::begin(&core.metadata_profiler);
-        let mut projected = entry.clone();
-        if self.view.is_none() {
-            self.access(&core, entry, 0)?;
-            let remote = core
-                .journal
-                .db
-                .query_row(
-                    "SELECT revision FROM live_authority WHERE singleton=1",
-                    [],
-                    |r| r.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten();
-            if remote.is_some() {
-                crate::metadata_profile::count("authority_load", 1);
-            }
-            let authority = remote
-                .map(|id| core.revision(&RevisionId::parse(id)?))
-                .transpose()?;
-            let tree = authority
-                .as_ref()
-                .map(|r| &r.tree)
-                .unwrap_or(&core.working()?.tree);
-            let current = if entry.id == tree.root.id {
-                Some(perm::root_entry(tree))
-            } else {
-                tree.entries.iter().find(|e| e.id == entry.id).cloned()
-            };
-            if let Some(current) = current {
-                projected.owner = current.owner;
-                projected.group = current.group;
-                projected.mode = current.mode;
-            }
-        }
-        if let (Some(view), Some(working)) = (&self.view, &core.working) {
-            let historical = perm::entry(&view.tree, &entry.path)?;
-            if historical.id != entry.id {
-                return Err(FsError::StaleHandle);
-            }
-            self.access(&core, &historical, 0)?;
-            let current = if entry.id == working.tree.root.id {
-                perm::root_entry(&working.tree)
-            } else {
-                working
-                    .tree
-                    .entries
-                    .iter()
-                    .find(|e| e.id == entry.id)
-                    .cloned()
-                    .ok_or(FsError::PermissionDenied)?
-            };
-            projected = historical;
-            projected.owner = current.owner;
-            projected.group = current.group;
-            projected.mode = current.mode;
-        }
-        Ok(projected)
+        let _callback = crate::metadata_profile::Callback::for_core(&core);
+        self.metadata_context(&core)?.attributes(entry)
     }
     pub fn lookup(&self, path: &str) -> Result<Entry, FsError> {
         let core = lock(&self.core)?;
-        let _callback = crate::metadata_profile::Callback::begin(&core.metadata_profiler);
-        let tree = self.tree(&core)?;
-        self.resolve_entry(&core, &tree, path)
+        let _callback = crate::metadata_profile::Callback::for_core(&core);
+        self.metadata_context(&core)?.resolve(path)
     }
     pub fn list(&self, path: &str) -> Result<Vec<String>, FsError> {
         let core = lock(&self.core)?;
-        let _callback = crate::metadata_profile::Callback::begin(&core.metadata_profiler);
-        let tree = self.tree(&core)?;
-        let e = self.resolve_entry(&core, &tree, path)?;
+        let _callback = crate::metadata_profile::Callback::for_core(&core);
+        let context = self.metadata_context(&core)?;
+        let e = context.resolve(path)?;
         if e.content != EntryContent::Directory {
             return Err(FsError::NotDirectory);
         }
-        self.access(&core, &e, 4)?;
-        let mut names = tree
+        context.access(&e, 4)?;
+        let mut names = context
+            .tree
             .entries
             .iter()
             .filter(|e| perm::parent(&e.path) == path)
@@ -1269,14 +1220,15 @@ impl Workspace {
     /// Readdir names, stable identities and kinds only; child attributes still require search.
     pub fn directory_entries(&self, path: &str) -> Result<Vec<(String, EntryId, bool)>, FsError> {
         let core = lock(&self.core)?;
-        let _callback = crate::metadata_profile::Callback::begin(&core.metadata_profiler);
-        let tree = self.tree(&core)?;
-        let entry = self.resolve_entry(&core, &tree, path)?;
+        let _callback = crate::metadata_profile::Callback::for_core(&core);
+        let context = self.metadata_context(&core)?;
+        let entry = context.resolve(path)?;
         if entry.content != EntryContent::Directory {
             return Err(FsError::NotDirectory);
         }
-        self.access(&core, &entry, 4)?;
-        Ok(tree
+        context.access(&entry, 4)?;
+        Ok(context
+            .tree
             .entries
             .iter()
             .filter(|e| perm::parent(&e.path) == path)
@@ -1292,19 +1244,20 @@ impl Workspace {
     /// Resolve an inode identity through its current path and current traversal authority.
     pub fn lookup_identity(&self, id: &EntryId) -> Result<Entry, FsError> {
         let core = lock(&self.core)?;
-        let _callback = crate::metadata_profile::Callback::begin(&core.metadata_profiler);
-        let tree = self.tree(&core)?;
-        let path = if &tree.root.id == id {
+        let _callback = crate::metadata_profile::Callback::for_core(&core);
+        let context = self.metadata_context(&core)?;
+        let path = if &context.tree.root.id == id {
             ""
         } else {
-            &tree
+            &context
+                .tree
                 .entries
                 .iter()
                 .find(|e| &e.id == id)
                 .ok_or(FsError::NotFound)?
                 .path
         };
-        self.resolve_entry(&core, &tree, path)
+        context.resolve(path)
     }
     /// NFS DELETE reports current writable/searchable parent authority, not file write mode.
     pub fn check_remove_identity(&self, id: &EntryId) -> Result<(), FsError> {
