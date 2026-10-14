@@ -62,3 +62,6 @@ mod metadata_descriptor;
 
 mod mounted_continuation;
 pub use mounted_continuation::*;
+
+mod clean_visibility;
+pub use clean_visibility::*;
