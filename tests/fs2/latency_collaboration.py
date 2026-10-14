@@ -9,6 +9,11 @@ def validate_passive_capture(row):
  return True
 
 
+def profile_docker_args(args):
+ if args[0:1]==('exec',) and args[1:2] in [('-d',),('-i',)]:return ('exec',args[1],'-e','MAGUS_LATENCY_TRACE=1','-e','MAGUS_METADATA_PROFILE=1',*args[2:])
+ return args
+
+
 def main():
  import argparse,hashlib,json,secrets,time,traceback
  from pathlib import Path
@@ -24,8 +29,7 @@ def main():
  class TraceInfra(OwnedInfra):
   def create(self,kind,suffix,args):return super().create(kind,suffix,acceptance_s3_capacity('acceptance',kind,suffix,args))
   def docker(self,*args,**kw):
-   if args[:2]==('exec','-d'):args=('exec','-d','-e','MAGUS_LATENCY_TRACE=1','-e','MAGUS_METADATA_PROFILE=1',*args[2:])
-   return super().docker(*args,**kw)
+   return super().docker(*profile_docker_args(args),**kw)
  i=TraceInfra(a.output);i.runtime_profile='release';j=None;endpoints=[];rows=[];phase='preflight';code=1
  (i.output/'driver.py').write_bytes(Path(__file__).read_bytes())
  i.write_json('diagnostic-plan.json',{'matrix':profile_matrix(),'bounds':{'observation_seconds':25,'settle_seconds':60},'qualification':False,'controls':'same daemon, counters switched outside timed saves'})
@@ -65,6 +69,7 @@ def main():
   j.tokens['worker']=j.expect('profile-grant','POST',j.root+'/grants',200,body={'delegate':{'replica':WORKER,'expires':expiry-3600,'actions':['read','write','integrate','history'],'branches':['main'],'prefixes':['']}})['token']
   for n,actor in [('a','alice'),('b','worker')]:
    e=DiskLazy(j,'profile-'+n);endpoints.append((n,e));e.start(n,actor=actor)
+   assert any(line.startswith('metadata_profile ') for line in logread(e,n)['log'].splitlines()),'startup metadata profile opt-in absent'
   background=0
   for number,spec in enumerate(profile_matrix()):
    phase='sample-'+str(number);size=spec['size']

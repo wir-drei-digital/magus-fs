@@ -1,5 +1,5 @@
 import unittest
-from latency_collaboration import profile_matrix, validate_passive_capture
+from latency_collaboration import profile_matrix, validate_passive_capture, profile_docker_args
 class CollaborationTests(unittest.TestCase):
  def test_profile_matrix_is_fourteen(self):
   rows=profile_matrix();self.assertEqual(len(rows),14)
@@ -12,3 +12,13 @@ class CollaborationTests(unittest.TestCase):
   self.assertTrue(validate_passive_capture(row))
   for key,value in [("post_applied_read",None),("exact_applied_ns",9),("status_polls",[1])]:
    with self.assertRaises((AssertionError,ValueError)):validate_passive_capture(dict(row,**{key:value}))
+
+class ProfileStartupTests(unittest.TestCase):
+ def test_profile_opt_in_reaches_actual_client_exec_i_startup(self):
+  args=('exec','-i','--user','0:0','owned-client','python3','-c','startup')
+  actual=profile_docker_args(args)
+  self.assertIn('MAGUS_METADATA_PROFILE=1',actual)
+  self.assertEqual(actual[-len(args[2:]):],args[2:])
+ def test_profile_opt_in_preserves_service_and_non_exec_commands(self):
+  self.assertIn('MAGUS_LATENCY_TRACE=1',profile_docker_args(('exec','-d','owned-service','service')))
+  self.assertEqual(profile_docker_args(('image','inspect','sha256:abc')),('image','inspect','sha256:abc'))
