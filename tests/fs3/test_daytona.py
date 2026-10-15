@@ -165,7 +165,6 @@ class DisposableTests(unittest.TestCase):
         p=disposable();p['recovery_after']['state_id']='recovery_before'
         self.assertTrue(validate_provider(p));self.assertTrue(deletion_permitted(p))
 
-if __name__=='__main__':unittest.main()
 
 
 class HostedDriverTests(unittest.TestCase):
@@ -344,3 +343,5 @@ class ConflictCollectionTests(unittest.TestCase):
             def execute(self,code,args):return {'exit':0,'stdout':json.dumps({'ok':True,'page':{'items':[],'next':'same'}})}
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(AssertionError,'cursor repeated'):record_inventory(Remote(),Path(directory),final=True)
+
+if __name__=='__main__':unittest.main()

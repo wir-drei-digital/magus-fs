@@ -34,6 +34,45 @@ def validate_packaging(m):
     return failures
 
 
+
+def packaging_assertions(measurements,evidence,manifest_path,interruption_evidence=None):
+    """Derive shared assertions from recorded native/service/extraction outcomes."""
+    from qualification import PACKAGING_CASES
+    evidence=Path(evidence);manifest_path=Path(manifest_path)
+    manifest=json.loads(manifest_path.read_text());rows=[]
+    def raw(path):return json.loads(path.read_text())
+    def add(case,passed,paths):
+        rows.append({'case':case,'acceptance':PACKAGING_CASES[case],'expected':True,
+            'observed':bool(passed),'passed':bool(passed),
+            'provenance':[{'path':str(p.resolve()),'sha256':sha(p.read_bytes())} for p in paths]})
+    for platform_name in PLATFORMS:
+        binary=next(r['binary_sha256'] for r in manifest['packages'] if r['role']=='client' and r['platform']==platform_name)
+        for attempt in (1,2):
+            matches=[r for r in measurements['installs'] if r['platform']==platform_name and r['attempt']==attempt]
+            assert len(matches)==1,'native assertion identity missing/duplicate'
+            path=evidence/matches[0]['provenance'];r=raw(path)
+            verified=(all(r.get(k) is True for k in ('kernel_mounted','normal_unmount','owner_stopped','state_preserved','prefix_removed'))
+                and r.get('binary_sha256')==binary and r.get('read_sha256')==r.get('expected_sha256')
+                and r.get('write_sha256')==r.get('written_sha256')
+                and all(re.fullmatch('[a-f0-9]{64}',r.get(k,'')) for k in ('read_sha256','write_sha256')))
+            add('native-'+platform_name+'-'+str(attempt),verified,[path,manifest_path])
+    path=evidence/measurements['service']['provenance'];r=raw(path)
+    binary=next(r['binary_sha256'] for r in manifest['packages'] if r['role']=='service' and r['platform']==PLATFORMS[1])
+    add('default-service',r.get('default_binary') is True and r.get('sha256')==binary and r.get('health')==200
+        and r.get('stopped') is True and r.get('executable')=='/opt/package-service/bin/magus-fs-service',[path,manifest_path])
+    license_path=evidence/'interrupted/LICENSE'
+    interrupted=Path(interruption_evidence) if interruption_evidence is not None else evidence/'interrupted-install.json'
+    observation=raw(interrupted);observation=observation.get('measurements',observation)
+    add('interrupted-install',observation.get('interrupted_prefix_retained') is True and observation.get('interrupted_error')=='simulated extraction interruption after LICENSE'
+        and license_path.is_file() and sha(license_path.read_bytes())==manifest['licenses']['LICENSE']
+        and not (evidence/'interrupted/THIRD_PARTY_NOTICES.md').exists()
+        and all(r['passed'] for r in rows if r['case'].startswith('native-')),
+        [interrupted,license_path,manifest_path])
+    cleanup=evidence/'cleanup.json';r=raw(cleanup)
+    add('package-evidence',sha(manifest_path.read_bytes())==measurements['manifest_sha256']
+        and all(r.get(k) is True for k in ('ok','mounts_absent','resources_removed')),[cleanup,manifest_path])
+    return rows
+
 def native_helpers():
     before=list(sys.path)
     try:
@@ -134,6 +173,7 @@ def run(manifest_path,output):
         try:install(manifest_path,PLATFORMS[0],'client',interrupted);raise AssertionError('existing prefix overwritten')
         except FileExistsError:pass
         measurements['interrupted_prefix_retained']=sha((interrupted/'LICENSE').read_bytes())==m['licenses']['LICENSE'];save()
+        (output/'interrupted-install.json').write_text(json.dumps({k:measurements[k] for k in ('interrupted_error','interrupted_prefix_retained')},indent=2)+'\n')
         for attempt in (1,2):
             prefix=output/('mac-install-'+str(attempt));install(manifest_path,PLATFORMS[0],'client',prefix);mac_clean=False
             row=native_mac(prefix,output/('mac'+str(attempt)));mac_clean=True;row.update(platform=PLATFORMS[0],attempt=attempt,provenance='mac'+str(attempt)+'/native.json');measurements['installs'].append(row);save()
@@ -166,6 +206,10 @@ def run(manifest_path,output):
         result['elapsed_seconds']=time.monotonic()-started
         result['status']='failed' if result['failures'] else 'blocked' if result['blocked'] else 'passed'
         (output/'cleanup.json').write_text(json.dumps(result['cleanup'],indent=2)+'\n');save()
+    if result['status']=='passed':
+        try:result['assertions']=packaging_assertions(measurements,output,manifest_path)
+        except Exception as error:
+            result['status']='failed';result['failures'].append('assertion derivation: '+str(error))
     from qualification import normalize
     result=normalize(result);save();return {'passed':0,'failed':1,'blocked':2}[result['status']]
 

@@ -11,6 +11,9 @@ ISOLATION_CASES = {'same-principal': 'F3-1', 'different-principal': 'F3-1',
 
 PROVIDER_CASES = {'scope':'F3-2','readonly':'F3-2','private-history':'F3-2','api-bypass':'F3-2','revoked-reconnect':'F3-2','cold-warm-range':'F3-5','shared-publication':'F3-1','disposable-lifecycle':'F3-7'}
 
+PACKAGING_CASES = {'native-'+p+'-'+str(a):'F3-6' for p in ('aarch64-apple-darwin','aarch64-unknown-linux-gnu') for a in (1,2)}
+PACKAGING_CASES.update({'default-service':'F3-6','interrupted-install':'F3-6','package-evidence':'F3-8'})
+
 SCALE_CASES = {'cache-bound':'F3-3','protected-prune':'F3-3','reads':'F3-5','fanout-1':'F3-4','fanout-5':'F3-4','fanout-20':'F3-4','peer-cases':'F3-4'}
 
 def normalize(evidence: dict) -> dict:
@@ -59,6 +62,15 @@ def normalize(evidence: dict) -> dict:
     if result.get('phase') == 'packaging':
         from packaging import validate_packaging
         for message in validate_packaging(result.get('measurements', {})):require(False,message)
+        assertions=result.get('assertions',[])
+        require(len(assertions)==len(PACKAGING_CASES),'unexpected packaging assertion count')
+        for case,acceptance in PACKAGING_CASES.items():
+            rows=[r for r in assertions if r.get('case')==case]
+            require(len(rows)==1,'missing or duplicate assertion: '+case)
+            for row in rows:
+                require(row.get('acceptance')==acceptance and row.get('passed') is True
+                    and row.get('expected') is not None and row.get('expected')==row.get('observed')
+                    and bool(row.get('provenance')),'assertion failed: '+case)
         if result.get('status') == 'failed' and not failures:failures.append('phase reported failure')
         result['failures']=failures
         result['status']='failed' if failures else 'blocked' if result.get('blocked') else 'passed'

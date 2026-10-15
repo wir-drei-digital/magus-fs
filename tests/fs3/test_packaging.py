@@ -75,7 +75,6 @@ class RunnerTests(unittest.TestCase):
   phases['provider']={'phase':'provider','status':'blocked','failures':[],'blocked':['no actual provider']}
   self.assertEqual(mod.aggregate(phases)['status'],'blocked')
 
-if __name__=='__main__':unittest.main()
 
 class PhasePackagingTests(unittest.TestCase):
  def test_claim_without_native_or_service_proof_fails(self):
@@ -169,3 +168,62 @@ class CrossClientTests(unittest.TestCase):
       ('binary_sha256','0'*64),('licenses',{}),('argv',['cargo','build','--features','test-faults'])]:
    p,b,s,l=self.fixture();p[key]=value
    with self.subTest(key=key),self.assertRaises(ValueError):package.verify_client_build(p,b,s,l)
+
+
+class PackagingAssertionTests(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.out=Path(self.tmp.name)
+  self.measurements={'manifest_sha256':'','interrupted_prefix_retained':True,'interrupted_error':'simulated extraction interruption after LICENSE','installs':[],
+   'service':{'default_binary':True,'sha256':'e'*64,'health':200,'stopped':True,'provenance':'linux/service.json','executable':'/opt/package-service/bin/magus-fs-service'}}
+  packages=[]
+  for platform in package.PLATFORMS:
+   packages.append({'platform':platform,'role':'client','binary_sha256':'b'*64})
+   for attempt in (1,2):
+    row={'platform':platform,'attempt':attempt,'binary_sha256':'b'*64,'kernel_mounted':True,'read_sha256':'c'*64,'expected_sha256':'c'*64,'write_sha256':'d'*64,'written_sha256':'d'*64,'normal_unmount':True,'owner_stopped':True,'state_preserved':True,'prefix_removed':True,'provenance':platform+str(attempt)+'.json'}
+    self.measurements['installs'].append(row);self.write(row['provenance'],row)
+  packages.append({'platform':package.PLATFORMS[1],'role':'service','binary_sha256':'e'*64})
+  self.manifest=self.out/'manifest.json';self.write('manifest.json',{'packages':packages,'licenses':{'LICENSE':package.sha(b'license')}})
+  self.measurements['manifest_sha256']=package.sha(self.manifest.read_bytes())
+  (self.out/'interrupted').mkdir();(self.out/'interrupted/LICENSE').write_bytes(b'license')
+  self.write('linux/service.json',self.measurements['service']);self.write('interrupted-install.json',{'measurements':self.measurements})
+  self.cleanup={'ok':True,'mounts_absent':True,'resources_removed':True,'provenance':['cleanup.json']};self.write('cleanup.json',self.cleanup)
+ def write(self,name,value):
+  p=self.out/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(json.dumps(value))
+ def produce(self):
+  import packaging as phase
+  self.assertTrue(hasattr(phase,'packaging_assertions'))
+  return phase.packaging_assertions(self.measurements,self.out,self.manifest)
+ def result(self):
+  return {'schema':1,'phase':'packaging','status':'passed','failures':[],'blocked':[],
+   'source':{'verified':True,'head':'a'*40,'manifest_sha256':'b'*64,'bridge':'source.json'},
+   'binaries':{'verified':True,'image':'sha256:'+'a'*64,'sha256':{'magus-fs':'b'*64,'magus-fs-service':'e'*64}},
+   'measurements':self.measurements,'cleanup':self.cleanup,'assertions':self.produce()}
+ def test_actual_producer_to_normalizer(self):
+  from qualification import normalize
+  result=self.result();self.assertEqual(len(result['assertions']),7);self.assertEqual(normalize(result)['status'],'passed')
+ def test_false_raw_native_or_service_outcome_is_not_copied_pass(self):
+  from qualification import normalize
+  self.write(self.measurements['installs'][0]['provenance'],{**self.measurements['installs'][0],'normal_unmount':False})
+  self.assertEqual(normalize(self.result())['status'],'failed')
+  self.write(self.measurements['installs'][0]['provenance'],self.measurements['installs'][0])
+  self.write('linux/service.json',{**self.measurements['service'],'health':503})
+  self.assertEqual(normalize(self.result())['status'],'failed')
+ def test_required_assertion_contract(self):
+  from qualification import normalize
+  from copy import deepcopy
+  for kind in ('missing','false','duplicate','wrong-id','wrong-outcome','missing-provenance'):
+   with self.subTest(kind=kind):
+    row=deepcopy(self.result());a=row['assertions']
+    if kind=='missing':a.clear()
+    elif kind=='false':a[0]['passed']=False
+    elif kind=='duplicate':a.append(dict(a[0]))
+    elif kind=='wrong-id':a[0]['acceptance']='F3-7'
+    elif kind=='wrong-outcome':a[0]['observed']=False
+    else:a[0]['provenance']=[]
+    self.assertEqual(normalize(row)['status'],'failed')
+ def test_interruption_origin_mismatch_fails(self):
+  from qualification import normalize
+  (self.out/'interrupted/LICENSE').write_bytes(b'changed')
+  self.assertEqual(normalize(self.result())['status'],'failed')
+
+if __name__=='__main__':unittest.main()

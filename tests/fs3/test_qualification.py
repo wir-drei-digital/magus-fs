@@ -151,7 +151,6 @@ class RawCompositionTests(unittest.TestCase):
         corrected['assertions'][0]['passed']=False;self.write(g/'result.json',corrected)
         with self.assertRaises(AssertionError):compose_evidence(self.e,self.f,g)
 
-if __name__ == '__main__': unittest.main()
 
 class ProviderAssertionTests(unittest.TestCase):
     def fixture(self):
@@ -239,3 +238,5 @@ class ProviderRawAssertionTests(unittest.TestCase):
                             'mountinfo':'1 0 0:1 / /shared/a2 rw - fuse magus rw',**change}
                     def status(self,name):return {'live':{'authorized':False}}
                 with self.assertRaises(AssertionError):daytona.revoked_reconnect_case(Remote(),{'read':13},before)
+
+if __name__=='__main__':unittest.main()
