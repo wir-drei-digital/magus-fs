@@ -36,6 +36,23 @@ def provision_record(name, actor, identities, token, root):
             'authority': mount_authorities(actor, identities)[0], **({'root_policy': root} if name == 'a1' else {})}
 
 
+def validate_history_absence(page, private_entry, hidden_entry):
+    """This small fixture must fit one complete page; never ignore a cursor."""
+    assert page['next'] is None, 'bounded history fixture unexpectedly paginated'
+    entries = [item['entry'] for item in page['items']]
+    assert private_entry not in entries and hidden_entry not in entries, 'private or hidden entry disclosed in history'
+    return {'private_entry':private_entry,'hidden_entry':hidden_entry,'observed_entries':entries,'page':page}
+
+
+def private_object_probe(journey, actor, private_object):
+    view, descriptor = journey.view(actor)
+    allowed = next(e for e in descriptor['tree']['entries'] if e['path']=='reports/live')['content']['version']['extents'][0]['object']
+    control = journey.expect('own-view-allowed-object','GET',journey.root+'/views/'+view['view']+'/objects/'+allowed,200,actor=actor,response_bytes=True)
+    assert object_id(control)==allowed, 'allowed object control has wrong bytes'
+    denied = journey.expect('own-view-private-object','GET',journey.root+'/views/'+view['view']+'/objects/'+private_object,404,actor=actor)
+    return {'actor':actor,'view':view,'allowed_object':allowed,'allowed_status':200,'private_object':private_object,'private_status':404,'denied':denied}
+
+
 class Isolation(NativeJourney):
     def __init__(self, infra, image, result):
         super().__init__(infra, image, ['linux'])
@@ -80,7 +97,7 @@ class Isolation(NativeJourney):
         return self.endpoints[name].execute("import json,os,sys\ns=json.load(sys.stdin);rows={}\nfor op,path in s['operations']:\n try:\n  p='/shared/'+s['name']+'/'+path\n  if op=='read':open(p,'rb').read()\n  elif op=='write':\n   with open(p,'wb') as f:f.write(b'denied')\n  elif op=='unlink':os.unlink(p)\n  rows[op+':'+path]=0\n except OSError as e:rows[op+':'+path]=e.errno\nprint(json.dumps(rows))",
             {'name': name, 'operations': operations}, user='1001:1001')
 
-    def setup(self):
+    def seed(self):
         self.i.start_service(); self.wait()
         rows = []
         for name, actor in self.identities.items():
@@ -97,6 +114,10 @@ class Isolation(NativeJourney):
         upload, revision = self.stage(self.descriptor([reports, secret, mode, readable, live]), bodies=[b'private sibling', b'owner only', b'readable no group write', b'seed'])
         self.expect('seed','POST',self.root+'/seed',200,body={'branch':'main','revision':revision,'upload':upload})
         self.i.write_json('identity-map.json', self.identities)
+        self.hidden_entry = secret['id']
+
+    def setup(self):
+        self.seed()
         for name, actor in self.identities.items():
             ep = RecordedLazy(self, name); self.endpoints[name] = ep
             self.bindings[name] = ep.start(name, readonly=name=='readonly', publication='isolated' if name=='a2' else 'shared-live', actor=name,
@@ -124,26 +145,9 @@ class Isolation(NativeJourney):
             assert not self.endpoints[name].has(name+'/reports/result')
         self.assertion('same-principal', {'identities': self.identities, 'private': private, 'other_replica_absent': True})
         self.assertion('isolated-private', {'private': private, 'head': before['head'], 'all_other_mounts_absent': True})
-        view, descriptor = self.view('a2')
-        history = self.expect('private-not-history','GET',self.root+'/history?view='+view['view'],200,actor='a2')
-        assert all(item.get('revision') != revision for item in history['items'])
-        readonly_view, _ = self.view('readonly')
-        self.expect('readonly-no-history','GET',self.root+'/history?view='+readonly_view['view'],404,actor='readonly')
-        self.expect('guessed-history-selector','POST',self.root+'/history/'+'0'*32+'/view',404,body={},actor='a1')
-        self.assertion('private-history', {'history':history,'private_revision':revision,'readonly_denied':404})
-        for name in ('a1','b','readonly'):
-            self.expect(name+'-private-operation','GET',self.op_path(private['request']),404,actor=name)
-            self.expect(name+'-private-replay','POST',self.root+'/candidates',404,body=private['request'],actor=name)
-            self.expect(name+'-private-receipt','POST',self.root+'/integrations',404,
-                body=self.integrate_request(private['private_receipt'],view),actor=name)
-            self.expect(name+'-foreign-view','GET',self.root+'/views/'+view['view']+'/descriptor',404,actor=name)
-        self.expect('private-selector-closed','POST',self.root+'/views',400,body={'branch':'main','revision':revision},actor='a1')
-        self.expect('guessed-view','GET',self.root+'/views/'+'0'*32+'/descriptor',404,actor='a2')
-        self.expect('hidden-object','GET',self.root+'/views/'+view['view']+'/objects/'+object_id(b'private sibling'),404,actor='a2')
-        self.expect('private-object','GET',self.root+'/views/'+view['view']+'/objects/'+object_id(body),404,actor='a1')
-        self.expect('wrong-branch','POST',self.root+'/views',404,body={'branch':'other'},actor='a2')
-        assert self.effect()==before
-        self.assertion('api-bypass', {'before':before,'after':self.effect(),'observations':'observations.json'})
+        local = next(r['descriptor'] for r in a2.cli('history','--state',state)['revisions'] if r['revision']==revision)
+        private_entry = next(e['id'] for e in local['tree']['entries'] if e['path']=='reports/result')
+        view = self.private_checks(private, private_entry, body)
         denied = self.denied_io('readonly',[('write','reports/live'),('write','reports/denied'),('unlink','reports/live')])
         assert set(denied.values())=={30}, denied
         self.expect('readonly-upload','POST',self.root+'/uploads',404,body={},actor='readonly')
@@ -194,6 +198,49 @@ class Isolation(NativeJourney):
             'owner_secret_unchanged':True,'boundary':'local private creation allowed; exact remote candidate denied'})
         self.reconnect_case(private, integrated, view)
 
+    def private_checks(self, private, private_entry, body):
+        before = self.effect()
+        revision = private['local_revision']
+        view, descriptor = self.view('a2')
+        history = self.expect('private-not-history','GET',self.root+'/history?view='+view['view'],200,actor='a2')
+        history_evidence = validate_history_absence(history, private_entry, self.hidden_entry)
+        readonly_view, _ = self.view('readonly')
+        self.expect('readonly-no-history','GET',self.root+'/history?view='+readonly_view['view'],404,actor='readonly')
+        self.expect('guessed-history-selector','POST',self.root+'/history/'+'0'*32+'/view',404,body={},actor='a1')
+        self.assertion('private-history', {**history_evidence,'private_revision':revision,'readonly_denied':404})
+        for name in ('a1','b','readonly'):
+            self.expect(name+'-private-operation','GET',self.op_path(private['request']),404,actor=name)
+            self.expect(name+'-private-replay','POST',self.root+'/candidates',404,body=private['request'],actor=name)
+            self.expect(name+'-private-receipt','POST',self.root+'/integrations',404,
+                body=self.integrate_request(private['private_receipt'],view),actor=name)
+            self.expect(name+'-foreign-view','GET',self.root+'/views/'+view['view']+'/descriptor',404,actor=name)
+        self.expect('private-selector-closed','POST',self.root+'/views',400,body={'branch':'main','revision':revision},actor='a1')
+        self.expect('guessed-view','GET',self.root+'/views/'+'0'*32+'/descriptor',404,actor='a2')
+        self.expect('hidden-object','GET',self.root+'/views/'+view['view']+'/objects/'+object_id(b'private sibling'),404,actor='a2')
+        object_evidence = private_object_probe(self, 'a1', object_id(body))
+        self.expect('wrong-branch','POST',self.root+'/views',404,body={'branch':'other'},actor='a2')
+        assert self.effect()==before
+        self.assertion('api-bypass', {'before':before,'after':self.effect(),'observations':'observations.json','own_view_private_object':object_evidence})
+        return view
+
+    def run_api_correction(self):
+        self.seed()
+        body = b'isolated API correction private bytes'
+        view, descriptor = self.view('a2')
+        parent = next(e['id'] for e in descriptor['tree']['entries'] if e['path']=='reports')
+        entry = file_entry('reports/result', parent, body)
+        descriptor['tree']['entries'].append(entry)
+        descriptor.update(principal=self.identities['a2']['principal'], replica=self.identities['a2']['replica'],
+                          operation=identity('operation'), parents=[view['revision']])
+        upload, revision = self.stage(descriptor, 'a2', [body])
+        request = {'operation':descriptor['operation'],'replica':descriptor['replica'],'original_view':view['view'],
+                   'original_head':view['head'],'revision':revision,'upload':upload}
+        receipt = self.expect('correction-private-candidate','POST',self.root+'/candidates',200,actor='a2',body=request)
+        assert receipt['submitted_revision']==revision and receipt['replica']==descriptor['replica']
+        self.i.write_json('candidate-binding.json',{'descriptor':descriptor,'request':request,'receipt':receipt,
+                          'private_entry':entry['id'],'hidden_entry':self.hidden_entry,'private_object':object_id(body)})
+        self.private_checks({'local_revision':revision,'request':request,'private_receipt':receipt},entry['id'],body)
+
     def reconnect_case(self, private, integrated, view, already_disconnected=False):
         a2 = self.endpoints['a2']
         # Isolated retained state survives disconnect; current authority is rechecked.
@@ -229,14 +276,17 @@ class Isolation(NativeJourney):
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--image',required=True);parser.add_argument('--output',required=True)
+    parser.add_argument('--api-correction',action='store_true',help='only reviewed history/object API checks; not a phase qualification')
     args=parser.parse_args(argv)
     infra=PhaseInfra(args.output);journey=None
-    result={'schema':1,'phase':'isolation','status':'failed','source':{},'binaries':{},'assertions':[],
+    result={'schema':1,'phase':'isolation-api-correction' if args.api_correction else 'isolation','status':'failed','source':{},'binaries':{},'assertions':[],
             'measurements':{'mounts':[]},'cleanup':{},'failures':[],'blocked':[]}
     try:
         infra.setup(args.image);infra.isolate_service_control()
         result['source'],result['binaries']=source_bridge(infra,args.image)
-        journey=Isolation(infra,args.image,result);journey.run()
+        journey=Isolation(infra,args.image,result)
+        if args.api_correction:journey.run_api_correction()
+        else:journey.run()
         after_source,after_binary=source_bridge(infra,args.image)
         assert (after_source,after_binary)==(result['source'],result['binaries'])
         result['status']='passed'
@@ -253,7 +303,9 @@ def main(argv=None):
                                'provenance':['cleanup.json']+[n+'-kernel-mount-cleanup.json' for n in (journey.endpoints if journey else [])]}
         except Exception as error:
             result['cleanup']={'ok':False,'error':str(error)};result['failures'].append('cleanup: '+str(error))
-        result=normalize(result);infra.write_json('result.json',result)
+        if not args.api_correction:result=normalize(result)
+        elif result['failures'] or not result['cleanup'].get('ok'):result['status']='failed'
+        infra.write_json('result.json',result)
     return {'passed':0,'failed':1,'blocked':2}[result['status']]
 
 

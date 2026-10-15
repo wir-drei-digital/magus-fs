@@ -40,4 +40,30 @@ class SourceBridgeTests(unittest.TestCase):
         self.assertFalse(allowed_source_changes({'tests/fs2/connected.py':{}}, 'old', 'unreviewed'))
         self.assertTrue(allowed_source_changes({'tests/fs3/isolation.py':{}}, 'same', 'same'))
 
+class SecurityPredicateTests(unittest.TestCase):
+    def test_private_or_hidden_entry_in_history_rejected(self):
+        from isolation import validate_history_absence
+        for entry in ('private-entry','hidden-entry'):
+            with self.assertRaises(AssertionError):validate_history_absence({'items':[{'id':'selector','entry':entry,'change':'version'}],'next':None},'private-entry','hidden-entry')
+
+    def test_unexamined_history_page_rejected(self):
+        from isolation import validate_history_absence
+        with self.assertRaises(AssertionError):validate_history_absence({'items':[],'next':'cursor'},'private-entry','hidden-entry')
+
+    def test_private_object_probe_uses_own_view_and_allowed_control(self):
+        from isolation import private_object_probe
+        from service_storage import object_id
+        class Requests:
+            root='/v1/n/test'
+            def __init__(self):self.calls=[]
+            def view(self,actor):
+                self.calls.append(('view',actor));return {'view':actor+'-view'},{'tree':{'entries':[{'path':'reports/live','content':{'version':{'extents':[{'object':object_id(b'allowed')}]}}}]}}
+            def expect(self,name,method,path,status,**kw):
+                self.calls.append((name,kw['actor'],path,status))
+                assert '/'+kw['actor']+'-view/' in path
+                return b'allowed' if status==200 else {'code':'not_found'}
+        requests=Requests();private_object_probe(requests,'a1',object_id(b'private'))
+        self.assertEqual(requests.calls[0],('view','a1'))
+        self.assertEqual([r[-1] for r in requests.calls[1:]],[200,404])
+
 if __name__ == '__main__': unittest.main()

@@ -68,3 +68,21 @@ The functional baseline's historical failed recovery rows still require explicit
 owner recovery; this phase neither rewrites those rows nor replays the complete
 historical PoC. No performance target, total-disk quota, package installation or
 external provider support follows from an isolation pass.
+
+
+For the reviewed R1/R3 correction, `--api-correction` runs only the bounded
+history and private-object HTTPS checks in a fresh owned fixture. Its result is
+`isolation-api-correction`, not a mounted isolation phase pass. History uses the
+actual private and hidden entry IDs in `{id, entry, change}` rows and requires
+`next` to be null for the deliberately small fixture. The other replica obtains
+its own valid view and reads a known allowed object before attempting the private
+object through that same view.
+
+`compose_evidence(earlier, continuation, correction=None)` verifies the referenced
+predecessor result's raw digest, individually passing expected/observed rows,
+canonical full-row/provenance equality, and imported mount provenance before
+composition. Supplying the bounded API correction replaces the two superseded
+assertions explicitly; raw predecessor and continuation results remain immutable.
+The replacement's source/binaries, result digest, actual cleanup and evidence paths
+are retained in the new derived qualification. Old invalid checks are not relabeled
+as valid evidence.

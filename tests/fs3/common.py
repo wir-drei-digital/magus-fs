@@ -111,7 +111,7 @@ while not kernel_mount_present(mount,Path('/proc/self/mountinfo').read_text()):
 print(json.dumps({'old_pid':pid,'pid':p.pid,'normal_unmount_required':was_mounted,'shutdown_seconds':s['shutdown_seconds'],'elapsed_seconds':time.monotonic()-started,'retained_revision':working['head'],'kernel_mounted':True}))""", {'name':name,'shutdown_seconds':shutdown_seconds})
 
 
-def compose_evidence(earlier, continuation):
+def compose_evidence(earlier, continuation, correction=None):
     """Validate an explicit failed-run/continuation composition from raw artifacts.
 
     Only the predecessor's individually passed cases are imported; its failed
@@ -123,6 +123,26 @@ def compose_evidence(earlier, continuation):
     earlier, continuation = Path(earlier), Path(continuation)
     old = json.loads((earlier/'result.json').read_text())
     result = copy.deepcopy(json.loads((continuation/'result.json').read_text()))
+    composition = result['measurements']['composition']
+    assert Path(composition['earlier_failed_result']).resolve() == (earlier/'result.json').resolve(), 'wrong predecessor result'
+    assert Path(composition['earlier_source_bridge']).resolve() == (earlier/'source-bridge.json').resolve(), 'wrong predecessor source'
+    assert composition['earlier_result_sha256'] == hashlib.sha256((earlier/'result.json').read_bytes()).hexdigest(), 'predecessor result changed'
+    def canonical_row(row, origin, mount=False):
+        row = copy.deepcopy(row)
+        if mount:
+            row['provenance'] = str((origin/row['provenance']).resolve())
+        else:
+            assert row.get('passed') is True and row.get('expected') is not None and row['expected'] == row.get('observed'), 'predecessor assertion did not pass'
+            row['provenance'] = [str((origin/p).resolve()) for p in row['provenance']]
+        return row
+    imported = composition['unchanged_passed_cases']
+    assert len(imported) == len(set(imported)), 'duplicate imported case'
+    for case in imported:
+        originals = [r for r in old['assertions'] if r['case'] == case]
+        copies = [r for r in result['assertions'] if r['case'] == case]
+        assert len(originals) == len(copies) == 1, 'missing or duplicate imported row'
+        assert canonical_row(originals[0], earlier) == canonical_row(copies[0], continuation), 'altered imported assertion'
+    assert [canonical_row(r, earlier, True) for r in old['measurements']['mounts']] == [canonical_row(r, continuation, True) for r in result['measurements']['mounts']], 'altered imported mount evidence'
     a = json.loads((earlier/'source-bridge.json').read_text())
     b = json.loads((continuation/'source-bridge.json').read_text())
     differences = sorted(p for p in set(a['current']) | set(b['current']) if a['current'].get(p) != b['current'].get(p))
@@ -150,4 +170,36 @@ def compose_evidence(earlier, continuation):
             'continuation_bridge_sha256':hashlib.sha256((continuation/'source-bridge.json').read_bytes()).hexdigest()})
     assert {r['case'] for r in old['assertions']} == set(composition['unchanged_passed_cases'])
     assert set(composition['remaining_cases']) == {'revoked-reconnect','unaffected-peer'}
+    result['cleanup']['provenance'] = [str((continuation/p).resolve()) for p in result['cleanup']['provenance']]
+    if correction is not None:
+        correction = Path(correction)
+        corrected = json.loads((correction/'result.json').read_text())
+        bridge = json.loads((correction/'source-bridge.json').read_text())
+        correction_owned = json.loads((correction/'ownership.json').read_text())
+        correction_cleanup = json.loads((correction/'cleanup.json').read_text())
+        assert corrected['schema'] == 1 and corrected['phase'] == 'isolation-api-correction' and corrected['status'] == 'passed'
+        assert not corrected['failures'] and not corrected['blocked']
+        assert correction_cleanup['ok'] is True and all(r.get('removed') is True for r in correction_cleanup['resources'])
+        assert resource_ids(correction_owned['resources']) == resource_ids(correction_cleanup['resources'])
+        assert corrected['cleanup'].get('ok') is True and corrected['cleanup'].get('resources_removed') is True
+        assert not corrected['measurements']['mounts'], 'API correction cannot replace mounted evidence'
+        assert corrected['binaries'] == result['binaries'] and bridge['image'] == a['image'] and bridge['binaries'] == a['binaries']
+        assert corrected['source']['manifest_sha256'] == digest(bridge['current'])
+        corrected_rows = [canonical_row(r, correction) for r in corrected['assertions']]
+        assert len(corrected_rows) == 2 and {r['case'] for r in corrected_rows} == {'private-history','api-bypass'}
+        assert all(Path(p).is_file() for r in corrected_rows for p in r['provenance'])
+        replaced = [r for r in result['assertions'] if r['case'] in {'private-history','api-bypass'}]
+        result['assertions'] = [r for r in result['assertions'] if r['case'] not in {'private-history','api-bypass'}] + corrected_rows
+        # Old raw passes remain retained, but these two are explicitly superseded.
+        composition['correction'] = {'result':str((correction/'result.json').resolve()),
+            'result_sha256':hashlib.sha256((correction/'result.json').read_bytes()).hexdigest(),
+            'source_bridge':str((correction/'source-bridge.json').resolve()),
+            'source_bridge_sha256':hashlib.sha256((correction/'source-bridge.json').read_bytes()).hexdigest(),
+            'superseded_rows':replaced,'replacement_cases':['private-history','api-bypass'],
+            'cleanup':str((correction/'cleanup.json').resolve())}
+        composition['source_chain']['differences'] = sorted(p for p in set(a['current']) | set(bridge['current']) if a['current'].get(p) != bridge['current'].get(p))
+        composition['source_chain']['current_manifest_sha256'] = digest(bridge['current'])
+        result['source'] = copy.deepcopy(corrected['source'])
+        result['source']['bridge'] = str((correction/result['source']['bridge']).resolve())
+        result['cleanup']['provenance'].extend(str((correction/p).resolve()) for p in corrected['cleanup']['provenance'])
     return normalize(result)
