@@ -300,12 +300,7 @@ impl SyncController {
                     p = self.save(&p, next)?;
                     // Shared-live publication restarts a definitively stale attempt against the
                     // current destination head: the service merges against the recorded base.
-                    if error.code == "stale_head"
-                        && p.state == SubmissionState::Failed
-                        && p.resolves.is_none()
-                        && p.superseded.len() < MAX_SUPERSEDED_INTEGRATIONS
-                        && self.transport.binding.publication == PublicationMode::SharedLive
-                    {
+                    if p.can_retry_stale_integration(self.transport.binding.publication) {
                         if let Some(stale) = p.integration.clone() {
                             let mut next = p.clone();
                             next.superseded.push(stale);

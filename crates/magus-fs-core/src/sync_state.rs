@@ -127,6 +127,21 @@ pub struct SyncProgress {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency_superseded_by: Option<SharedReceipt>,
 }
+impl SyncProgress {
+    /// A definitive stale SharedLive integration may be retried without changing its
+    /// candidate. The queue remains the durable failure/root until supersession.
+    pub fn can_retry_stale_integration(&self, publication: PublicationMode) -> bool {
+        publication == PublicationMode::SharedLive
+            && self.state == SubmissionState::Failed
+            && self.error.as_deref() == Some("stale_head")
+            && !self.remote_outcome_unknown
+            && self.private_receipt.is_some()
+            && self.integration.is_some()
+            && self.resolves.is_none()
+            && self.resolution.is_none()
+            && self.superseded.len() < MAX_SUPERSEDED_INTEGRATIONS
+    }
+}
 /// Bound on superseded integration attempts per candidate.
 pub const MAX_SUPERSEDED_INTEGRATIONS: usize = 32;
 /// Definitive service outcomes that end an uncertain integration/resolution attempt.
@@ -927,7 +942,11 @@ impl Replica {
         let retained = if matches!(
             update.state,
             SubmissionState::Denied | SubmissionState::Failed
-        ) {
+        ) && !update.can_retry_stale_integration(r.binding.publication)
+        {
+            // Automatic stale retries retain their candidate/request in sync_queue.
+            // An unlinked recovery snapshot would outlive even clean Shared/Applied.
+            // Terminal failures (including the retry cap) still retain local work.
             core.mounted_recovery_record("original publication requires recovery")?
         } else {
             None

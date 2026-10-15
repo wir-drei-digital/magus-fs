@@ -10,6 +10,7 @@ struct Reply {
     status: u16,
     body: Vec<u8>,
     before_response: Option<Box<dyn FnOnce() + Send>>,
+    response_body: Option<Box<dyn FnOnce() -> Vec<u8> + Send>>,
 }
 impl Reply {
     fn new(status: u16, body: &[u8]) -> Self {
@@ -17,6 +18,7 @@ impl Reply {
             status,
             body: body.to_vec(),
             before_response: None,
+            response_body: None,
         }
     }
 }
@@ -124,13 +126,16 @@ impl Fixture {
                         if request.contains("/stall ") {
                             std::thread::sleep(Duration::from_millis(500));
                         }
-                        let reply = scripted
+                        let mut reply = scripted
                             .lock()
                             .unwrap()
                             .pop_front()
                             .unwrap_or_else(|| Reply::new(200, b"ok"));
                         if let Some(action) = reply.before_response {
                             action();
+                        }
+                        if let Some(body) = reply.response_body {
+                            reply.body = body();
                         }
                         let header = format!(
                             "HTTP/1.1 {} fixture\r\nContent-Length: {}\r\n\r\n",
@@ -857,4 +862,151 @@ fn mounted_same_view_recovery_clears_resolved_discovery_error() {
         "readonly must not enter the owner callback"
     );
     drop(readonly);
+}
+
+#[test]
+fn controller_stale_retry_preserves_exact_attempt_history() {
+    let fixture = Fixture::new();
+    let principal = PrincipalId::random().unwrap();
+    let group = GroupId::random().unwrap();
+    let actor = Actor::new(principal.clone());
+    let mut config = fixture.config.clone();
+    config.cache_bytes = 32 * 1024 * 1024;
+    config.authorities.push(Authority {
+        principal: principal.clone(),
+        uid: unsafe { libc::geteuid() },
+        gid: 1001,
+        primary_group: group.clone(),
+        groups: vec![group.clone()],
+        dac_override: false,
+        ownership_transfer: false,
+    });
+    let rep = Replica::open(fixture.dir.join("state"), config.clone()).unwrap();
+    let revision = Revision {
+        format: FORMAT.into(),
+        hash: HASH.into(),
+        layout: LAYOUT.into(),
+        parents: vec![],
+        operation: OperationId::random().unwrap(),
+        replica: config.replica,
+        principal: principal.clone(),
+        captured_at_ns: 0,
+        coverage: vec!["".into()],
+        provenance: "explicit".into(),
+        restoration: None,
+        tree: Tree {
+            root: Root {
+                id: EntryId::random().unwrap(),
+                owner: principal,
+                group,
+                mode: 0o755,
+            },
+            entries: vec![],
+        },
+    };
+    let bytes = encode_revision(&revision).unwrap();
+    let id = revision_id(&revision).unwrap();
+    rep.import_revision(
+        ImportDescriptor {
+            expected: id.clone(),
+            bytes: bytes.clone(),
+        },
+        ChunkSource::Unavailable,
+    )
+    .unwrap();
+    let owner = rep.begin_live(&id, actor.clone(), false).unwrap();
+    let mut binding = fixture.transport.binding.clone();
+    binding.publication = PublicationMode::SharedLive;
+    binding.view.revision = id;
+    rep.configure_sync(binding.clone()).unwrap();
+    rep.enable_mounted_collaboration(&owner, &binding, actor.clone())
+        .unwrap();
+
+    drop(owner.create("first-save", 0o600).unwrap());
+    let op = OperationId::random().unwrap();
+    let revision = owner
+        .checkpoint(
+            &op,
+            owner.generation().unwrap(),
+            Attribution {
+                coverage: vec!["".into()],
+                captured_at_ns: 0,
+                provenance: "explicit".into(),
+            },
+        )
+        .unwrap();
+    rep.enqueue_submission(PendingSubmission {
+        operation: op.clone(),
+        local_revision: revision.clone(),
+        original_view: binding.view.view.clone(),
+        original_head: binding.view.head.clone(),
+        expected_local_generation: owner.generation().unwrap(),
+    })
+    .unwrap();
+    let mut p = rep.sync_status().unwrap().submissions.remove(0);
+    p.private_receipt = Some(protocol::PrivateReceipt {
+        receipt: protocol::ReceiptId::random().unwrap(),
+        operation: op.clone(),
+        replica: rep.configuration().unwrap().replica,
+        submitted_revision: revision.clone(),
+        original_view: binding.view.view.clone(),
+        original_head: binding.view.head.clone(),
+    });
+    p.state = SubmissionState::PrivateRemote;
+    rep.record_sync_progress(&op, SubmissionState::Queued, p.clone())
+        .unwrap();
+    fixture.response(409, br#"{"code":"stale_head"}"#);
+    let fresh = protocol::ViewBinding {
+        head: protocol::HeadToken::random().unwrap(),
+        ..binding.view.clone()
+    };
+    fixture.response(200, &serde_json::to_vec(&fresh).unwrap());
+    let replica = rep.clone();
+    let shared_head = protocol::HeadToken::random().unwrap();
+    fixture.replies.lock().unwrap().push_back(Reply {
+        status: 200,
+        body: vec![],
+        before_response: None,
+        response_body: Some(Box::new(move || {
+            let current = replica.sync_status().unwrap().submissions.remove(0);
+            serde_json::to_vec(&protocol::SharedReceipt {
+                receipt: protocol::ReceiptId::random().unwrap(),
+                operation: current.integration.unwrap().operation,
+                replica: replica.configuration().unwrap().replica,
+                submitted_revision: current.local_revision,
+                branch: binding.branch,
+                head: shared_head,
+            })
+            .unwrap()
+        })),
+    });
+    let result = crate::sync::controller::SyncController::new(&rep)
+        .unwrap()
+        .drain(
+            &revision,
+            DurabilityLevel::Shared,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(result.state, SubmissionState::Shared);
+    assert_eq!(result.superseded.len(), 1);
+    assert_eq!(
+        result.superseded[0].expected_head,
+        p.private_receipt.as_ref().unwrap().original_head
+    );
+    assert_eq!(
+        result.integration.as_ref().unwrap().expected_head,
+        fresh.head
+    );
+    assert_ne!(
+        result.integration.as_ref().unwrap().operation,
+        result.superseded[0].operation
+    );
+    assert_eq!(result.private_receipt, p.private_receipt);
+    assert!(rep.local_work_recovery().unwrap().is_empty());
+    let requests = fixture.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].contains("/integrations "));
+    assert!(requests[1].contains("/views "));
+    assert!(requests[2].contains("/integrations "));
 }

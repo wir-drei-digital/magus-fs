@@ -158,8 +158,49 @@ except BaseException:
         log=self.endpoints['a'].execute("import json;print(json.dumps(open('/private/a/daemon.log').read()))")
         if not overlap:assert ('DirtyReconciled' if foreign else 'OwnBaseAdvanced') in log
         self.record(case,before=before,after=after,original=original,new=[p for p in current if p['operation'] not in prior],ordinary_uid=1001,logs=log)
-    def run(self, agents_only=False):
+    def stale_retry_two_saves(self):
+        self.restart_mount('a',fault='sync-before-send')
+        self.write('a','target',b'stale-first-save')
+        self.until(lambda:self.endpoints['a'].execute("import json,os;print(json.dumps(os.path.exists('/private/a/task3-fault')))") ,15)
+        original=self.status('a')['status']['submissions']
+        candidate=next(p for p in original if p['remote_outcome_unknown'])
+        # A's candidate/base are frozen, Working is clean, and B wins the head race.
+        self.write('b','foreign',b'winning-foreign-save')
+        self.until(lambda:self.status('b')['status']['binding']['view']['head']!=candidate['request']['original_head'],60)
+        self.settle(('b',))
+        self.restart_mount('a',crash=True)
+        self.until(lambda:any(p['operation']==candidate['operation'] and p.get('applied_revision') for p in self.status('a')['status']['submissions']),60)
+        first=self.settle()
+        recovered=next(p for p in first['a']['status']['submissions'] if p['operation']==candidate['operation'])
+        assert recovered['state']=='Shared' and recovered.get('superseded'),recovered
+        assert recovered['applied_revision'] is not None
+        for key in ['operation','local_revision','request','request_digest']:
+            assert recovered[key]==candidate[key],key
+        assert recovered['superseded'][0]['expected_head']==candidate['request']['original_head']
+        assert self.read('a','target')==self.read('b','target')==b'stale-first-save'.hex()
+        assert self.read('a','foreign')==b'winning-foreign-save'.hex()
+        recovery=self.local('a','list')
+        assert recovery['readiness']=='Ready',recovery
+        self.restart_mount('a')
+        self.settle()
+        reopened=self.local('a','list')
+        assert reopened['readiness']=='Ready',reopened
+        self.write('a','target',b'stale-second-save')
+        prior={p['operation'] for p in first['a']['status']['submissions']}
+        self.until(lambda:any(p['operation'] not in prior and p.get('applied_revision') for p in self.status('a')['status']['submissions']),60)
+        second=self.settle()
+        assert self.read('a','target')==self.read('b','target')==b'stale-second-save'.hex()
+        assert len(second['a']['status']['submissions'])>len(first['a']['status']['submissions'])
+        preserved=next(p for p in second['a']['status']['submissions'] if p['operation']==candidate['operation'])
+        for key in ['operation','local_revision','request','request_digest','superseded','integration','private_receipt','shared_receipt']:
+            assert preserved[key]==recovered[key],key
+        self.record('stale-retry-two-saves',original=original,first=first,recovery=recovery,reopened=reopened,second=second,ordinary_uid=1001)
+
+    def run(self, agents_only=False, stale_retry_only=False):
         self.setup_mounts()
+        if stale_retry_only:
+            self.stale_retry_two_saves()
+            return
         if agents_only:
             self.two_agents()
             return
@@ -286,8 +327,8 @@ print(json.dumps({'pid':p.pid,'schema':schema}))""",{'name':name,'fault':fault,'
         if errors:raise AssertionError('owned mounted cleanup incomplete')
 
 def main(argv=None):
-    parser=argparse.ArgumentParser();parser.add_argument('--image',required=True);parser.add_argument('--output',required=True);parser.add_argument('--agents-only',action='store_true');args=parser.parse_args(argv)
-    cases=['two-ordinary-agents'] if args.agents_only else CASES
+    parser=argparse.ArgumentParser();parser.add_argument('--image',required=True);parser.add_argument('--output',required=True);parser.add_argument('--agents-only',action='store_true');parser.add_argument('--stale-retry-only',action='store_true');args=parser.parse_args(argv)
+    cases=['stale-retry-two-saves'] if args.stale_retry_only else ['two-ordinary-agents'] if args.agents_only else CASES
     from continuation_proof import validate_image
     validate_image(args.image)
     class Infra(OwnedInfra):
@@ -299,7 +340,7 @@ def main(argv=None):
     infra.write_json('mounted-plan.json',{'cases':cases,'ordinary_uid':1001,'manual_drains':False})
     try:
         infra.preflight();source=capture(infra);infra.setup(args.image);infra.isolate_service_control();verify_linux_image(infra,source)
-        journey=Journey(infra,args.image);journey.run(agents_only=args.agents_only);verify_linux_image(infra,source);status=0
+        journey=Journey(infra,args.image);journey.run(agents_only=args.agents_only,stale_retry_only=args.stale_retry_only);verify_linux_image(infra,source);status=0
     except InfrastructureUnavailable as error:infra.write_json('failure.json',{'classification':'blocked','reason':str(error)});status=2
     except Exception as error:infra.write_json('failure.json',{'classification':'failed','reason':str(error),'trace':traceback.format_exc()});print(traceback.format_exc(),flush=True)
     finally:
@@ -307,7 +348,7 @@ def main(argv=None):
             if journey:journey.cleanup()
             infra.cleanup()
         except Exception as error:infra.write_json('cleanup-failure.json',{'reason':str(error)});status=1
-        infra.write_json('result.json',{'status':status,'scope':'actual two-agent practicality' if args.agents_only else 'mounted continuation correctness','completed':journey.observations if journey else [],'not_run':[c for c in cases if not journey or not any(r['case']==c for r in journey.observations)]})
+        infra.write_json('result.json',{'status':status,'scope':'actual stale retry two-save recovery' if args.stale_retry_only else 'actual two-agent practicality' if args.agents_only else 'mounted continuation correctness','completed':journey.observations if journey else [],'not_run':[c for c in cases if not journey or not any(r['case']==c for r in journey.observations)]})
     return status
 
 if __name__=='__main__':raise SystemExit(main())

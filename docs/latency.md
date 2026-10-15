@@ -1,5 +1,9 @@
 # Latency diagnostics
 
+**Current disposition — October 15, 2026:** Performance qualification is deferred. The fixed 36 screen remains failed (30 samples over 500ms; eight historical EACCES observations), and no 800-save cohort or current full native/PoC qualification is claimed. The functional whole-branch review identified a stale-head retry recovery blocker; the focused correction passed 80 affected Core checks plus a recovery child, 47 client checks and the actual mounted stale-retry/two-save proof. Its source-attributed evidence is recorded in `.superpowers/sdd/latency-collaboration-plan/functional-closeout-fix-report.md`, subject to one scoped rereview before functional closeout. FS3 scale/provider/packaging gates remain separate.
+
+The sections below are a chronological evidence record. Earlier requirements holds, producer-pending and agent-not-run statements describe their original checkpoints; subsequent correction evidence supersedes those dispositions without erasing failed runs.
+
 `python3 tests/fs2/latency.py --image sha256:IMMUTABLE_IMAGE_ID --output NEW_ABSOLUTE_PATH --phase wakeups` runs one owned synthetic diagnostic. Use a release image built from the frozen checkout with `tests/fs2/Dockerfile.linux`, `VERIFY=latency`, `BUILD_PROFILE=release`, `BIN_DIR=release`, and matching host release default/fault executables. The driver independently compares every runtime/test source with the image and records source/binary/image identities.
 
 The wakeups phase measures 12 mounted saves each on small and warm 64 MiB backgrounds, rotating 24 B, 1 KiB and 16 KiB. Both engines use a fresh owned named disk volume for replica state; ordinary writes/read sampling execute as UID/GID 1001. There are three native saves per background and an atomic editor-save smoke. Linux processes share the VM CLOCK_MONOTONIC clock; native host/VM differences are reported as first-read upper bounds, never subtracted as cross-clock stages. This is a diagnostic in one mounted container, not the two-container final acceptance cohort or host/VM power-loss qualification.
@@ -74,7 +78,7 @@ Acceptance read-only sync-status polling begins after first bytes and can overla
 
 The preserved synthetic atomic probe establishes an ordering blocker: an ordinary temp-file fsync then rename before firstShared freezes both candidates to the old base. The first publishes, the second receives stale_head409 followed by actual409conflicted; sender final bytes differ from the peer's old bench plus published temp file. Renaming after actual firstShared base advancement succeeds even while Applied is pending, so rename-before-Applied alone does not explain failure. Natural j's second request state was cleaned before preservation and its exact409 cause is not retrospectively claimed. No service identity/conflict relaxation or recovery claim was added.
 
-Current status is NEEDS_REQUIREMENTS. Naive admission deferral can deadlock because ordinary adoption rejects dirty work/unadmitted local head. A new authorized own-Shared base-advance operation must first define preservation of dirty writes, captures, generations/current grants and every frozen admitted request/base/digest. This Core behavior lies beyond approved transport scope; human architectural scope/design approval is pending. Do not resume full cohorts, implement speculative behavior or rebuild while that hold remains. Full raw distributions/source/binary/command/cleanup proof and all earlier failures remain in the private Task3 report and evidence. No merge, production or final latency qualification is claimed.
+**Historical transport checkpoint (superseded by approved mounted continuation):** Status was NEEDS_REQUIREMENTS. Naive admission deferral can deadlock because ordinary adoption rejects dirty work/unadmitted local head. A new authorized own-Shared base-advance operation must first define preservation of dirty writes, captures, generations/current grants and every frozen admitted request/base/digest. This Core behavior lies beyond approved transport scope; human architectural scope/design approval is pending. Do not resume full cohorts, implement speculative behavior or rebuild while that hold remains. Full raw distributions/source/binary/command/cleanup proof and all earlier failures remain in the private Task3 report and evidence. No merge, production or final latency qualification is claimed.
 
 ## Bounded metadata collaboration profile
 
@@ -89,7 +93,7 @@ Schema2 inventory is computed only for an active collection window. `current` co
 Enabled profile rows require a real nonzero window, callback and authority-load counts; their per-endpoint attribution verdict retains the ambiguity flag. Counter-off controls are explicitly marked `control-off` with unavailable ambiguity, never interpreted as zero metadata work. The original P1/P2 envelopes predate schema2: their `current` and `removed` values are invalid as inode inventories and are retained unchanged, without retroactive relabeling or reconstructed counts. The correction has focused source/test verification only; its live CPU/latency impact is unmeasured.
 
 
-## Continuation producer (source verified; live execution pending P3)
+## Historical continuation producer checkpoint (live execution was pending P3)
 
 The additive `POST /v1/n/{namespace}/continuations/proof` endpoint accepts
 `ContinuationRequestV1 { receipt: SharedReceipt }` within the existing 64-KiB
@@ -188,7 +192,7 @@ retrieval. Exact operation/receipt/view bindings are checked afterward; first
 bytes are separate and never qualify completion. Existing 25-second observation
 and 60-second settling limits remain. Every completion must be at most 500 ms,
 with median at most 200 ms. This mode is implemented but unrun; three saves
-would not establish p95. Continuation producer P3 remains independently pending.
+would not establish p95. At this historical checkpoint, continuation producer P3 remained independently pending; its later completed producer journey is recorded below.
 
 
 The subsequent I1 harness correction preserves that immediate peer read and
@@ -234,10 +238,10 @@ and restart, denial retention, old-client schema refusal and unchanged Native
 routing. A real private mmap retained its kernel capability after its sole file
 descriptor closed; foreign affected work remained blocked until munmap. Shared
 mmap is unsupported by the existing direct-I/O mount and was not enabled.
-The separate actual two-agent rendezvous was not completed; scripts do not
+At this historical mounted-F checkpoint, the separate actual two-agent rendezvous was not completed; scripts do not
 substitute for that practicality gate.
 
-The original fixed36 screen completed every sample, with first bytes kept
+The original fixed 36 screen completed every sample, with first bytes kept
 separate from exact Shared/Applied/fresh post-Applied read completion:
 
 | Background | Median | Maximum |
@@ -273,3 +277,29 @@ case passed. Two actual ordinary agents then completed atomic and in-place saves
 on separate mounts with matching Applied heads and fresh reads. The original
 fixed36 failure remains unchanged; these focused checks do not establish a new
 latency distribution or authorize the 800-save cohorts.
+
+
+The functional stale-head correction distinguishes an automatically retryable
+SharedLive integration failure from a terminal recovery obligation using one
+predicate shared by Core and the controller. The immutable candidate, request,
+base and ordered stale attempts remain in the durable queue; a Failed record
+still blocks checkpointing until superseded. A recoverable stale attempt no
+longer creates a second, unlinked snapshot that would block the next save even
+after clean Shared/Applied. Retry-cap, denial, conflict and unrelated local-work
+obligations remain retained. Existing unlinked historical recovery records are
+not guessed away; their explicit recovery path remains available.
+
+The bounded reproduction command is
+`python3 tests/fs2/mounted_continuation.py --stale-retry-only --image sha256:IMMUTABLE_IMAGE_ID --output NEW_ABSOLUTE_PATH`.
+It freezes an ordinary mounted candidate, lets a disjoint publisher win the
+head race, requires the actual stale-attempt history and clean Applied, reopens
+the mount, then checks a second ordinary save and exact peer bytes. This is a
+functional regression gate, not a latency cohort or new full-PoC qualification.
+
+The October 15 stale-retry two-save proof passed on immutable image
+`sha256:6e9d9e9342136ef108586f7691da537324b75e890135e3c7eb6997e1fcdb18c0`,
+with empty not-run and successful owned cleanup. Evidence is retained at
+`/private/tmp/magus-functional-closeout-mounted-20261015`; source and all five
+binary identities are recorded there and in the correction report. This new
+proof is limited to the corrected boundary; prior producer/native/agent evidence
+retains its original identity and the failed performance results remain failed.

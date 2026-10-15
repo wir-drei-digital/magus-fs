@@ -107,6 +107,34 @@ fn mounted_owner_requires_same_writable_live_actor() {
 }
 
 fn published(rep: &Replica, b: &SyncBinding, revision: &RevisionId) -> SharedReceipt {
+    publish_with(rep, b, revision, |_, _, _| {})
+}
+
+fn publish_with(
+    rep: &Replica,
+    b: &SyncBinding,
+    revision: &RevisionId,
+    before_shared: impl FnOnce(&Replica, &OperationId, &mut SyncProgress),
+) -> SharedReceipt {
+    let (operation, mut progress, shared) = pending_publication(rep, b, revision);
+    before_shared(rep, &operation, &mut progress);
+    let shared = SharedReceipt {
+        operation: progress.integration.as_ref().unwrap().operation.clone(),
+        ..shared
+    };
+    progress.shared_receipt = Some(shared.clone());
+    progress.state = SubmissionState::Shared;
+    let previous = rep.sync_status().unwrap().submissions[0].state;
+    rep.record_sync_progress(&operation, previous, progress)
+        .unwrap();
+    shared
+}
+
+fn pending_publication(
+    rep: &Replica,
+    b: &SyncBinding,
+    revision: &RevisionId,
+) -> (OperationId, SyncProgress, SharedReceipt) {
     let operation = rep.revision(revision).unwrap().operation;
     rep.enqueue_submission(PendingSubmission {
         operation: operation.clone(),
@@ -159,11 +187,7 @@ fn published(rep: &Replica, b: &SyncBinding, revision: &RevisionId) -> SharedRec
     progress.request = Some(request);
     progress.private_receipt = Some(private);
     progress.integration = Some(integration);
-    progress.shared_receipt = Some(shared.clone());
-    progress.state = SubmissionState::Shared;
-    rep.record_sync_progress(&operation, SubmissionState::Queued, progress)
-        .unwrap();
-    shared
+    (operation, progress, shared)
 }
 
 fn incoming(rep: &Replica, b: &SyncBinding, r: &Revision, receipt: &SharedReceipt) -> SyncBinding {
@@ -956,4 +980,257 @@ fn core_handles_and_unknown_accounting_block_foreign_affected_entries() {
     .unwrap();
     err(w.create("another-local-new", 0o600), "permission_denied");
     assert!(!rep.live_status().unwrap().applied);
+}
+
+#[test]
+fn stale_retry_clean_adoption_allows_second_checkpoint_after_reopen() {
+    let (d, rep, w, base) = setup();
+    let b = binding(base);
+    rep.configure_sync(b.clone()).unwrap();
+    rep.enable_mounted_collaboration(&w, &b, actor()).unwrap();
+    let h = w.create("draft", 0o600).unwrap();
+    w.write(&h, 0, b"first").unwrap();
+    drop(h);
+    let r1 = w
+        .checkpoint(
+            &OperationId::random().unwrap(),
+            w.generation().unwrap(),
+            attr(),
+        )
+        .unwrap();
+    let receipt = publish_with(&rep, &b, &r1, |rep, operation, p| {
+        let frozen = (
+            p.request.clone(),
+            p.request_digest.clone(),
+            p.private_receipt.clone(),
+        );
+        let stale = p.integration.clone().unwrap();
+        p.state = SubmissionState::Failed;
+        p.error = Some("stale_head".into());
+        rep.record_sync_progress(operation, SubmissionState::Queued, p.clone())
+            .unwrap();
+        assert!(matches!(
+            rep.checkpoint_readiness().unwrap(),
+            CheckpointReadiness::Blocked { .. }
+        ));
+        assert!(!rep
+            .prune(true)
+            .unwrap()
+            .evictable
+            .contains(&ObjectId::for_bytes(b"first").unwrap()));
+        p.superseded.push(stale.clone());
+        p.integration = None;
+        p.state = SubmissionState::PrivateRemote;
+        rep.record_sync_progress(operation, SubmissionState::Failed, p.clone())
+            .unwrap();
+        p.integration = Some(IntegrationRequest {
+            operation: OperationId::random().unwrap(),
+            expected_head: HeadToken::random().unwrap(),
+            ..stale.clone()
+        });
+        assert_eq!(
+            (
+                p.request.clone(),
+                p.request_digest.clone(),
+                p.private_receipt.clone()
+            ),
+            frozen
+        );
+        assert_eq!(p.superseded, vec![stale]);
+    });
+    let mut frozen = rep.sync_status().unwrap().submissions;
+    let next = incoming(&rep, &b, &rep.revision(&r1).unwrap(), &receipt);
+    let adoption = rep
+        .adopt_remote_view(next.clone(), w.generation().unwrap(), actor())
+        .unwrap();
+    rep.acknowledge_adoption(&next.view.revision, adoption.epoch)
+        .unwrap();
+    assert!(rep.live_status().unwrap().applied);
+    frozen[0].applied_revision = Some(next.view.revision.clone());
+    assert_eq!(
+        rep.checkpoint_readiness().unwrap(),
+        CheckpointReadiness::Ready
+    );
+    drop(w);
+    drop(rep);
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    assert_eq!(rep.sync_status().unwrap().submissions, frozen);
+    assert_eq!(
+        rep.checkpoint_readiness().unwrap(),
+        CheckpointReadiness::Ready
+    );
+    assert!(!rep
+        .prune(true)
+        .unwrap()
+        .evictable
+        .contains(&ObjectId::for_bytes(b"first").unwrap()));
+    let w = rep.begin_live(&next.view.revision, actor(), false).unwrap();
+    let h = w.open("draft", OpenMode::ReadWrite).unwrap();
+    w.write(&h, 0, b"second").unwrap();
+    w.checkpoint(
+        &OperationId::random().unwrap(),
+        w.generation().unwrap(),
+        attr(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn stale_retry_failure_reopen_retains_candidate_and_later_work() {
+    let (d, rep, w, base) = setup();
+    let b = binding(base);
+    rep.configure_sync(b.clone()).unwrap();
+    rep.enable_mounted_collaboration(&w, &b, actor()).unwrap();
+    let h = w.create("draft", 0o600).unwrap();
+    w.write(&h, 0, b"first").unwrap();
+    let r1 = w
+        .checkpoint(
+            &OperationId::random().unwrap(),
+            w.generation().unwrap(),
+            attr(),
+        )
+        .unwrap();
+    let (op, mut p, _) = pending_publication(&rep, &b, &r1);
+    w.write(&h, 0, b"later").unwrap();
+    p.state = SubmissionState::Failed;
+    p.error = Some("stale_head".into());
+    rep.record_sync_progress(&op, SubmissionState::Queued, p.clone())
+        .unwrap();
+    assert!(rep.local_work_recovery().unwrap().is_empty());
+    drop(h);
+    drop(w);
+    drop(rep);
+    let rep = Replica::reopen(d.path().join("state")).unwrap();
+    assert_eq!(rep.sync_status().unwrap().submissions[0], p);
+    assert!(matches!(
+        rep.checkpoint_readiness().unwrap(),
+        CheckpointReadiness::Blocked { .. }
+    ));
+    let w = rep.begin_live(&r1, actor(), false).unwrap();
+    let h = w.open("draft", OpenMode::Read).unwrap();
+    assert_eq!(w.read(&h, 0, 5).unwrap(), b"later");
+    let gc = rep.prune(true).unwrap();
+    for body in [b"first", b"later"] {
+        assert!(!gc.evictable.contains(&ObjectId::for_bytes(body).unwrap()));
+    }
+}
+
+#[test]
+fn terminal_publication_failures_keep_recovery_obligations() {
+    for failure in ["denied", "conflict", "cap", "isolated", "resolution"] {
+        let (d, rep, w, base) = setup();
+        let b = binding(base);
+        rep.configure_sync(b.clone()).unwrap();
+        rep.enable_mounted_collaboration(&w, &b, actor()).unwrap();
+        let h = w.create("draft", 0o600).unwrap();
+        w.write(&h, 0, b"first").unwrap();
+        let r1 = w
+            .checkpoint(
+                &OperationId::random().unwrap(),
+                w.generation().unwrap(),
+                attr(),
+            )
+            .unwrap();
+        let (op, mut p, _) = pending_publication(&rep, &b, &r1);
+        p.state = SubmissionState::Failed;
+        p.error = Some("stale_head".into());
+        // Pin predicate boundaries without fabricating invalid resolution records.
+        if failure == "isolated" {
+            assert!(!p.can_retry_stale_integration(PublicationMode::Isolated));
+            continue;
+        }
+        if failure == "resolution" {
+            let mut resolution = p.clone();
+            resolution.resolves = Some(ResolutionTarget {
+                conflicts: vec![],
+                expected_head: b.view.head.clone(),
+                receipts: vec![],
+                source: None,
+            });
+            assert!(!resolution.can_retry_stale_integration(PublicationMode::SharedLive));
+            p.integration = None;
+            assert!(!p.can_retry_stale_integration(PublicationMode::SharedLive));
+        }
+        if failure == "denied" {
+            p.state = SubmissionState::Denied;
+            p.error = Some("denied".into());
+        }
+        if failure == "conflict" {
+            p.error = Some("conflict".into());
+        }
+        let mut previous = SubmissionState::Queued;
+        if failure == "cap" {
+            for _ in 0..MAX_SUPERSEDED_INTEGRATIONS {
+                rep.record_sync_progress(&op, previous, p.clone()).unwrap();
+                let stale = p.integration.take().unwrap();
+                p.superseded.push(stale.clone());
+                p.state = SubmissionState::PrivateRemote;
+                rep.record_sync_progress(&op, SubmissionState::Failed, p.clone())
+                    .unwrap();
+                p.integration = Some(IntegrationRequest {
+                    operation: OperationId::random().unwrap(),
+                    ..stale
+                });
+                p.state = SubmissionState::Failed;
+                previous = SubmissionState::PrivateRemote;
+            }
+        }
+        assert!(
+            !p.can_retry_stale_integration(PublicationMode::SharedLive),
+            "{failure}"
+        );
+        rep.record_sync_progress(&op, previous, p.clone()).unwrap();
+        assert_eq!(rep.local_work_recovery().unwrap().len(), 1, "{failure}");
+        drop(h);
+        drop(w);
+        drop(rep);
+        let rep = Replica::reopen(d.path().join("state")).unwrap();
+        assert!(
+            matches!(
+                rep.checkpoint_readiness().unwrap(),
+                CheckpointReadiness::Blocked { .. }
+            ),
+            "{failure}"
+        );
+        assert_eq!(rep.sync_status().unwrap().submissions[0], p);
+        assert!(!rep
+            .prune(true)
+            .unwrap()
+            .evictable
+            .contains(&ObjectId::for_bytes(b"first").unwrap()));
+    }
+}
+
+#[test]
+fn clean_publication_does_not_clear_unrelated_authority_recovery() {
+    let (_d, rep, w, base) = setup();
+    let b = binding(base);
+    rep.configure_sync(b.clone()).unwrap();
+    rep.enable_mounted_collaboration(&w, &b, actor()).unwrap();
+    drop(w.create("draft", 0o600).unwrap());
+    let r1 = w
+        .checkpoint(
+            &OperationId::random().unwrap(),
+            w.generation().unwrap(),
+            attr(),
+        )
+        .unwrap();
+    rep.observe_remote_authority(None, rep.live_status().unwrap().authority_generation)
+        .unwrap();
+    let recovery = rep.local_work_recovery().unwrap();
+    let receipt = published(&rep, &b, &r1);
+    let next = incoming(&rep, &b, &rep.revision(&r1).unwrap(), &receipt);
+    let adoption = rep
+        .adopt_remote_view(next.clone(), w.generation().unwrap(), actor())
+        .unwrap();
+    rep.acknowledge_adoption(&next.view.revision, adoption.epoch)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(rep.local_work_recovery().unwrap()).unwrap(),
+        serde_json::to_value(recovery).unwrap()
+    );
+    assert!(matches!(
+        rep.checkpoint_readiness().unwrap(),
+        CheckpointReadiness::Blocked { .. }
+    ));
 }
