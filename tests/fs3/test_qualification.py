@@ -177,7 +177,7 @@ class ProviderAssertionTests(unittest.TestCase):
                 self.assertEqual(normalize(row)['status'],'failed')
 
 class ProviderRawAssertionTests(unittest.TestCase):
-    def test_false_raw_outcome_is_not_replaced_by_true_case_flag(self):
+    def raw_assertions(self,revoked_row=None):
         import tempfile,json,hashlib
         from pathlib import Path
         from daytona import provider_assertions
@@ -190,6 +190,7 @@ class ProviderRawAssertionTests(unittest.TestCase):
                 'private-history':{'private_entry':'private','hidden_entry':'hidden','observed_entries':[],'readonly_denied':404,'page':{'next':None}},
                 'api-bypass':{'before':{},'after':{},'own_view_private_object':{'allowed_status':200,'private_status':404,'denied':{'code':'not_found'}}},
                 'revoked-reconnect':{'denied':{'read':13},'status':{'live':{'authorized':False}},'kernel_daemon_proof':{'mountinfo':'1 0 0:1 / /shared/a2 rw - fuse magus rw','pid':2,'expected_pid':2,'binary_sha256':'a'*64,'expected_binary_sha256':'a'*64,'command':['magus-fs','mount','--state','/private/a2/state','--mountpoint','/shared/a2']}}}
+            if revoked_row is not None:raw['revoked-reconnect']=revoked_row
             cases={}
             for case,value in raw.items():
                 path=p/(case+'.json');path.write_text(json.dumps(value));cases[case]={'passed':True,'provenance':str(path),'sha256':hashlib.sha256(path.read_bytes()).hexdigest()}
@@ -201,3 +202,40 @@ class ProviderRawAssertionTests(unittest.TestCase):
             readonly=next(r for r in rows if r['case']=='readonly')
             self.assertFalse(readonly['observed']);self.assertFalse(readonly['passed'])
             self.assertEqual(len(rows),8)
+            return rows
+
+    def test_false_raw_outcome_is_not_replaced_by_true_case_flag(self):
+        self.raw_assertions()
+
+
+    def test_live_revoked_producer_matches_actual_assertion_reader(self):
+        import daytona,copy
+        self.assertTrue(hasattr(daytona,'revoked_reconnect_case'))
+        proof={'pid':272,'expected_pid':272,'binary_sha256':'a'*64,'expected_binary_sha256':'a'*64,
+            'command':['/opt/fs3-task4/bin/magus-fs','mount','--state','/private/a2/state','--mountpoint','/shared/a2'],
+            'mountinfo':'1 0 0:1 / /shared/a2 rw - fuse magus rw','stat_ismount':False}
+        class Remote:
+            def execute(self,code,settings):
+                assert settings=={'name':'a2','expected_pid':272,'expected_binary_sha256':'a'*64}
+                return copy.deepcopy(proof)
+            def status(self,name):return {'live':{'authorized':False}}
+        emitted=daytona.revoked_reconnect_case(Remote(),{'read:reports/result':13,'write:reports/live':13},proof)
+        rows=self.raw_assertions(emitted)
+        self.assertTrue(next(r for r in rows if r['case']=='revoked-reconnect')['passed'])
+        self.assertEqual(emitted['kernel_daemon_proof'],proof)
+
+    def test_live_revoked_producer_rejects_changed_pid_binary_or_missing_mount(self):
+        import daytona
+        self.assertTrue(hasattr(daytona,'revoked_reconnect_case'))
+        before={'pid':272,'expected_pid':272,'binary_sha256':'a'*64,'expected_binary_sha256':'a'*64,
+            'command':['/opt/fs3-task4/bin/magus-fs','mount','--state','/private/a2/state','--mountpoint','/shared/a2'],
+            'mountinfo':'1 0 0:1 / /shared/a2 rw - fuse magus rw'}
+        for change in ({'pid':273},{'binary_sha256':'b'*64},{'mountinfo':'1 0 0:1 / / rw - overlay root rw'}):
+            with self.subTest(change=change):
+                class Remote:
+                    def execute(self,code,settings):
+                        return {'pid':272,'expected_pid':272,'binary_sha256':'a'*64,'expected_binary_sha256':'a'*64,
+                            'command':['/opt/fs3-task4/bin/magus-fs','mount','--state','/private/a2/state','--mountpoint','/shared/a2'],
+                            'mountinfo':'1 0 0:1 / /shared/a2 rw - fuse magus rw',**change}
+                    def status(self,name):return {'live':{'authorized':False}}
+                with self.assertRaises(AssertionError):daytona.revoked_reconnect_case(Remote(),{'read':13},before)

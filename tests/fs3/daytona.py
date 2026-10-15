@@ -256,6 +256,30 @@ def retained_mount(row,name):
         and '--mountpoint' in command and command[command.index('--mountpoint')+1]=='/shared/'+name)
 
 
+
+def observe_retained_mount(remote,name,expected_pid,expected_binary_sha256=None):
+    """Read kernel/process identities without stat-based mount authority or remount."""
+    proof=remote.execute('''import json,sys,os,hashlib
+from pathlib import Path
+s=json.load(sys.stdin);pid=int(Path('/private/'+s['name']+'/pid').read_text());proc=Path('/proc')/str(pid)
+expected=s['expected_binary_sha256'] or hashlib.sha256(Path('/opt/fs3-task4/bin/magus-fs').read_bytes()).hexdigest()
+print(json.dumps({'pid':pid,'expected_pid':s['expected_pid'],'binary_sha256':hashlib.sha256((proc/'exe').read_bytes()).hexdigest(),
+ 'expected_binary_sha256':expected,'command':[x.decode() for x in (proc/'cmdline').read_bytes().split(b'\\0') if x],
+ 'mountinfo':Path('/proc/self/mountinfo').read_text(),'stat_ismount':os.path.ismount('/shared/'+s['name'])}))''',
+        {'name':name,'expected_pid':expected_pid,'expected_binary_sha256':expected_binary_sha256})
+    assert retained_mount(proof,name),'retained mount/daemon identity changed'
+    return proof
+
+
+def revoked_reconnect_case(remote,denied,before):
+    """Producer and assertion reader share the full retained_mount proof schema."""
+    assert retained_mount(before,'a2'),'pre-disconnect identity uncertain'
+    proof=observe_retained_mount(remote,'a2',before['pid'],before['binary_sha256'])
+    status=remote.status('a2')
+    assert denied and set(denied.values())=={13} and status['live']['authorized'] is False
+    return {'denied':denied,'retained_mount':True,'status':status,'transport_reconnect_only':True,
+            'pre_disconnect_kernel_daemon_proof':before,'kernel_daemon_proof':proof}
+
 class RemoteMount:
     """Existing Lazy CLI boundary carried over private SSH; workload is UID1002."""
     def __init__(self,journey,config,output):
@@ -494,6 +518,7 @@ def hosted_cases(config,output):
         state['steps']['negative_scope']=rejected;save()
         c.assertion('scope',{'scope_read':denied,'rejected':rejected,'local_recovery_sha256':hashlib.sha256(synthetic).hexdigest(),'before':before,'after':c.effect()})
     if 'revoked-reconnect' not in state.get('cases',{}):
+        before_reconnect=observe_retained_mount(remote,'a2',state['steps']['mounts']['a2']['pid'])
         relay=json.loads((output/'relay-18443-owner.json').read_text());pid=relay['pid']
         actual=subprocess.check_output(['ps','-p',str(pid),'-o','command='],text=True)
         assert 'ssh_relay.py' in actual and config['ssh_config'] in actual and '--target-port '+str(i.port) in actual,'relay identity changed'
@@ -505,8 +530,7 @@ def hosted_cases(config,output):
         denied=c.denied_io('a2',[('read','reports/result'),('write','reports/live')]);assert set(denied.values())=={13},denied
         c.expect('hosted-revoked-view','POST',c.root+'/views',401,body={'branch':'main'},actor='a2')
         c.expect('hosted-revoked-operation','GET',c.op_path(private['request']),401,actor='a2')
-        assert remote.execute("import json;from pathlib import Path;print(json.dumps(any(line.split()[4]=='/shared/a2' for line in Path('/proc/self/mountinfo').read_text().splitlines())))") is True
-        c.assertion('revoked-reconnect',{'denied':denied,'retained_mount':remote.execute("import json;from pathlib import Path;print(json.dumps(any(line.split()[4]=='/shared/a2' for line in Path('/proc/self/mountinfo').read_text().splitlines())))"),'status':remote.status('a2'),'transport_reconnect_only':True})
+        c.assertion('revoked-reconnect',revoked_reconnect_case(remote,denied,before_reconnect))
     if 'intended_write' not in state['steps']:
         body=b'complete intended final hosted bytes\n';(output/'intended-input.bin').write_bytes(body)
         c.write('a1','reports/completed',body)
