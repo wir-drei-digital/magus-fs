@@ -42,3 +42,11 @@ python3 tests/fs3/run.py --phase all --image sha256:IMMUTABLE_IMAGE --package-ma
 ```
 
 Exit0 means the selected phase passed, exit1 failed, exit2 blocked. Only relevant inputs are required. `all` executes the phases; it does not import earlier results. Missing or blocked actual provider evidence can never pass `all`. Provider execution is a later task; no credentials are read by local packaging. Daytona's documented local snapshot import requires AMD64; these ARM64 archives cannot qualify that route. Confirm actual target architecture and endpoint/trust/FUSE/lifecycle prerequisites before a separate AMD64 build or provider run. Keep provider inputs private and workload/control credentials separate. A fake provider can only test failure handling.
+
+Daytona Task4 additionally supports the explicitly approved `disposable-daytona`
+lifecycle. Aggregate acceptance requires its full pre-delete completion guard,
+terminal exact-owned provider absence, two distinct fresh service-only whole-tree
+recoveries, and normal cleanup of local recovery mounts. It does not convert
+provider deletion into a normal-unmount result. Hosted content measurements may
+be composed from the explicitly labelled existing instrumented read-only service;
+the default packaged service remains the authority and durability path.

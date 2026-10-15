@@ -57,3 +57,24 @@ class RetainedAggregateTests(unittest.TestCase):
         self.index['phases']['provider']={'result':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
         with self.assertRaisesRegex(ValueError,'unexecuted evidence'):
             self.run_index()
+
+class DisposableCleanupTests(unittest.TestCase):
+    def fixture(self):
+        from test_daytona import disposable
+        return {'schema':1,'phase':'provider','status':'passed','failures':[],'blocked':[],
+            'source':{'verified':True,'head':'a'*40,'manifest_sha256':'b'*64,'bridge':'actual-bridge'},
+            'binaries':{'verified':True,'image':'sha256:'+'a'*64,'sha256':{'magus-fs':'b'*64,'magus-fs-service':'c'*64}},
+            'measurements':disposable(),'cleanup':{'ok':True,'mounts_absent':False,'resources_removed':True,'provider_absent':True,'local_mounts_absent':True,'lifecycle':'disposable-daytona','provenance':'actual'}}
+
+    def test_complete_disposal_does_not_claim_normal_unmount(self):
+        from qualification import normalize
+        result=normalize(self.fixture())
+        self.assertEqual(result['failures'],[])
+        self.assertFalse(result['cleanup']['mounts_absent'])
+
+    def test_disposal_without_post_recovery_or_local_cleanup_fails(self):
+        from qualification import normalize
+        r=self.fixture();r['measurements'].pop('recovery_after')
+        self.assertEqual(normalize(r)['status'],'failed')
+        r=self.fixture();r['cleanup']['local_mounts_absent']=False
+        self.assertEqual(normalize(r)['status'],'failed')

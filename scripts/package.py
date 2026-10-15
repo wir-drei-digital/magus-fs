@@ -13,6 +13,9 @@ import tarfile
 
 ROOT=Path(__file__).resolve().parents[1]
 PLATFORMS=('aarch64-apple-darwin','aarch64-unknown-linux-gnu')
+AMD64='x86_64-unknown-linux-gnu'
+CLIENT_BUILD=['cargo','build','--locked','--release','-p','magus-fs','--bin','magus-fs','--target',AMD64]
+BASE_MANIFEST_SHA256='56d8592d1ba9fd84a4a2ed8ae93d41824608e334f75645b56ea674eb42c98da8'
 LICENSES=('LICENSE','THIRD_PARTY_NOTICES.md')
 MARKERS=(b'MAGUS_TEST_',b'client_probe')
 MANIFESTS=('Cargo.toml','crates/magus-fs/Cargo.toml','crates/magus-fs-core/Cargo.toml','crates/magus-fs-service/Cargo.toml')
@@ -48,9 +51,10 @@ def runtime_inputs(manifest):
     return {n:v for n,v in manifest.items() if n in MANIFESTS or n in ('Cargo.lock','rust-toolchain.toml') or n.startswith(('src/','vendor/','benches/')) or (n.startswith('crates/') and '/tests/' not in n)}
 
 def binary_check(data,platform):
-    require(platform in PLATFORMS,'unsupported architecture label')
+    require(platform in (*PLATFORMS,AMD64),'unsupported architecture label')
     require(not any(marker in data for marker in MARKERS),'test-fault/probe binary forbidden')
     if platform==PLATFORMS[0]:require(data[:4]==b'\xcf\xfa\xed\xfe' and data[4:8]==b'\x0c\x00\x00\x01','expected ARM64 Mach-O')
+    elif platform==AMD64:require(data[:6]==b'\x7fELF\x02\x01' and data[18:20]==b'\x3e\x00','expected AMD64 ELF')
     else:require(data[:6]==b'\x7fELF\x02\x01' and data[18:20]==b'\xb7\x00','expected ARM64 ELF')
 
 def write_archive(path,files):
@@ -65,8 +69,9 @@ def load_manifest(path):
     path=Path(path);m=json.loads(path.read_text());require(m.get('schema')==1,'unsupported package schema')
     s=m.get('source',{});require(re.fullmatch('[a-f0-9]{40}',s.get('head','')) and canonical_sha(s.get('manifest'))==s.get('manifest_sha256'),'source manifest mismatch')
     for row in m.get('packages',[]):
-        require(row.get('platform') in PLATFORMS,'unsupported architecture label')
+        require(row.get('platform') in (*PLATFORMS,AMD64),'unsupported architecture label')
         require(row.get('role') in ('client','service'),'unsupported artifact role')
+        require(row.get('platform')!=AMD64 or row.get('role')=='client','AMD64 service is not qualified')
         require(row.get('archive')==Path(row.get('archive','')).name and row.get('archive','').endswith('.tar.gz'),'unsafe archive path')
     require(bool(m.get('packages')),'missing packages');return m
 
@@ -93,6 +98,7 @@ def install(manifest_path,platform,role,prefix):
     binary='bin/magus-fs' if role=='client' else 'bin/magus-fs-service'
     require(row['binary']==binary and sha(files[binary])==row['binary_sha256'],'binary checksum mismatch')
     binary_check(files[binary],platform)
+    if platform==AMD64:verify_client_build(m.get('builds',{}).get('client_amd64',{}),files[binary],runtime_inputs(m['source']['manifest']),m['licenses'])
     prefix.mkdir(mode=0o700);(prefix/'bin').mkdir(mode=0o755)
     # An interrupted install remains owned evidence. Retry must choose a new prefix.
     for name,body in sorted(files.items()):
@@ -148,9 +154,62 @@ def package(output,image,host_proof):
     (output/'SHA256SUMS').write_text(''.join(f'{v}  {n}\n' for n,v in sorted(sums.items())))
     return manifest
 
+def verify_client_build(proof,data,source,licenses):
+    require(proof.get('exit')==0 and proof.get('platform')==AMD64
+        and proof.get('profile')=='release' and proof.get('argv')==CLIENT_BUILD,
+        'default cross-client build command mismatch')
+    require(proof.get('compiler','').startswith('rustc 1.92.0 ')
+        and re.fullmatch('sha256:[a-f0-9]{64}',proof.get('toolchain_image','')),
+        'cross-client toolchain provenance missing')
+    require(proof.get('source')==source and proof.get('source_manifest_sha256')==canonical_sha(source),
+        'cross-client source mismatch')
+    require(proof.get('licenses')==licenses,'cross-client license mismatch')
+    require(proof.get('binary_sha256')==sha(data),'cross-client binary mismatch')
+    binary_check(data,AMD64)
+
+
+def append_client(output,base_path,proof_path):
+    """Copy immutable accepted archives; add only the independently built client."""
+    import copy
+    base_path=Path(base_path);proof_path=Path(proof_path);output=Path(output)
+    require(output.is_absolute(),'absolute fresh output required')
+    require(sha(base_path.read_bytes())==BASE_MANIFEST_SHA256,'unaccepted base manifest')
+    base=load_manifest(base_path);source=source_manifest()
+    require(runtime_inputs(base['source']['manifest'])==runtime_inputs(source),'base runtime source changed')
+    licenses={n:source[n] for n in LICENSES}
+    require(licenses==base['licenses'],'base notices changed')
+    proof=json.loads(proof_path.read_text());data=Path(proof['binary_path']).read_bytes()
+    verify_client_build(proof,data,runtime_inputs(source),licenses)
+    archives={r['archive']:(base_path.parent/r['archive']).read_bytes() for r in base['packages']}
+    require(all(sha(archives[r['archive']])==r['sha256'] for r in base['packages']),'base archive changed')
+    output.mkdir(mode=0o700)
+    for name,blob in archives.items():(output/name).write_bytes(blob)
+    m=copy.deepcopy(base);m['base_manifest']={'sha256':BASE_MANIFEST_SHA256,'source':base['source']}
+    m['source']={'head':command(['git','rev-parse','HEAD']).strip(),'manifest':source,
+        'manifest_sha256':canonical_sha(source),'diff_sha256':sha(command(['git','diff','--binary','HEAD']).encode()),
+        'bridge':{n:{'base':base['source']['manifest'].get(n),'current':source.get(n)}
+            for n in sorted(set(source)|set(base['source']['manifest'])) if source.get(n)!=base['source']['manifest'].get(n)}}
+    m['builds']['client_amd64']=proof
+    m['builds']['client_amd64_proof_sha256']=sha(proof_path.read_bytes())
+    files={'bin/magus-fs':data,**{n:(ROOT/n).read_bytes() for n in LICENSES},
+        'fs3-qualification.md':(ROOT/'docs/fs3-qualification.md').read_bytes()}
+    archive='magus-fs-0.1.0-'+AMD64+'.tar.gz';write_archive(output/archive,files)
+    m['packages'].append({'role':'client','platform':AMD64,'archive':archive,
+        'sha256':sha((output/archive).read_bytes()),'binary':'bin/magus-fs','binary_sha256':sha(data),
+        'members':{n:sha(b) for n,b in files.items()}})
+    require(source==source_manifest(),'source changed during client packaging')
+    (output/'manifest.json').write_text(json.dumps(m,indent=2)+'\n')
+    sums={r['archive']:r['sha256'] for r in m['packages']};sums['manifest.json']=sha((output/'manifest.json').read_bytes())
+    (output/'SHA256SUMS').write_text(''.join(f'{v}  {n}\n' for n,v in sorted(sums.items())))
+    return m
+
+
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output');p.add_argument('--image');p.add_argument('--host-build-proof',default=str(ROOT/'target/release/fs3-host-build.json'));p.add_argument('--prepare-host',action='store_true');a=p.parse_args()
-    if a.prepare_host:host_build(a.host_build_proof)
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output');p.add_argument('--image');p.add_argument('--host-build-proof',default=str(ROOT/'target/release/fs3-host-build.json'));p.add_argument('--prepare-host',action='store_true');p.add_argument('--client-build-proof');p.add_argument('--base-manifest');a=p.parse_args()
+    if a.client_build_proof:
+        if not a.base_manifest or not a.output or a.image or a.prepare_host:p.error('client-only mode requires --base-manifest and --output only')
+        append_client(a.output,a.base_manifest,a.client_build_proof)
+    elif a.prepare_host:host_build(a.host_build_proof)
     else:
         if not a.output or not a.image:p.error('--output and --image are required for packaging')
         package(a.output,a.image,a.host_build_proof)

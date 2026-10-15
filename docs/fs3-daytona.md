@@ -118,3 +118,42 @@ accepted Task3 hash. Every harness/documentation addition or modification is
 still enumerated with exact hashes. This is a source-attributed composition,
 not a claim that old tests ran again on current code. Original failed runs and
 their source identities remain unchanged.
+
+## Approved disposable-worker continuation
+
+Task4's `disposable-daytona` lifecycle qualifies an owned worker only after
+controlled workload dispatch is frozen, kernel writers are absent, the entire
+intended tree and generation remain stable, all replicas have explicit work
+accounting, and exact private and Shared receipts match actual server rows.
+Known synthetic negative inputs have retained external origins and exhaustive
+local descriptor checks; a revoked conflict-list denial is not an empty result.
+A client `remote_outcome_unknown` flag remains recorded, with its exact denied
+operation resolved against the owned service and revoked credential.
+
+The driver uses private SSH stdio framing to carry opaque end-to-end TLS between
+sandbox loopback18443 and the owned default service. UID1001 is control-only;
+UID1002 performs workload I/O without access to root-owned credentials/state.
+The AMD64 client is a default GNU crossbuild, appended to a new package manifest;
+the accepted ARM64 base archives remain immutable.
+
+Independent fresh local state/cache must recover the entire intended fixture
+before DELETE. Only terminal provider absence plus unreachable SSH permits the
+second fresh service-only recovery. Owned local recovery mounts still require
+normal unmount. Provider normal unmount, daemon-crash recovery and worker reuse
+remain unqualified; disposal never populates a normal-unmount pass.
+
+The actual continuation used a separately labelled read-only instrumented
+service for content counters, with only `MAGUS_TEST_TRANSFER_LOG=1`. These counters
+observe verified backend bodies fetched for authorized object responses, not
+TLS wire bytes. Default packaged service evidence owns authority, receipt,
+integration and both recovery proofs; its mounted transfer accounting is not
+claimed by the instrumented subcase.
+
+The private provider configuration retains the original owned service and SSH
+paths, namespace, plus `worker_identity` and `provider_observation` JSON paths.
+`retained_output` resumes the exact staged evidence directory into a new output
+result directory. Completed stages are not replayed; uncertain partial
+publication/deletion stops with resources retained. Missing capabilities remain
+blocked. Reports hash the staged evidence and exact package-to-current source
+delta; runtime inputs must be identical. Build caches and stopped build evidence
+are intentionally retained separately from active qualification fixtures.

@@ -21,8 +21,14 @@ def normalize(evidence: dict) -> dict:
     require(result.get('phase') in ('isolation','scale','packaging','provider'), 'unsupported phase')
     require(result.get('status') in ('passed', 'failed', 'blocked'), 'invalid phase status')
     cleanup = result.get('cleanup', {})
-    require(all(cleanup.get(k) is True for k in ('ok', 'mounts_absent', 'resources_removed'))
-            and bool(cleanup.get('provenance')), 'owned cleanup unresolved')
+    normal_cleanup=all(cleanup.get(k) is True for k in ('ok','mounts_absent','resources_removed'))
+    disposable_cleanup=False
+    if result.get('phase')=='provider' and cleanup.get('lifecycle')=='disposable-daytona':
+        from daytona import validate_provider
+        disposable_cleanup=(all(cleanup.get(k) is True for k in ('ok','resources_removed','provider_absent','local_mounts_absent'))
+            and result.get('measurements',{}).get('lifecycle')=='disposable-daytona'
+            and not validate_provider(result.get('measurements',{})))
+    require((normal_cleanup or disposable_cleanup) and bool(cleanup.get('provenance')), 'owned cleanup unresolved')
     # Missing prerequisites do not invent failed runtime assertions.
     if result.get('status') == 'blocked' and result.get('blocked') and not failures:
         return result

@@ -146,3 +146,26 @@ class InterruptedWriteTests(unittest.TestCase):
   self.assertEqual((prefix/'LICENSE').read_bytes(),files['LICENSE'])
   with self.assertRaises(FileExistsError):p.install(path,r['platform'],'client',prefix)
   p.install(path,r['platform'],'client',self.root/'fresh');self.assertEqual((self.root/'fresh'/r['binary']).read_bytes(),files[r['binary']])
+
+class CrossClientTests(unittest.TestCase):
+ def fixture(self):
+  binary=b'\x7fELF\x02\x01'+bytes(12)+b'\x3e\x00'+bytes(100)
+  source={'Cargo.lock':'a'*64};licenses={'LICENSE':'b'*64,'THIRD_PARTY_NOTICES.md':'c'*64}
+  proof={'exit':0,'platform':'x86_64-unknown-linux-gnu','profile':'release',
+   'compiler':'rustc 1.92.0 (verified)','toolchain_image':'sha256:'+'d'*64,
+   'source':source,'source_manifest_sha256':package.canonical_sha(source),
+   'binary_sha256':package.sha(binary),'licenses':licenses,
+   'argv':['cargo','build','--locked','--release','-p','magus-fs','--bin','magus-fs','--target','x86_64-unknown-linux-gnu']}
+  return proof,binary,source,licenses
+ def test_amd64_client_target_without_new_local_native_requirement(self):
+  self.assertEqual(package.PLATFORMS,('aarch64-apple-darwin','aarch64-unknown-linux-gnu'))
+  p,b,s,l=self.fixture();package.binary_check(b,p['platform'])
+ def test_verified_cross_client(self):
+  self.assertTrue(hasattr(package,'verify_client_build'))
+  p,b,s,l=self.fixture();package.verify_client_build(p,b,s,l)
+ def test_wrong_target_source_binary_notice_and_features_rejected(self):
+  self.assertTrue(hasattr(package,'verify_client_build'))
+  for key,value in [('platform','aarch64-unknown-linux-gnu'),('source',{}),
+      ('binary_sha256','0'*64),('licenses',{}),('argv',['cargo','build','--features','test-faults'])]:
+   p,b,s,l=self.fixture();p[key]=value
+   with self.subTest(key=key),self.assertRaises(ValueError):package.verify_client_build(p,b,s,l)
