@@ -415,6 +415,7 @@ async fn run(job: Job, pool: Arc<Mutex<Pool>>) -> DispatchResult<Vec<u8>> {
             }
             _ => match status.as_u16() {
                 401 => "invalid_credential",
+                403 if job.method == "POST" && job.path == "/views" => "denied",
                 404 => "denied",
                 409 => "conflict",
                 413 => "limit_exceeded",

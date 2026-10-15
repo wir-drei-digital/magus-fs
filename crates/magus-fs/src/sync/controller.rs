@@ -822,7 +822,12 @@ pub fn attach(
             json!({"branch":branch}),
             Instant::now() + Duration::from_secs(10),
         )
-        .map_err(|_| FsError::PermissionDenied)?;
+        // Admission and transport failure do not establish an authority denial.
+        .map_err(|error| match error.code {
+            "invalid_credential" | "denied" => FsError::PermissionDenied,
+            "backpressure" => FsError::Backpressure,
+            _ => FsError::InvalidSource,
+        })?;
     let bytes = t
         .bytes(
             "GET",

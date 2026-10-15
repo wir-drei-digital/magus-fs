@@ -1010,3 +1010,103 @@ fn controller_stale_retry_preserves_exact_attempt_history() {
     assert!(requests[1].contains("/views "));
     assert!(requests[2].contains("/integrations "));
 }
+
+fn attach_replica(f: &Fixture) -> Replica {
+    let mut config = f.config.clone();
+    config.cache_bytes = 1024;
+    let group = GroupId::random().unwrap();
+    config.authorities.push(Authority {
+        principal: PrincipalId::random().unwrap(),
+        uid: unsafe { libc::geteuid() },
+        gid: 1001,
+        primary_group: group.clone(),
+        groups: vec![group],
+        dac_override: false,
+        ownership_transfer: false,
+    });
+    Replica::open(f.dir.join("attach-state"), config).unwrap()
+}
+
+#[test]
+fn attach_classifies_view_http_failures_without_retry_or_binding() {
+    for (status, body, expected) in [
+        (
+            503,
+            br#"{"code":"backpressure"}"#.as_slice(),
+            "backpressure",
+        ),
+        (
+            503,
+            br#"{"code":"backend_unavailable"}"#.as_slice(),
+            "invalid_source",
+        ),
+        (
+            401,
+            br#"{"code":"invalid_credential"}"#.as_slice(),
+            "permission_denied",
+        ),
+        (
+            403,
+            br#"{"code":"forbidden"}"#.as_slice(),
+            "permission_denied",
+        ),
+        (
+            404,
+            br#"{"code":"not_found"}"#.as_slice(),
+            "permission_denied",
+        ),
+        (200, b"malformed response".as_slice(), "invalid_source"),
+    ] {
+        let f = Fixture::new();
+        let replica = attach_replica(&f);
+        f.response(status, body);
+        let error = crate::sync::controller::attach(
+            &replica,
+            &f.transport.binding.transport_profile,
+            BranchName::parse("main".into()).unwrap(),
+            PublicationMode::SharedLive,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), expected, "HTTP {status}");
+        assert_eq!(f.requests.lock().unwrap().len(), 1, "POST must not retry");
+        assert!(replica.sync_status().unwrap().binding.is_none());
+        assert!(replica.status().unwrap().head.is_none());
+    }
+}
+
+#[test]
+fn attach_network_failure_is_not_an_authority_denial() {
+    let f = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        drop(listener.accept().unwrap());
+    });
+    let path = &f.transport.binding.transport_profile;
+    let mut profile: Profile = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    profile.endpoint = format!("https://localhost:{port}");
+    std::fs::write(path, serde_json::to_vec(&profile).unwrap()).unwrap();
+    let replica = attach_replica(&f);
+    let error = crate::sync::controller::attach(
+        &replica,
+        path,
+        BranchName::parse("main".into()).unwrap(),
+        PublicationMode::SharedLive,
+    )
+    .unwrap_err();
+    server.join().unwrap();
+    assert_eq!(error.code(), "invalid_source");
+    assert!(replica.sync_status().unwrap().binding.is_none());
+}
+
+#[test]
+fn non_view_forbidden_response_classification_is_unchanged() {
+    let f = Fixture::new();
+    f.response(403, br#"{"code":"forbidden"}"#);
+    assert_eq!(
+        Fixture::call(&f.transport, "/other", 1000)
+            .unwrap_err()
+            .code,
+        "invalid_response"
+    );
+}

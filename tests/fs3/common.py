@@ -24,7 +24,10 @@ class PhaseInfra(OwnedInfra):
 
 
 def allowed_source_changes(changed, old_fixture, new_fixture):
-    if any(p != 'tests/fs2/connected.py' and not p.startswith('tests/fs3/') for p in changed):
+    test_path = 'crates/magus-fs-core/tests/fs3_cache.rs'
+    if test_path in changed and changed[test_path] != {'image': None, 'current': 'ddfa10203861d12c9be7722755b05cf4cbe8dacbb552a2af1da3810bce74bf28'}:
+        return False
+    if any(p not in ('tests/fs2/connected.py', test_path) and not p.startswith('tests/fs3/') for p in changed):
         return False
     if 'tests/fs2/connected.py' not in changed:
         return old_fixture == new_fixture
@@ -57,7 +60,7 @@ def source_bridge(infra, image):
     head = infra.run(['git', 'rev-parse', 'HEAD']).stdout.strip()
     infra.write_json('source-bridge.json', {'head': head, 'current': current, 'image_source': actual['source'],
                      'differences': changed, 'image': image, 'binaries': actual['binaries'],
-                     'contract': 'FS3 harness-only bridge; runtime inputs byte-identical'})
+                     'contract': 'FS3 harness plus exact test-only fs3_cache.rs addition; production Rust/build inputs byte-identical'})
     diff = difflib.unified_diff(actual['fixture'].splitlines(True), (ROOT/'tests/fs2/connected.py').read_text().splitlines(True), fromfile='image/tests/fs2/connected.py', tofile='current/tests/fs2/connected.py')
     (infra.output / 'fixture-diff.patch').write_text(''.join(diff))
     return ({'verified': True, 'head': head, 'manifest_sha256': digest(current), 'bridge': 'source-bridge.json'},
