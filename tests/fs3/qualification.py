@@ -9,6 +9,8 @@ ISOLATION_CASES = {'same-principal': 'F3-1', 'different-principal': 'F3-1',
                    'revoked-reconnect': 'F3-2', 'unaffected-peer': 'F3-2'}
 
 
+PROVIDER_CASES = {'scope':'F3-2','readonly':'F3-2','private-history':'F3-2','api-bypass':'F3-2','revoked-reconnect':'F3-2','cold-warm-range':'F3-5','shared-publication':'F3-1','disposable-lifecycle':'F3-7'}
+
 SCALE_CASES = {'cache-bound':'F3-3','protected-prune':'F3-3','reads':'F3-5','fanout-1':'F3-4','fanout-5':'F3-4','fanout-20':'F3-4','peer-cases':'F3-4'}
 
 def normalize(evidence: dict) -> dict:
@@ -43,6 +45,14 @@ def normalize(evidence: dict) -> dict:
     if result.get('phase') == 'provider':
         from daytona import validate_provider
         for message in validate_provider(result.get('measurements', {})):require(False,message)
+        if result.get('status')=='failed' and not failures:failures.append('phase reported failure')
+        for case,acceptance in PROVIDER_CASES.items():
+            rows=[r for r in result.get('assertions',[]) if r.get('case')==case]
+            require(len(rows)==1,'missing or duplicate assertion: '+case)
+            for row in rows:
+                require(row.get('acceptance')==acceptance and row.get('passed') is True
+                    and row.get('expected') is not None and row.get('expected')==row.get('observed')
+                    and bool(row.get('provenance')),'assertion failed: '+case)
         result['failures']=failures
         result['status']='failed' if failures else 'blocked' if result.get('blocked') else 'passed'
         return result

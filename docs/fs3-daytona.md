@@ -1,6 +1,22 @@
 # FS3 Daytona qualification
 
-Task4 is partial and blocked. On 2026-10-15 an actual `daytona-medium`
+The implemented driver supports the approved `disposable-daytona` lifecycle.
+The actual packaged-client run was staged and resumed; retained evidence can be
+revalidated without replaying the deleted worker. Normal provider unmount remains
+unqualified. Required raw accounting, shared assertions and source bridges are
+validated before a corrected composition can pass.
+
+```sh
+python3 tests/fs3/daytona.py --package-manifest /absolute/package/manifest.json --provider-config /absolute/private/provider.json --output /absolute/new-result
+python3 tests/fs3/run.py --phase all --evidence-manifest /absolute/private/evidence-index.json --output /absolute/new-aggregate
+```
+
+## Historical pre-amendment checkpoint (superseded)
+
+The following blocked status records the initial capability-only attempt, before
+the approved disposable lifecycle and actual client continuation below.
+
+At that checkpoint Task4 was partial and blocked. On 2026-10-15 an actual `daytona-medium`
 container (snapshot image `daytonaio/sandbox:0.9.0`) ran Debian13/AMD64,
 glibc2.41, FUSE and ordinary synthetic write/fsync/read through Debian
 bindfs1.14.7. Normal unmount failed with ENOENT. The packaged magus-fs client
@@ -25,8 +41,8 @@ hashes, and reports exact missing prerequisites. It never creates sandboxes,
 ports, snapshots, services or other resources. Exit2 is blocked; exit1 includes
 an observed failure or unresolved owned cleanup. Preflight cannot exit0.
 
-Without `--preflight`, this partial driver still emits an explicit incomplete
-result. There is no implemented live magus-fs journey to invoke yet. Do not
+At that checkpoint, without `--preflight`, the partial driver emitted an explicit
+incomplete result; the live magus-fs journey was not yet implemented. Do not
 replace that gate with the bindfs capability probe, local Docker proof, or
 unit-test fixture output.
 

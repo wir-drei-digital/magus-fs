@@ -226,3 +226,121 @@ class HostedFailureRetentionTests(unittest.TestCase):
             self.assertFalse(result['cleanup']['ok'])
             self.assertEqual(json.loads(partial.read_text()),{'actual':True})
             self.assertTrue((out/'failure.log').exists())
+
+class RawCompletionTests(unittest.TestCase):
+    """Real completion derivation, using public synthetic retained fixture data."""
+    def setUp(self):
+        import tempfile,json
+        from pathlib import Path
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.out=Path(self.tmp.name);data=json.loads((Path(__file__).parent/'fixtures/daytona-completion.json').read_text())
+        self.config={'sandbox_id':'f465fad1-189f-4a8f-b7d9-7f4b99be48ef','owned_service_dir':str(self.out/'service'),'namespace':'test'}
+        for name,body in data.pop('inputs').items():(self.out/name).write_bytes(bytes.fromhex(body))
+        self.commands=data.pop('controlled_commands')
+        self.write('service/control/hosted-resume-test.json',data.pop('state'))
+        for name,value in data.items():self.write(name,value)
+        self.write('freeze-dispatch.json',{})
+
+    def write(self,name,value):
+        import json
+        p=self.out/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(json.dumps(value))
+
+    def inventory(self):
+        import json
+        return json.loads((self.out/'final-inventory.json').read_text())
+
+    def derive(self):
+        from daytona import completion_measurements
+        return completion_measurements(self.config,self.out)
+
+    def test_complete_known_fixture_is_nonblocking(self):
+        self.assertTrue(deletion_permitted(self.derive()))
+
+    def test_raw_unique_recovery_and_import_cannot_disappear(self):
+        for field,key in [('work','recovery'),('recovery','records'),('recovery','imports')]:
+            with self.subTest(field=field,key=key):
+                before=self.inventory();changed=self.inventory();changed['a1'][field][key]=[{'operation':'unaccounted','revision':'unknown'}]
+                self.write('final-inventory.json',changed)
+                with self.assertRaises((AssertionError,ValueError)):self.derive()
+                self.write('final-inventory.json',before)
+
+    def test_missing_denied_or_unfinished_conflict_inventory_blocks(self):
+        for change in (None,{'ok':True,'page':{'items':[],'next':'more'}},{'ok':False,'error':'unknown'},
+                       {'ok':True,'page':{'items':[{'id':'unknown','receipt':'unknown','state':'Open'}],'next':None}}):
+            with self.subTest(change=change):
+                v=self.inventory()
+                if change is None:v['a1'].pop('conflicts',None)
+                else:v['a1']['conflicts']=change
+                self.write('final-inventory.json',v)
+                with self.assertRaises((AssertionError,ValueError)):self.derive()
+
+    def test_unaccounted_submission_blocks_but_known_history_does_not(self):
+        v=self.inventory();v['a1']['sync']['status']['submissions'].append({'operation':'unknown','local_revision':'unknown','state':'Denied','remote_outcome_unknown':True})
+        self.write('final-inventory.json',v)
+        with self.assertRaises((AssertionError,ValueError)):self.derive()
+
+    def test_missing_and_unready_local_inventory_blocks(self):
+        for field in ('work','recovery'):
+            v=self.inventory();old=v['metrics'].pop(field);self.write('final-inventory.json',v)
+            with self.assertRaises((AssertionError,ValueError)):self.derive()
+            v['metrics'][field]=old;self.write('final-inventory.json',v)
+
+
+class RetainedConflictDerivationTests(RawCompletionTests):
+    def historical(self,change=None):
+        import json,copy
+        from daytona import derive_retained_conflicts,RETAINED_CONFLICT_SOURCES
+        read=lambda n:json.loads((self.out/n).read_text())
+        args=[read('pre-freeze-inventory.json'),self.inventory(),read('publication-shared.json'),read('publication-server.json'),copy.deepcopy(self.commands),dict(RETAINED_CONFLICT_SOURCES)]
+        if change:change(args)
+        return derive_retained_conflicts(*args)
+
+    def test_named_derivation_never_claims_final_query_or_a2_empty(self):
+        proof=self.historical()
+        self.assertTrue(all(x['final_list_observed'] is False for x in proof.values()))
+        self.assertEqual(proof['a2']['list_state'],'unknown')
+
+    def test_extra_conflicted_server_integration_or_queued_integration_blocks(self):
+        def server(a):a[3].append({**a[3][-1],'kind':'integration','status':409})
+        def queued(a):a[1]['a2']['sync']['status']['submissions'][0]['integration']={'unknown':'integration'}
+        for change in (server,queued):
+            with self.subTest(change=change):
+                with self.assertRaises((AssertionError,ValueError)):self.historical(change)
+
+    def test_broken_source_or_additional_controlled_integration_blocks(self):
+        def source(a):a[5]['crates/magus-fs-service/src/conflicts.rs']='0'*64
+        def commands(a):a[4].append(next(r for r in a[4] if isinstance(r['settings'],list) and r['settings'][:2]==['sync','integrate']))
+        def observer(a):a[4][-1]['code']+='; unknown_mutation()'
+        for change in (source,commands,observer):
+            with self.subTest(change=change):
+                with self.assertRaises((AssertionError,ValueError)):self.historical(change)
+
+    def test_known_covered_historical_failed_submission_is_nonblocking(self):
+        v=self.inventory();v['a1']['sync']['status']['submissions'][0]['state']='Denied'
+        self.write('final-inventory.json',v)
+        self.assertTrue(deletion_permitted(self.derive()))
+
+class ConflictCollectionTests(unittest.TestCase):
+    def test_actual_collector_follows_pages_and_retains_revocation_denial(self):
+        import tempfile,json
+        from pathlib import Path
+        from daytona import record_inventory
+        class Remote:
+            def cli(self,*args):return {'ok':True}
+            def execute(self,code,args):
+                if '/private/a2/state' in args:return {'exit':1,'stdout':json.dumps({'ok':False,'error':'invalid_credential'})}
+                return {'exit':0,'stdout':json.dumps({'ok':True,'page':{'items':[],'next':None if '--cursor' in args else 'cursor1'}})}
+        with tempfile.TemporaryDirectory() as directory:
+            rows=record_inventory(Remote(),Path(directory),final=True)
+        self.assertEqual(len(rows['a1']['conflicts']['pages']),2)
+        self.assertEqual(rows['a2']['conflicts']['value']['error'],'invalid_credential')
+
+    def test_repeated_cursor_cannot_claim_complete_inventory(self):
+        import tempfile,json
+        from pathlib import Path
+        from daytona import record_inventory
+        class Remote:
+            def cli(self,*args):return {'ok':True}
+            def execute(self,code,args):return {'exit':0,'stdout':json.dumps({'ok':True,'page':{'items':[],'next':'same'}})}
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(AssertionError,'cursor repeated'):record_inventory(Remote(),Path(directory),final=True)

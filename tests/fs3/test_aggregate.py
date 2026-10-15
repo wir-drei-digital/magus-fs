@@ -64,6 +64,7 @@ class DisposableCleanupTests(unittest.TestCase):
         return {'schema':1,'phase':'provider','status':'passed','failures':[],'blocked':[],
             'source':{'verified':True,'head':'a'*40,'manifest_sha256':'b'*64,'bridge':'actual-bridge'},
             'binaries':{'verified':True,'image':'sha256:'+'a'*64,'sha256':{'magus-fs':'b'*64,'magus-fs-service':'c'*64}},
+            'assertions':[{'case':c,'acceptance':a,'passed':True,'expected':'verified','observed':'verified','provenance':['raw.json']} for c,a in __import__('qualification').PROVIDER_CASES.items()],
             'measurements':disposable(),'cleanup':{'ok':True,'mounts_absent':False,'resources_removed':True,'provider_absent':True,'local_mounts_absent':True,'lifecycle':'disposable-daytona','provenance':'actual'}}
 
     def test_complete_disposal_does_not_claim_normal_unmount(self):
@@ -78,3 +79,9 @@ class DisposableCleanupTests(unittest.TestCase):
         self.assertEqual(normalize(r)['status'],'failed')
         r=self.fixture();r['cleanup']['local_mounts_absent']=False
         self.assertEqual(normalize(r)['status'],'failed')
+
+class ProviderFailureStatusTests(DisposableCleanupTests):
+    def test_explicit_failed_status_cannot_be_promoted(self):
+        from qualification import normalize
+        row=self.fixture();row['status']='failed';row['failures']=[]
+        self.assertEqual(normalize(row)['status'],'failed')

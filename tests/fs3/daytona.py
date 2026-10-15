@@ -663,12 +663,158 @@ print(json.dumps(rows))''',label)
     return row
 
 
-def completion_measurements(config,output):
+
+RETAINED_CONFLICT_SOURCES = {
+    'crates/magus-fs-service/src/conflicts.rs':'92e11070d19bb57311b7db21e4d4b53624db72acb21f8ab74b7eacb5abbe4c52',
+    'crates/magus-fs-service/src/publication.rs':'1bd94ee626d3409c99c39781179c760672d084005845927e550533f3e1dc1718',
+    'crates/magus-fs/src/sync/controller.rs':'af0d0d3e3401f0fe5f9a7425dec2f62eb18c05dd92662ac8c3a799970fdd6d52'}
+
+
+def derive_retained_conflicts(pre,final,shared,server,commands,source_binding):
+    """Reviewed finite historical derivation, never a final conflict-list response.
+
+    Pinned source: conflict INSERT occurs transactionally only in conflicted409
+    integration; Isolated controllers do not auto-integrate on head movement.
+    """
+    if source_binding!=RETAINED_CONFLICT_SOURCES:raise ValueError('conflict derivation source binding differs')
+    intended=shared['integration'];receipt=shared['shared_receipt']
+    integrations=[r for r in server if r['kind']=='integration']
+    assert len(integrations)==1 and integrations[0]['status']==200 and json_value(integrations[0]['result'])==receipt,'unexpected server integration/conflict obligation'
+    assert all(r['kind'] in ('seed','candidate','integration') and r['status']==200 for r in server),'unknown server operation kind/outcome'
+    for phase in (pre,final):
+        for name,row in phase.items():
+            sync=row['sync'].get('value',row['sync'])
+            assert sync['status']['binding']['publication']=='Isolated','non-Isolated historical binding'
+            for item in sync['status']['submissions']:
+                if item.get('integration') is not None:
+                    assert name=='a1' and item['integration']==intended and item.get('shared_receipt')==receipt,'unaccounted queued integration'
+    start=next(n for n,r in enumerate(commands) if 'writers=[];users=[];unknown=[];daemons={}' in r.get('code',''))
+    import hashlib
+    frozen_code=commands[start]['code'];integrate=[]
+    assert hashlib.sha256(frozen_code.encode()).hexdigest()=='a090dd05d399685027bbfc7b1bcc08981312f8cf1384ee995611fd8b2e3fcad7','unbound freeze observer code'
+    for row in commands[start:]:
+        assert row['workload_uid']==0,'workload dispatch after freeze'
+        args=row.get('settings')
+        if args is None:
+            assert row['code']==frozen_code,'unknown post-freeze control command'
+        else:
+            assert isinstance(args,list),'unknown post-freeze request'
+            assert hashlib.sha256(row['code'].encode()).hexdigest()=='e3d5b65e7d7e139bea8035e5a86adae7b47ba735de68cca2c6e5e76d76e6e268','unbound CLI observer code'
+            assert args[0] in ('status','history','checkpoint','sync'),'unknown post-freeze CLI action'
+            if args[0]=='sync':assert args[1:2] in (['status'],['run'],['drain'],['integrate'],['local-work'],['recovery'],['conflicts'])
+            if args[:2]==['sync','integrate']:
+                assert args[args.index('--revision')+1]==receipt['submitted_revision'];integrate.append(args)
+            if args[:2] in (['sync','local-work'],['sync','recovery'],['sync','conflicts']):assert args[2]=='list'
+    assert len(integrate)==1,'controlled integration history differs'
+    coverage={}
+    for name,row in pre.items():
+        observation=row['conflicts'];value=observation.get('value',observation)
+        if name=='a2':assert value=={'ok':False,'error':'invalid_credential'}
+        else:assert value.get('ok') is True and value['page']=={'items':[],'next':None}
+        coverage[name]={'kind':'historical-conflict-derivation','final_list_observed':False,
+            'list_state':'unknown' if name=='a2' else 'pre-freeze-empty-only',
+            'disposition':'known-synthetic-candidates' if name=='a2' else 'no-new-unaccounted-conflict-obligation',
+            'basis':'pinned executed source, Isolated bindings, controlled commands, exact sole successful integration; synthetic descriptors checked separately'}
+    return coverage
+
+
+def json_value(value):
+    import json
+    return json.loads(value)
+
+
+def historical_conflict_coverage(config,evidence,derived,pre,final,shared,server):
+    import json,hashlib
+    from pathlib import Path
+    def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+    package_path=Path(config['historical_conflict_package'])
+    assert sha(package_path)=='1f7eab8130b5a8f9c58943f45439661ffa4204c619ccf6760a84d2ac897023ed','unreviewed historical package'
+    package=json.loads(package_path.read_text());sources=package['source']['manifest']
+    binding={n:sources[n] for n in RETAINED_CONFLICT_SOURCES}
+    repo=Path(__file__).resolve().parents[2]
+    assert binding=={n:sha(repo/n) for n in binding},'source changed since executed package'
+    actual=json.loads((evidence/'default-service-final-identity.json').read_text())
+    service=next(r for r in package['packages'] if r['role']=='service');assert actual['binary_sha256']==service['binary_sha256'] and not actual['fault_variables']
+    client=next(r for r in package['packages'] if r['platform']=='x86_64-unknown-linux-gnu')
+    assert all(r['binary_sha256']==client['binary_sha256'] for r in json.loads((evidence/'freeze-final.json').read_text())['daemons'].values())
+    commands_path=Path(config['owned_service_dir'])/'hosted-commands.json';commands=json.loads(commands_path.read_text())
+    coverage=derive_retained_conflicts(pre,final,shared,server,commands,binding)
+    names=('pre-freeze-inventory.json','final-inventory.json','publication-shared.json','publication-server.json','freeze-final.json','accounting-history-a2.json','synthetic-private-input.bin','synthetic-collision-input.bin','default-service-final-identity.json')
+    record={'new_execution':False,'final_conflict_query_missing':True,'coverage':coverage,'executed_sources':binding,
+        'package_manifest_sha256':sha(package_path),'executed_binaries':{'service':service['binary_sha256'],'client':client['binary_sha256']},
+        'raw_inputs':{str(evidence/n):sha(evidence/n) for n in names},'controlled_commands':{'path':str(commands_path),'sha256':sha(commands_path)}}
+    (derived/'historical-conflict-derivation.json').write_text(json.dumps(record,indent=2)+'\n')
+    return coverage
+
+def account_raw_inventory(final,covered,synthetic,denied_operation,server,conflict_coverage=None):
+    """Every observed item is covered explicitly or blocks; absence is never inferred."""
+    rows=[]
+    def require(value,message):
+        if not value:raise ValueError(message)
+    require(set(final)=={'a1','a2','readonly','metrics'},'unknown or missing replica inventory')
+    for name,inv in final.items():
+        for key in ('status','sync','work','recovery'):
+            require(isinstance(inv.get(key),dict),name+': missing '+key+' inventory')
+        for key in ('status','sync','work','recovery'):
+            require(inv[key].get('ok') is True,name+': unavailable '+key+' inventory')
+        work=inv['work'];recovery=inv['recovery']
+        require(work.get('readiness')=='Ready',name+': local work readiness unknown')
+        for owner,key in ((work,'recovery'),(recovery,'records'),(recovery,'imports')):
+            require(isinstance(owner.get(key),list),name+': missing '+key+' listing')
+            # No export/settlement is performed by this finite fixture. Nonempty
+            # local recovery needs a separately verified disposition before retry.
+            require(not owner[key],name+': unaccounted '+key+' items')
+        require(type(recovery.get('limit')) is int and recovery['limit']>len(recovery['records']),name+': recovery listing may be truncated')
+        status=inv['sync'].get('status',{});submissions=status.get('submissions')
+        require(isinstance(submissions,list),name+': missing submissions')
+        operations=set();receipts={}
+        for item in submissions:
+            op=item.get('operation');revision=item.get('local_revision')
+            require(bool(op) and op not in operations,name+': duplicate or missing submission identity');operations.add(op)
+            require(revision in covered[name],name+': unaccounted submission '+str(op))
+            if item.get('remote_outcome_unknown') is not False:
+                require(name=='a2' and op==denied_operation and revision in synthetic
+                    and inv['sync'].get('live',{}).get('authorized') is False
+                    and not any(r['operation']==op for r in server),name+': unresolved submission outcome '+str(op))
+            receipt=item.get('private_receipt') or item.get('shared_receipt')
+            if receipt:receipts[receipt['receipt']]=revision
+            rows.append({'replica_name':name,'kind':'submission','id':op,'revision':revision,
+                         'disposition':'known-synthetic-exclusion' if revision in synthetic and name=='a2' else 'covered-by-complete-fixture'})
+        if 'conflicts' not in inv:
+            require(conflict_coverage is not None and name in conflict_coverage,name+': missing conflicts inventory')
+            rows.append({'replica_name':name,**conflict_coverage[name]});continue
+        observation=inv['conflicts']
+        # Recorded CLI exits remain explicit, including intentional revocation.
+        if 'value' in observation:
+            require(observation.get('exit')==(0 if observation['value'].get('ok') is True else 1),name+': inconsistent conflict command exit')
+            observation=observation['value']
+        if observation.get('ok') is not True:
+            require(name=='a2' and observation.get('error')=='invalid_credential'
+                and inv['sync'].get('live',{}).get('authorized') is False
+                and all(x.get('local_revision') in synthetic for x in submissions),name+': conflict inventory denied/unknown')
+            rows.append({'replica_name':name,'kind':'conflicts','disposition':'revoked-known-synthetic-only','empty_claim':False})
+            continue
+        pages=observation.get('pages',[observation.get('page')]);require(isinstance(pages,list) and bool(pages),name+': missing conflict pages')
+        seen=set()
+        for index,page in enumerate(pages):
+            require(isinstance(page,dict) and isinstance(page.get('items'),list) and 'next' in page,name+': malformed conflict page')
+            require(bool(page['next']) if index<len(pages)-1 else page['next'] is None,name+': incomplete conflict pagination')
+            for item in page['items']:
+                ident=item.get('id');require(bool(ident) and ident not in seen,name+': duplicate conflict');seen.add(ident)
+                revision=receipts.get(item.get('receipt'))
+                require(revision in covered[name] and (item.get('state')=='Resolved' or
+                    (name=='a2' and revision in synthetic)),name+': unaccounted conflict '+str(ident))
+                rows.append({'replica_name':name,'kind':'conflict','id':ident,'revision':revision,
+                             'disposition':'known-synthetic-exclusion' if name=='a2' else 'resolved-covered-fixture'})
+        rows.append({'replica_name':name,'kind':'inventory','local_work':0,'native_recovery':0,'imports':0,'conflict_pages':len(pages)})
+    return rows
+
+def completion_measurements(config,output,derived_output=None):
     """Derive the deletion guard only from retained actual observations."""
     import json,hashlib
     from pathlib import Path
     from common import digest
-    output=Path(output)
+    output=Path(output);derived=Path(derived_output) if derived_output is not None else output
     def read(n):return json.loads((output/n).read_text())
     def sha(n):return hashlib.sha256((output/n).read_bytes()).hexdigest()
     first=read('freeze-first.json');post=read('freeze-after-publication.json');last=read('freeze-final.json')
@@ -703,6 +849,17 @@ def completion_measurements(config,output):
                 name=inputs[e['path']];body=(output/name).read_bytes();v=e['content']['version']
                 assert v=={'size':len(body),'extents':[{'kind':'chunk','object':'sha256:'+sha(name),'object_size':len(body),'offset':0,'length':len(body)}]}
     assert history[-1]['revision']==final['a2']['status']['captured_revision']
+    a1history=read('accounting-history-a1.json')['revisions']
+    complete=next(r['descriptor'] for r in a1history if r['revision']==revision)
+    entries={e['path']:e for e in complete['tree']['entries']}
+    a1covered={r['revision'] for r in a1history if all(e==entries.get(e['path']) for e in r['descriptor']['tree']['entries'])}
+    covered={'a1':a1covered,'a2':{r['revision'] for r in history},
+        **{n:{final[n]['status']['captured_revision']} for n in ('readonly','metrics')}}
+    conflict_coverage=None
+    if config.get('historical_conflict_package'):
+        assert derived!=output,'historical revalidation requires fresh derived output'
+        conflict_coverage=historical_conflict_coverage(config,output,derived,inventory,final,shared,server)
+    raw_dispositions=account_raw_inventory(final,covered,covered['a2'],rejected['operation'],server,conflict_coverage)
     replicas={n:final[n]['sync']['status']['submissions'][0]['request']['replica'] for n in ('a1','a2')}
     mounts=read('mounted.json')
     # Binding view doesn't expose replica; retain exact provisioned identities.
@@ -719,14 +876,14 @@ def completion_measurements(config,output):
     metric=read('metrics-service/read-proof.json')
     work.append({'id':'metrics-readonly','replica':replicas['metrics'],'intended':False,'unique':False,'disposition':'remote-recoverable',
         'independently_verified':metric['passed'],'content_sha256':metric['expected_sha256'],'provenance':sha('metrics-service/read-proof.json')})
-    accounting={'complete':True,'replicas':list(replicas.values()),'work':work,'exclusions':exclusions,
+    accounting={'raw_dispositions':raw_dispositions,'complete':True,'replicas':list(replicas.values()),'work':work,'exclusions':exclusions,
         'historical_a1':'automatic candidate contains same intended bytes; final checkpoint covers it',
         'historical_a2':'all descriptors exhaustively checked against immutable baseline and two explicit synthetic exclusions',
         'scope_unknown_resolution':{'client_flag_retained':rejected['remote_outcome_unknown'],'operation':rejected['operation'],
             'server_operation_absent':True,'credential_revoked':True,'server_provenance':sha('publication-server.json')},
         'revoked_conflict_list':'invalid_credential retained; not treated as empty; exact local descriptors and synthetic source exhaustively account controlled writes',
         'inventory_provenance':sha('final-inventory.json')}
-    (output/'accounting.json').write_text(json.dumps(accounting,indent=2)+'\n');accounting['provenance']=sha('accounting.json')
+    (derived/'accounting.json').write_text(json.dumps(accounting,indent=2)+'\n');accounting['provenance']=hashlib.sha256((derived/'accounting.json').read_bytes()).hexdigest()
     manifest=digest(first['manifest']);run=output.name
     save={'sequence':2,'revision':revision,'operation':receipt['operation'],'receipt':receipt['receipt'],
         'sha256':sha('intended-input.bin'),'manifest_sha256':manifest,'private_receipt':receipt,'shared_receipt':sr,
@@ -741,7 +898,7 @@ def completion_measurements(config,output):
        'recovery_before':{'sequence':3,'run_id':run,'sandbox_id':config['sandbox_id'],'independent':True,'sandbox_disk_used':False,
            'service_only':True,'whole_fixture':True,'private_closure_verified':True,'state_id':before['state_id'],
            'revision':revision,'sha256':save['sha256'],'manifest_sha256':digest(before['manifest']),'provenance':sha('recovery-before.json')}}
-    errors=completion_failures(m);(output/'completion-guard.json').write_text(json.dumps({'errors':errors,'measurements':m},indent=2)+'\n')
+    errors=completion_failures(m);(derived/'completion-guard.json').write_text(json.dumps({'errors':errors,'measurements':m},indent=2)+'\n')
     assert not errors,errors
     return m
 
@@ -835,6 +992,18 @@ def record_inventory(remote,output,final=False):
         for label,args in (('status',['status']),('sync',['sync','status']),('work',['sync','local-work','list']),('recovery',['sync','recovery','list'])):
             value=remote.cli(*args,'--state','/private/'+name+'/state')
             rows[name][label]=value if final else {'exit':0,'value':value}
+        pages=[];cursor=None;seen=set()
+        while True:
+            args=['sync','conflicts','list','--state','/private/'+name+'/state']+(['--cursor',cursor] if cursor else [])
+            raw=remote.execute("import json,subprocess,sys;p=subprocess.run(['/opt/fs3-task4/bin/magus-fs',*json.load(sys.stdin)],capture_output=True,text=True);print(json.dumps({'exit':p.returncode,'stdout':p.stdout}))",args)
+            value=json.loads(raw['stdout'])
+            if raw['exit']!=0:
+                rows[name]['conflicts']={'exit':raw['exit'],'value':value};break
+            assert value.get('ok') is True and isinstance(value.get('page'),dict)
+            pages.append(value['page']);cursor=value['page'].get('next')
+            if cursor is None:
+                rows[name]['conflicts']={'ok':True,'pages':pages};break
+            assert cursor not in seen,'conflict cursor repeated';seen.add(cursor)
     (output/('final-inventory.json' if final else 'pre-freeze-inventory.json')).write_text(json.dumps(rows,indent=2)+'\n')
     return rows
 
@@ -886,6 +1055,35 @@ def execute_hosted(config,output):
     if not (output/'owned-cleanup.json').exists():cleanup_hosted(config,output)
 
 
+
+def provider_assertions(evidence,measurements,cases):
+    """Shared assertions are recomputed from raw outcomes, not copied pass flags."""
+    import json,hashlib
+    from qualification import PROVIDER_CASES
+    rows=[]
+    def raw(case):
+        from pathlib import Path
+        p=Path(cases[case]['provenance']);blob=p.read_bytes()
+        assert hashlib.sha256(blob).hexdigest()==cases[case]['sha256'],'case provenance changed'
+        return json.loads(blob),p
+    def add(case,passed,paths):
+        rows.append({'acceptance':PROVIDER_CASES[case],'case':case,'expected':True,'observed':bool(passed),'passed':bool(passed),
+            'provenance':[{'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for p in paths]})
+    r,p=raw('scope');add('scope',r['before']==r['after'] and all(v in (2,13) for v in r['scope_read'].values())
+        and r['rejected']['state']=='Denied' and r['rejected']['private_receipt'] is None and r['rejected']['shared_receipt'] is None,[p])
+    r,p=raw('readonly');add('readonly',bool(r['errnos']) and set(r['errnos'].values())=={30} and r['direct_upload']==404,[p])
+    r,p=raw('private-history');add('private-history',r['private_entry'] not in r['observed_entries'] and r['hidden_entry'] not in r['observed_entries'] and r['readonly_denied']==404 and r['page']['next'] is None,[p])
+    r,p=raw('api-bypass');probe=r['own_view_private_object'];add('api-bypass',r['before']==r['after'] and probe['allowed_status']==200 and probe['private_status']==404 and probe['denied']=={'code':'not_found'},[p])
+    r,p=raw('revoked-reconnect');add('revoked-reconnect',set(r['denied'].values())=={13} and r['status']['live']['authorized'] is False and retained_mount(r['kernel_daemon_proof'],'a2'),[p])
+    p=evidence/'metrics-service/read-proof.json';r=json.loads(p.read_text())
+    commands=evidence/'metrics-service/hosted-commands.json';raw_commands=json.loads(commands.read_text())
+    full_hash_observed=any(x.get('exit')==0 and 'hashlib.sha256(open' in x['code'] and json.loads(x['stdout'])==r['expected_sha256'] for x in raw_commands)
+    add('cold-warm-range',r['metadata']['authorized_body']==0 and 0<r['cold']['authorized_body']-r['metadata']['authorized_body']<=2*1024*1024
+        and r['warm']['authorized_body']==r['cold']['authorized_body'] and full_hash_observed,[p,commands])
+    add('shared-publication',not completion_failures(measurements),[evidence/'publication-private.json',evidence/'publication-shared.json',evidence/'publication-server.json'])
+    add('disposable-lifecycle',not validate_provider(measurements),[evidence/'provider-deletion.json',evidence/'recovery-before.json',evidence/'recovery-after.json',evidence/'owned-cleanup.json'])
+    return rows
+
 def hosted_result(config,manifest_path,evidence,output):
     import json,hashlib,sys,subprocess,tarfile
     from pathlib import Path
@@ -901,7 +1099,8 @@ def hosted_result(config,manifest_path,evidence,output):
     archive=Path(manifest_path).parent/client['archive'];assert sha(archive)==client['sha256']
     with tarfile.open(archive,'r:gz') as tar:data=tar.extractfile(client['binary']).read()
     binary_check(data,client['platform']);assert hashlib.sha256(data).hexdigest()==client['binary_sha256']
-    m=completion_measurements(config,evidence);deletion=read('provider-deletion.json');after=read('recovery-after.json')
+    m=completion_measurements(config,evidence,output);deletion=read('provider-deletion.json');after=read('recovery-after.json')
+    assert sha(evidence/'completion-guard.json')==deletion['guard_sha256'],'original deletion guard changed'
     assert after['manifest']==read('recovery-before.json')['manifest'] and after['normal_local_cleanup']
     m['recovery_after']={**m['recovery_before'],'sequence':6,'state_id':after['state_id'],'provenance':sha(evidence/'recovery-after.json')}
     m['deletion']={**deletion,'sequence':5,'owned':True,'provenance':sha(evidence/'provider-deletion.json')}
@@ -926,6 +1125,11 @@ def hosted_result(config,manifest_path,evidence,output):
     return normalize({'schema':1,'phase':'provider','status':'passed','executed':True,'execution':'resumed owned staged journey','failures':[],'blocked':[],
         'source':{'verified':True,'head':subprocess.check_output(['git','rev-parse','HEAD'],text=True,cwd=Path(__file__).resolve().parents[2]).strip(),'manifest_sha256':canonical_sha(current),'bridge':str(output/'source-bridge.json')},
         'binaries':{'verified':True,'image':state['image'],'sha256':{'magus-fs':client['binary_sha256'],'magus-fs-service':service['binary_sha256']}},
+        'assertions':provider_assertions(evidence,m,state['cases']),
+        'composition':{'new_execution':False,'kind':'retained-observation revalidation','original_guard_sha256':deletion['guard_sha256'],
+            'original_guard_path':str(evidence/'completion-guard.json'),
+            'original_result':{'path':config.get('original_result'),'sha256':sha(config['original_result'])} if config.get('original_result') else None,
+            'historical_conflict_derivation':str(output/'historical-conflict-derivation.json') if config.get('historical_conflict_package') else None},
         'measurements':m,'cleanup':{'ok':True,'mounts_absent':False,'resources_removed':True,'provider_absent':True,'local_mounts_absent':True,'lifecycle':'disposable-daytona','provenance':sha(evidence/'owned-cleanup.json')}})
 
 def run_hosted(config,manifest_path,output):
@@ -941,7 +1145,10 @@ def run_hosted(config,manifest_path,output):
             result['blocked'].append('owned worker, private transport, service and package inputs required')
             return result
         evidence=Path(config.get('retained_output',output))
-        execute_hosted(config,evidence)
+        if config.get('historical_conflict_package'):
+            assert evidence!=Path(output),'revalidation output must be fresh'
+            assert (evidence/'owned-cleanup.json').exists(),'historical revalidation cannot execute missing stages'
+        else:execute_hosted(config,evidence)
         result=hosted_result(config,manifest_path,evidence,Path(output))
     except Exception as error:
         result['status']='failed';result['failures'].append(type(error).__name__+': '+str(error))

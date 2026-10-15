@@ -152,3 +152,52 @@ class RawCompositionTests(unittest.TestCase):
         with self.assertRaises(AssertionError):compose_evidence(self.e,self.f,g)
 
 if __name__ == '__main__': unittest.main()
+
+class ProviderAssertionTests(unittest.TestCase):
+    def fixture(self):
+        from test_aggregate import DisposableCleanupTests
+        row=DisposableCleanupTests().fixture()
+        cases={'scope':'F3-2','readonly':'F3-2','private-history':'F3-2','api-bypass':'F3-2','revoked-reconnect':'F3-2','cold-warm-range':'F3-5','shared-publication':'F3-1','disposable-lifecycle':'F3-7'}
+        row['assertions']=[{'case':c,'acceptance':a,'passed':True,'expected':'verified','observed':'verified','provenance':['raw.json']} for c,a in cases.items()]
+        return row
+
+    def test_complete_provider_assertions_pass(self):
+        self.assertEqual(normalize(self.fixture())['status'],'passed')
+
+    def test_missing_false_duplicate_or_wrong_acceptance_fails(self):
+        for kind in ('missing','false','duplicate','acceptance','outcome','provenance'):
+            with self.subTest(kind=kind):
+                row=self.fixture();a=row['assertions']
+                if kind=='missing':a.pop()
+                elif kind=='false':a[0]['passed']=False
+                elif kind=='duplicate':a.append(dict(a[0]))
+                elif kind=='acceptance':a[0]['acceptance']='wrong'
+                elif kind=='outcome':a[0]['observed']='denied obligation unresolved'
+                else:a[0]['provenance']=[]
+                self.assertEqual(normalize(row)['status'],'failed')
+
+class ProviderRawAssertionTests(unittest.TestCase):
+    def test_false_raw_outcome_is_not_replaced_by_true_case_flag(self):
+        import tempfile,json,hashlib
+        from pathlib import Path
+        from daytona import provider_assertions
+        from test_daytona import disposable
+        with tempfile.TemporaryDirectory() as directory:
+            p=Path(directory)
+            raw={
+                'scope':{'before':{},'after':{},'scope_read':{'secret':2},'rejected':{'state':'Denied','private_receipt':None,'shared_receipt':None}},
+                'readonly':{'errnos':{'write':0},'direct_upload':404},
+                'private-history':{'private_entry':'private','hidden_entry':'hidden','observed_entries':[],'readonly_denied':404,'page':{'next':None}},
+                'api-bypass':{'before':{},'after':{},'own_view_private_object':{'allowed_status':200,'private_status':404,'denied':{'code':'not_found'}}},
+                'revoked-reconnect':{'denied':{'read':13},'status':{'live':{'authorized':False}},'kernel_daemon_proof':{'mountinfo':'1 0 0:1 / /shared/a2 rw - fuse magus rw','pid':2,'expected_pid':2,'binary_sha256':'a'*64,'expected_binary_sha256':'a'*64,'command':['magus-fs','mount','--state','/private/a2/state','--mountpoint','/shared/a2']}}}
+            cases={}
+            for case,value in raw.items():
+                path=p/(case+'.json');path.write_text(json.dumps(value));cases[case]={'passed':True,'provenance':str(path),'sha256':hashlib.sha256(path.read_bytes()).hexdigest()}
+            metric=p/'metrics-service';metric.mkdir()
+            (metric/'read-proof.json').write_text(json.dumps({'metadata':{'authorized_body':0},'cold':{'authorized_body':262144},'warm':{'authorized_body':262144},'expected_sha256':'a'*64}))
+            (metric/'hosted-commands.json').write_text(json.dumps([{'exit':0,'code':'hashlib.sha256(open','stdout':json.dumps('a'*64)}]))
+            for name in ('publication-private','publication-shared','publication-server','provider-deletion','recovery-before','recovery-after','owned-cleanup'):(p/(name+'.json')).write_text('{}')
+            rows=provider_assertions(p,disposable(),cases)
+            readonly=next(r for r in rows if r['case']=='readonly')
+            self.assertFalse(readonly['observed']);self.assertFalse(readonly['passed'])
+            self.assertEqual(len(rows),8)
