@@ -23,7 +23,15 @@ class PhaseInfra(OwnedInfra):
         return super().create(kind, suffix, acceptance_s3_capacity('acceptance', kind, suffix, args))
 
 
+# Exact approved package.license="MIT" additions; no dependency/profile exclusions.
+LICENSE_METADATA = {'Cargo.toml': {'image': '39aaeb4f910b372f9529783cd3c9700b5c8b21840247fb9459e7d7b01a3fc7a2', 'current': '5ee9008219bb6e7109b6cfad48be9c07802d55c1ebed8d4dfcf105be057f88d5'}, 'crates/magus-fs/Cargo.toml': {'image': '45f1eae6698de0039e34838e8b24bdfaf04755ac510d66eb11f5bbbd429c8a81', 'current': 'e10006ba9b541a9dce52e760ae013f0977f4a5ff0c8c191297b6f4549ea0cecb'}, 'crates/magus-fs-core/Cargo.toml': {'image': 'a456791ad749a3e1322bbdeb747f2bc98f3299dd358fa60da1cbfe84ee06d7cc', 'current': '3608a8527711143286adba9450a0234380f07e37667a5bb65814120b720e3096'}, 'crates/magus-fs-service/Cargo.toml': {'image': '2fd74845f285724201c61d05a9680631d0ba815945694715911244604f9b34b1', 'current': '343cc4f208e28d1c14b7233a42eb9e6ef1ef6b5169d2cc959b306550efbb6c5b'}}
+
 def allowed_source_changes(changed, old_fixture, new_fixture):
+    changed=dict(changed)
+    for name, expected in LICENSE_METADATA.items():
+        if name in changed:
+            if changed[name] != expected:return False
+            del changed[name]
     test_path = 'crates/magus-fs-core/tests/fs3_cache.rs'
     if test_path in changed and changed[test_path] != {'image': None, 'current': 'ddfa10203861d12c9be7722755b05cf4cbe8dacbb552a2af1da3810bce74bf28'}:
         return False
@@ -60,7 +68,7 @@ def source_bridge(infra, image):
     head = infra.run(['git', 'rev-parse', 'HEAD']).stdout.strip()
     infra.write_json('source-bridge.json', {'head': head, 'current': current, 'image_source': actual['source'],
                      'differences': changed, 'image': image, 'binaries': actual['binaries'],
-                     'contract': 'FS3 harness plus exact test-only fs3_cache.rs addition; production Rust/build inputs byte-identical'})
+                     'contract': 'FS3 harness plus exact test-only fs3_cache.rs addition and exact MIT license metadata; runtime/dependencies/build settings byte-identical'})
     diff = difflib.unified_diff(actual['fixture'].splitlines(True), (ROOT/'tests/fs2/connected.py').read_text().splitlines(True), fromfile='image/tests/fs2/connected.py', tofile='current/tests/fs2/connected.py')
     (infra.output / 'fixture-diff.patch').write_text(''.join(diff))
     return ({'verified': True, 'head': head, 'manifest_sha256': digest(current), 'bridge': 'source-bridge.json'},

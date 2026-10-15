@@ -18,7 +18,7 @@ def normalize(evidence: dict) -> dict:
         if not ok and message not in failures:
             failures.append(message)
     require(result.get('schema') == 1, 'unsupported evidence schema')
-    require(result.get('phase') in ('isolation','scale'), 'unsupported phase')
+    require(result.get('phase') in ('isolation','scale','packaging'), 'unsupported phase')
     require(result.get('status') in ('passed', 'failed', 'blocked'), 'invalid phase status')
     cleanup = result.get('cleanup', {})
     require(all(cleanup.get(k) is True for k in ('ok', 'mounts_absent', 'resources_removed'))
@@ -34,6 +34,13 @@ def normalize(evidence: dict) -> dict:
     require(binaries.get('verified') is True and bool(re.fullmatch('sha256:[a-f0-9]{64}', binaries.get('image', '')))
             and all(re.fullmatch('[a-f0-9]{64}', binaries.get('sha256', {}).get(n, ''))
                     for n in ('magus-fs', 'magus-fs-service')), 'binary binding incomplete')
+    if result.get('phase') == 'packaging':
+        from packaging import validate_packaging
+        for message in validate_packaging(result.get('measurements', {})):require(False,message)
+        if result.get('status') == 'failed' and not failures:failures.append('phase reported failure')
+        result['failures']=failures
+        result['status']='failed' if failures else 'blocked' if result.get('blocked') else 'passed'
+        return result
     composition = result.get('measurements', {}).get('composition')
     if composition is not None:
         chain = composition.get('source_chain', {})
