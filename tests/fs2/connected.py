@@ -74,8 +74,8 @@ class Lazy(LiveJourney):
             result=super().execute(code,settings,user,check);record.update(result=result,seconds=time.monotonic()-started);return result
         except Exception as error:record.update(error=str(error),seconds=time.monotonic()-started);raise
         finally:self.i.write_json('linux-native-commands.json',self.commands)
-    def start(self,name,readonly=False,publication='shared-live',actor='alice',drop=False,lookup_barrier=False,replica_identity=None):
-        settings={'name':name,'namespace':NS,'replica':replica_identity or (WORKER if actor=='worker' else REPLICA if actor=='alice' else 'replica:'+f'{3:032x}'),'principal':ALICE,'group':GROUP,'token':self.tokens[actor],'ca':(self.i.control/'ca.crt').read_text(),'readonly':readonly,'publication':publication,'drop':drop,'lookup_barrier':lookup_barrier}
+    def start(self,name,readonly=False,publication='shared-live',actor='alice',drop=False,lookup_barrier=False,replica_identity=None,principal=ALICE,group=GROUP,additional_authorities=()):
+        settings={'name':name,'namespace':NS,'replica':replica_identity or (WORKER if actor=='worker' else REPLICA if actor=='alice' else 'replica:'+f'{3:032x}'),'principal':principal,'group':group,'token':self.tokens[actor],'ca':(self.i.control/'ca.crt').read_text(),'readonly':readonly,'publication':publication,'drop':drop,'lookup_barrier':lookup_barrier,'additional_authorities':list(additional_authorities)}
         self.mounts.append(name);self.i.write_json('mount-ownership.json',{'container':self.daemon,'mounts':self.mounts})
         result=self.execute('''import json,os,subprocess,sys,time
 s=json.load(sys.stdin);name=s['name'];control='/private/'+name;os.mkdir(control,0o700)
@@ -86,7 +86,7 @@ def private(n,v):
 def cli(*a):
  p=subprocess.run(['magus-fs',*a],capture_output=True,text=True);assert p.returncode==0,(a,p.stdout,p.stderr);return json.loads(p.stdout)
 mount='/shared/'+name
-config={'replica':{'replica':s['replica'],'authorities':[{'principal':s['principal'],'uid':1001,'gid':1001,'primary_group':s['group'],'groups':[s['group']],'dac_override':False,'ownership_transfer':False},{'principal':'principal:'+'c'*32,'uid':0,'gid':0,'primary_group':'group:'+'c'*32,'groups':['group:'+'c'*32],'dac_override':True,'ownership_transfer':True}],'content_roots':[mount],'cache_bytes':96*1024*1024},'root':mount,'policy':{'included_roots':['.'],'excluded_prefixes':[]},'creation_umask':18}
+config={'replica':{'replica':s['replica'],'authorities':[{'principal':s['principal'],'uid':1001,'gid':1001,'primary_group':s['group'],'groups':[s['group']],'dac_override':False,'ownership_transfer':False},{'principal':'principal:'+'c'*32,'uid':0,'gid':0,'primary_group':'group:'+'c'*32,'groups':['group:'+'c'*32],'dac_override':True,'ownership_transfer':True}]+s['additional_authorities'],'content_roots':[mount],'cache_bytes':96*1024*1024},'root':mount,'policy':{'included_roots':['.'],'excluded_prefixes':[]},'creation_umask':18}
 cli('init','--state',control+'/state','--config',private('config',config))
 profile=private('profile',{'endpoint':'https://service:8443','namespace':s['namespace'],'replica':s['replica'],'ca_file':private('ca',s['ca']),'token_file':private('token',s['token']),'publication_principal':s['principal']})
 attached=cli('sync','attach','--state',control+'/state','--profile',profile,'--branch','main','--publication',s['publication'])
