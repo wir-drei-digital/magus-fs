@@ -89,3 +89,63 @@ class ExactAppliedTests(unittest.TestCase):
     def test_stale_live_revision(self):
         e=fixture();e['cohorts'][0]['saves'][0]['receivers'][0]['applied_revision']='stale'
         self.assertTrue(validate_scale(e))
+
+class ScaleFailureReportingTests(unittest.TestCase):
+    def run_missing_prerequisite(self, cleanup_error=False):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from scale import main, InfrastructureUnavailable
+        class MissingInfra:
+            def __init__(self, output):
+                self.output=Path(output);self.output.mkdir()
+            def write_json(self, name, value):
+                (self.output/name).write_text(json.dumps(value))
+            def setup(self, image):
+                raise InfrastructureUnavailable('docker unavailable')
+            def cleanup(self):
+                if cleanup_error:raise RuntimeError('owned cleanup failed')
+        with tempfile.TemporaryDirectory() as tmp, patch('scale.BudgetInfra',MissingInfra):
+            output=Path(tmp)/'phase'
+            code=main(['--image','unused','--output',str(output)])
+            result=json.loads((output/'result.json').read_text())
+        return code,result
+    def test_missing_prerequisite_is_blocked_without_invented_results(self):
+        code,result=self.run_missing_prerequisite()
+        self.assertEqual(code,2)
+        self.assertEqual(result['status'],'blocked')
+        self.assertEqual(result['blocked'],['docker unavailable'])
+        self.assertEqual(result['failures'],[])
+        self.assertEqual(result['assertions'],[])
+    def test_cleanup_failure_still_fails_when_prerequisite_missing(self):
+        code,result=self.run_missing_prerequisite(cleanup_error=True)
+        self.assertEqual(code,1)
+        self.assertEqual(result['status'],'failed')
+        self.assertEqual(result['failures'],['cleanup 1: owned cleanup failed'])
+        self.assertEqual(result['assertions'],[])
+    def test_failed_peer_publication_retains_attempt_and_original_error(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from scale import Cohort
+        saved=[];snapshots=[]
+        journey=Cohort.__new__(Cohort)
+        journey.row={'saves':[]};journey.mounts={'r00':object()};journey.client={}
+        journey.publisher=SimpleNamespace(status=lambda _: {'status':{'submissions':[]}},
+                                         write=Mock(side_effect=TimeoutError('synthetic publication timeout')))
+        journey.transfers=Mock(side_effect=[{'authorized_body':0},{'authorized_body':7}])
+        journey.save=lambda:snapshots.append(copy.deepcopy(journey.row))
+        journey.i=SimpleNamespace(write_json=lambda name,row:saved.append((name,copy.deepcopy(row))))
+        with self.assertRaisesRegex(TimeoutError,'synthetic publication timeout'):
+            journey.publish_save('peer-cases','reports/live',b'body',['r00'],False)
+        self.assertGreaterEqual(len(saved),2)
+        self.assertEqual(saved[0][0],'peer-case-save.json')
+        self.assertEqual(saved[0][1]['attempted'],1)
+        row=saved[-1][1]
+        self.assertEqual(row['error'],'synthetic publication timeout')
+        self.assertEqual((row['attempted'],row['successful'],row['failed']),(1,0,1))
+        self.assertFalse(row['shared'])
+        self.assertEqual(row['receivers'],[])
+        self.assertGreaterEqual(row['seconds'],0)
+        self.assertEqual(row['transfer'],{'authorized_body':7})
+        self.assertTrue(all(s['saves']==[] for s in snapshots))

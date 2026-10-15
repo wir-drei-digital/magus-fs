@@ -201,7 +201,10 @@ class Cohort(NativeJourney):
         transfer=self.transfers();started=time.monotonic()
         row={'kind':kind,'path':path,'sha256':hashlib.sha256(body).hexdigest(),'bytes':len(body),'attempted':len(names),'receivers':[],'shared':False}
         if store:self.row['saves'].append(row)
-        self.save()
+        def persist_attempt():
+            if not store:self.i.write_json('peer-case-save.json',row)
+            self.save()
+        persist_attempt()
         try:
             self.publisher.write(self.client,body,path,atomic=kind=='atomic')
             progress=self.until(lambda:next((p for p in self.publisher.status(self.client)['status']['submissions'] if p['operation'] not in old and p['shared_receipt']),None),15)
@@ -216,10 +219,13 @@ class Cohort(NativeJourney):
             row.update(head=head,revision=view['revision'],shared=True,progress=progress,publisher_status=self.publisher.status(self.client),descriptor_entry=entry)
             row['receivers']=self.observe(names,path,body,head,started)
             return row
+        except Exception as error:
+            row['error']=str(error)
+            raise
         finally:
             row.update(successful=sum(r['error'] is None for r in row['receivers']),failed=len(names)-sum(r['error'] is None for r in row['receivers']),seconds=time.monotonic()-started,
                        transfer={k:v-transfer[k] for k,v in self.transfers().items()})
-            self.save()
+            persist_attempt()
     def metrics(self,name):
         ep=self.mounts[name]
         return ep.execute("""import json,sys,os
@@ -253,7 +259,7 @@ print(json.dumps({'cpu_ticks':int(stat[13])+int(stat[14]),'clock_ticks':os.sysco
         self.mounts[slow].execute("import os,signal,json,sys;n=json.load(sys.stdin);os.kill(int(open('/private/'+n+'/pid').read()),signal.SIGSTOP);print('{}')",slow);self.paused=slow
         body=b'bounded named peer case';healthy=[n for n in self.mounts if n not in (disconnected,slow,revoked)]
         row=self.publish_save('peer-cases','reports/live',body,healthy,False)
-        self.i.write_json('peer-case-save.json',row);assert row['failed']==0
+        assert row['failed']==0
         self.mounts[slow].execute("import os,signal,json,sys;n=json.load(sys.stdin);os.kill(int(open('/private/'+n+'/pid').read()),signal.SIGCONT);print('{}')",slow);self.paused=None
         self.i.docker('network','connect',self.i.ingress,self.mounts[disconnected].daemon);self.disconnected.remove(disconnected)
         recovered=self.observe([disconnected,slow],'reports/live',body,row['head'],time.monotonic())
@@ -387,9 +393,15 @@ def main(argv=None):
             persist()
         if result['failures'] or result['blocked']:break
     from qualification import normalize, SCALE_CASES
+    if result['blocked']:
+        # Unexecuted cases are neither successes nor runtime failures. Keep any
+        # actual failure (including cleanup) while leaving partial evidence intact.
+        result['status']='failed' if result['failures'] else 'blocked'
+        if not result['failures']:result=normalize(result)
+        persist();return 1 if result['failures'] else 2
+    result['failures'].extend(validate_scale(result['measurements']))
     for case, acceptance in SCALE_CASES.items():
         result['assertions'].append({'case':case,'acceptance':acceptance,'expected':'verified','observed':'verified' if not result['failures'] else 'incomplete','passed':not result['failures'],'provenance':['cohort-1/cohort.json','cohort-5/cohort.json','cohort-20/cohort.json']})
-    result['failures'].extend(validate_scale(result['measurements']))
     result['status']='failed' if result['failures'] else 'blocked' if result['blocked'] else 'passed'
     result=normalize(result)
     persist();return {'passed':0,'failed':1,'blocked':2}[result['status']]
